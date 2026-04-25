@@ -26,6 +26,7 @@
 package parser
 
 import (
+	"errors"
 	"strings"
 	"time"
 
@@ -4615,9 +4616,14 @@ ShardKeyOpt:
 	{ $$ = nil }
 |   "SHARD_KEY" '(' ColumnNameList ')' "INTO" LengthNum "SHARDS"
 	{
+		shardCnt := int($6.(uint64))
+		if shardCnt <= 0 {
+			yylex.AppendError(errors.New("Shard count must be greater than 0"))
+			return 1
+		}
 		$$ = &ast.ShardKeyClause{
 			Columns:  $3.([]*ast.ColumnName),
-			ShardCnt: int($6.(uint64)),
+			ShardCnt: shardCnt,
 		}
 	}
 

@@ -29,6 +29,7 @@ package parser
 import __yyfmt__ "fmt"
 
 import (
+	"errors"
 	"strings"
 	"time"
 
@@ -15876,9 +15877,14 @@ yynewstate:
 		}
 	case 430:
 		{
+			shardCnt := int(yyS[yypt-1].item.(uint64))
+			if shardCnt <= 0 {
+				yylex.AppendError(errors.New("Shard count must be greater than 0"))
+				return 1
+			}
 			parser.yyVAL.item = &ast.ShardKeyClause{
 				Columns:  yyS[yypt-4].item.([]*ast.ColumnName),
-				ShardCnt: int(yyS[yypt-1].item.(uint64)),
+				ShardCnt: shardCnt,
 			}
 		}
 	case 431:
