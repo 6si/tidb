@@ -833,6 +833,20 @@ func BuildTableInfoWithStmt(ctx *metabuild.Context, s *ast.CreateTableStmt, dbCh
 		return nil, errors.Trace(err)
 	}
 
+	// Set shard key info from the SHARD_KEY clause
+	if s.ShardKeyInfo != nil {
+		cols := make([]string, 0, len(s.ShardKeyInfo.Columns))
+		for _, col := range s.ShardKeyInfo.Columns {
+			cols = append(cols, col.Name.L)
+		}
+		if len(cols) > 0 {
+			tbInfo.ShardKeyInfo = &model.ShardKeyInfo{
+				Columns:  cols,
+				ShardCnt: s.ShardKeyInfo.ShardCnt,
+			}
+		}
+	}
+
 	// validateTableAffinity settings, this should be after buildTablePartitionInfo for some partition checks
 	if err = validateTableAffinity(tbInfo, tbInfo.Affinity); err != nil {
 		return nil, errors.Trace(err)
