@@ -606,7 +606,9 @@ import (
 	serializable          "SERIALIZABLE"
 	session               "SESSION"
 	setval                "SETVAL"
+	shardKey              "SHARD_KEY"
 	shardRowIDBits        "SHARD_ROW_ID_BITS"
+	shards                "SHARDS"
 	share                 "SHARE"
 	shared                "SHARED"
 	shutdown              "SHUTDOWN"
@@ -1338,6 +1340,7 @@ import (
 	ShowProfileTypesOpt                    "Show profile types option"
 	ShowProfileType                        "Show profile type"
 	ShowProfileTypes                       "Show profile types"
+	ShardKeyOpt                            "shard key option"
 	SplitOption                            "Split Option"
 	SplitSyntaxOption                      "Split syntax Option"
 	Starting                               "Starting by"
@@ -4523,23 +4526,26 @@ DatabaseOptionList:
  *      )
  *******************************************************************/
 CreateTableStmt:
-	"CREATE" OptTemporary "TABLE" IfNotExists TableName TableElementListOpt CreateTableOptionListOpt PartitionOpt DuplicateOpt AsOpt CreateTableSelectOpt OnCommitOpt
+	"CREATE" OptTemporary "TABLE" IfNotExists TableName TableElementListOpt ShardKeyOpt CreateTableOptionListOpt PartitionOpt DuplicateOpt AsOpt CreateTableSelectOpt OnCommitOpt
 	{
 		stmt := $6.(*ast.CreateTableStmt)
 		stmt.Table = $5.(*ast.TableName)
 		stmt.IfNotExists = $4.(bool)
 		stmt.TemporaryKeyword = $2.(ast.TemporaryKeyword)
-		stmt.Options = $7.([]*ast.TableOption)
-		if $8 != nil {
-			stmt.Partition = $8.(*ast.PartitionOptions)
+		if $7 != nil {
+			stmt.ShardKeyInfo = $7.(*ast.ShardKeyClause)
 		}
-		stmt.OnDuplicate = $9.(ast.OnDuplicateKeyHandlingType)
-		stmt.Select = $11.(*ast.CreateTableStmt).Select
-		if ($12 != nil && stmt.TemporaryKeyword != ast.TemporaryGlobal) || (stmt.TemporaryKeyword == ast.TemporaryGlobal && $12 == nil) {
+		stmt.Options = $8.([]*ast.TableOption)
+		if $9 != nil {
+			stmt.Partition = $9.(*ast.PartitionOptions)
+		}
+		stmt.OnDuplicate = $10.(ast.OnDuplicateKeyHandlingType)
+		stmt.Select = $12.(*ast.CreateTableStmt).Select
+		if ($13 != nil && stmt.TemporaryKeyword != ast.TemporaryGlobal) || (stmt.TemporaryKeyword == ast.TemporaryGlobal && $13 == nil) {
 			yylex.AppendError(yylex.Errorf("GLOBAL TEMPORARY and ON COMMIT DELETE ROWS must appear together"))
 		} else {
 			if stmt.TemporaryKeyword == ast.TemporaryGlobal {
-				stmt.OnCommitDelete = $12.(bool)
+				stmt.OnCommitDelete = $13.(bool)
 			}
 		}
 		$$ = stmt
@@ -4602,6 +4608,17 @@ PartitionOpt:
 			return 1
 		}
 		$$ = opt
+	}
+
+
+ShardKeyOpt:
+	{ $$ = nil }
+|   "SHARD_KEY" '(' ColumnNameList ')' "INTO" LengthNum "SHARDS"
+	{
+		$$ = &ast.ShardKeyClause{
+			Columns:  $3.([]*ast.ColumnName),
+			ShardCnt: int($6.(uint64)),
+		}
 	}
 
 GlobalOrLocal:
