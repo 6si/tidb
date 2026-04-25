@@ -85,6 +85,13 @@ const (
 	CurrLatestTableInfoVersion = TableInfoVersion5
 )
 
+// ShardKeyInfo describes the shard key for MPP co-location optimization.
+// Tables with matching shard keys can skip exchange during joins.
+type ShardKeyInfo struct {
+	Columns  []string `json:"columns"`   // Column names forming the shard key
+	ShardCnt int      `json:"shard_cnt"` // Number of shards (must be >= 1)
+}
+
 // ExtraHandleName is the name of ExtraHandle Column.
 var ExtraHandleName = model.NewCIStr("_tidb_rowid")
 
@@ -210,6 +217,10 @@ type TableInfo struct {
 	DBID int64 `json:"-"`
 
 	Mode TableMode `json:"mode,omitempty"`
+
+	// ShardKeyInfo describes the shard key for MPP co-location.
+	// If nil, this table is not sharded.
+	ShardKeyInfo *ShardKeyInfo `json:"shard_key_info,omitempty"`
 }
 
 // SepAutoInc decides whether _rowid and auto_increment id use separate allocator.
