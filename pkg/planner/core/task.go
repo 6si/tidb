@@ -16,6 +16,7 @@ package core
 
 import (
 	"math"
+	"strings"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
@@ -23,6 +24,7 @@ import (
 	"github.com/pingcap/tidb/pkg/expression/aggregation"
 	"github.com/pingcap/tidb/pkg/infoschema"
 	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/charset"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
@@ -2488,6 +2490,51 @@ func tryExpandVirtualColumn(p base.PhysicalPlan) {
 	}
 }
 
+// extractTableFromPlan traverses down the plan tree to find the underlying
+// PhysicalTableScan or PhysicalIndexScan and returns its TableInfo.
+func extractTableFromPlan(plan base.PhysicalPlan) *model.TableInfo {
+	for plan != nil {
+		switch p := plan.(type) {
+		case *PhysicalTableScan:
+			return p.Table
+		case *PhysicalIndexScan:
+			return p.Table
+		case *PhysicalExchangeReceiver:
+			if len(p.Children()) > 0 {
+				plan = p.Children()[0]
+			} else {
+				return nil
+			}
+		default:
+			// For other plan nodes, try the first child
+			if len(p.Children()) > 0 {
+				plan = p.Children()[0]
+			} else {
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+// shardKeyColumnsMatch checks whether all the given MPP partition columns
+// are covered by the shard key columns of the table.
+func shardKeyColumnsMatch(shardKey *model.ShardKeyInfo, partitionCols []*property.MPPPartitionColumn) bool {
+	if shardKey == nil || len(shardKey.Columns) == 0 {
+		return false
+	}
+	shardColSet := make(map[string]struct{}, len(shardKey.Columns))
+	for _, col := range shardKey.Columns {
+		shardColSet[col] = struct{}{}
+	}
+	for _, pc := range partitionCols {
+		if _, ok := shardColSet[strings.ToLower(pc.Col.OrigName)]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func (t *MppTask) needEnforceExchanger(prop *property.PhysicalProperty) bool {
 	switch prop.MPPPartitionTp {
 	case property.AnyType:
@@ -2499,6 +2546,14 @@ func (t *MppTask) needEnforceExchanger(prop *property.PhysicalProperty) bool {
 	default:
 		if t.partTp != property.HashType {
 			return true
+		}
+		// Shard key optimization: if the underlying table has a shard key
+		// and the required partition columns are covered by the shard key,
+		// the data is already co-located — no exchange needed.
+		if tbl := extractTableFromPlan(t.p); tbl != nil && tbl.ShardKeyInfo != nil {
+			if shardKeyColumnsMatch(tbl.ShardKeyInfo, prop.MPPPartitionCols) {
+				return false
+			}
 		}
 		// TODO: consider equalivant class
 		// TODO: `prop.IsSubsetOf` is enough, instead of equal.
