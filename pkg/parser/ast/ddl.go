@@ -1090,6 +1090,12 @@ const (
 	TemporaryLocal
 )
 
+// ShardKeyClause represents SHARD_KEY(col1, col2) INTO N SHARDS clause
+type ShardKeyClause struct {
+	Columns  []*ColumnName // Column names forming the shard key
+	ShardCnt int          // Number of shards from INTO N SHARDS
+}
+
 // CreateTableStmt is a statement to create a table.
 // See https://dev.mysql.com/doc/refman/5.7/en/create-table.html
 type CreateTableStmt struct {
@@ -1109,6 +1115,9 @@ type CreateTableStmt struct {
 	Partition      *PartitionOptions
 	OnDuplicate    OnDuplicateKeyHandlingType
 	Select         ResultSetNode
+
+	// ShardKeyInfo contains shard key clause if present
+	ShardKeyInfo *ShardKeyClause `json:"shard_key_info,omitempty"`
 }
 
 // Restore implements Node interface.
