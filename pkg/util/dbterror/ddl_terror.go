@@ -72,6 +72,10 @@ var (
 	ErrUnsupportedCharset = ClassDDL.NewStdErr(mysql.ErrUnsupportedDDLOperation, parser_mysql.Message(fmt.Sprintf(mysql.MySQLErrName[mysql.ErrUnsupportedDDLOperation].Raw, "charset %s and collate %s"), nil))
 	// ErrUnsupportedShardRowIDBits means we don't support the shard_row_id_bits.
 	ErrUnsupportedShardRowIDBits = ClassDDL.NewStdErr(mysql.ErrUnsupportedDDLOperation, parser_mysql.Message(fmt.Sprintf(mysql.MySQLErrName[mysql.ErrUnsupportedDDLOperation].Raw, "shard_row_id_bits for table with primary key as row id"), nil))
+	// ErrShardKeyAutoIncrement is returned when a SHARD_KEY column is AUTO_INCREMENT.
+	ErrShardKeyAutoIncrement = ClassDDL.NewStdErr(mysql.ErrUnsupportedDDLOperation, parser_mysql.Message(fmt.Sprintf(mysql.MySQLErrName[mysql.ErrUnsupportedDDLOperation].Raw, "shard key column '%s' cannot be AUTO_INCREMENT"), nil))
+	// ErrShardKeyColumnType is returned when a SHARD_KEY column has an unsupported type.
+	ErrShardKeyColumnType = ClassDDL.NewStdErr(mysql.ErrUnsupportedDDLOperation, parser_mysql.Message(fmt.Sprintf(mysql.MySQLErrName[mysql.ErrUnsupportedDDLOperation].Raw, "shard key column '%s' must be an integer (TINYINT, SMALLINT, MEDIUMINT, INT, BIGINT), VARCHAR, CHAR, or TEXT type; BLOB, BINARY, and VARBINARY are not allowed"), nil))
 	// ErrUnsupportedAlterTableWithValidation means we don't support the alter table with validation.
 	ErrUnsupportedAlterTableWithValidation = ClassDDL.NewStdErr(mysql.ErrUnsupportedDDLOperation, parser_mysql.Message("ALTER TABLE WITH VALIDATION is currently unsupported", nil))
 	// ErrUnsupportedAlterTableWithoutValidation means we don't support the alter table without validation.

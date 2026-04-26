@@ -835,9 +835,63 @@ func BuildTableInfoWithStmt(ctx *metabuild.Context, s *ast.CreateTableStmt, dbCh
 
 	// Set shard key info from the SHARD_KEY clause
 	if s.ShardKeyInfo != nil {
+		if tbInfo.TempTableType != model.TempTableNone {
+			return nil, dbterror.ErrNotSupportedYet.GenWithStackByArgs("SHARD_KEY on temporary tables")
+		}
+		if tbInfo.ShardRowIDBits > 0 {
+			return nil, dbterror.ErrNotSupportedYet.GenWithStackByArgs("SHARD_KEY together with SHARD_ROW_ID_BITS")
+		}
+		// A column cannot serve both as a partition column and a shard key column.
+		// Partition-by-range/list on the shard key breaks uniform hash distribution.
+		if s.Partition != nil {
+			partColSet := make(map[string]struct{})
+			// RANGE COLUMNS, LIST COLUMNS, KEY: explicit column list
+			for _, cn := range s.Partition.ColumnNames {
+				partColSet[cn.Name.L] = struct{}{}
+			}
+			// RANGE, LIST, HASH: expression — capture bare column references
+			if s.Partition.Expr != nil {
+				if colExpr, ok := s.Partition.Expr.(*ast.ColumnNameExpr); ok {
+					partColSet[colExpr.Name.Name.L] = struct{}{}
+				}
+			}
+			for _, skCol := range s.ShardKeyInfo.Columns {
+				if _, overlap := partColSet[skCol.Name.L]; overlap {
+					return nil, dbterror.ErrNotSupportedYet.GenWithStackByArgs(
+						fmt.Sprintf("column '%s' cannot be both a partition column and a shard key column", skCol.Name.O))
+				}
+			}
+		}
+		seen := make(map[string]struct{}, len(s.ShardKeyInfo.Columns))
 		cols := make([]string, 0, len(s.ShardKeyInfo.Columns))
 		for _, col := range s.ShardKeyInfo.Columns {
-			cols = append(cols, col.Name.L)
+			colName := col.Name.L
+			if _, dup := seen[colName]; dup {
+				return nil, infoschema.ErrColumnExists.GenWithStackByArgs(col.Name.O)
+			}
+			seen[colName] = struct{}{}
+			colInfo := model.FindColumnInfo(tbInfo.Columns, colName)
+			if colInfo == nil {
+				return nil, dbterror.ErrKeyColumnDoesNotExits.GenWithStackByArgs(col.Name.O)
+			}
+			if mysql.HasAutoIncrementFlag(colInfo.GetFlag()) {
+				return nil, dbterror.ErrShardKeyAutoIncrement.FastGenByArgs(col.Name.O)
+			}
+			colType := colInfo.GetType()
+			isBinary := mysql.HasBinaryFlag(colInfo.GetFlag())
+			switch colType {
+			case mysql.TypeTiny, mysql.TypeShort, mysql.TypeInt24, mysql.TypeLong, mysql.TypeLonglong:
+				// integer types always allowed
+			case mysql.TypeVarchar, mysql.TypeVarString, mysql.TypeString,
+				mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeBlob, mysql.TypeLongBlob:
+				// text-family types allowed; binary-family types (VARBINARY, BINARY, BLOB) are not
+				if isBinary {
+					return nil, dbterror.ErrShardKeyColumnType.FastGenByArgs(col.Name.O)
+				}
+			default:
+				return nil, dbterror.ErrShardKeyColumnType.FastGenByArgs(col.Name.O)
+			}
+			cols = append(cols, colName)
 		}
 		if len(cols) > 0 {
 			tbInfo.ShardKeyInfo = &model.ShardKeyInfo{

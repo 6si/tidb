@@ -5,6 +5,7 @@ import (
 
 	"github.com/pingcap/tidb/pkg/parser"
 	ast "github.com/pingcap/tidb/pkg/parser/ast"
+	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -73,4 +74,54 @@ func TestParseCreateTableShardKeyZero(t *testing.T) {
 
 	_, _, err := p.Parse(sql, "", "")
 	assert.Error(t, err, "Should reject shard count of 0")
+}
+
+func TestParseCreateTableShardKeyOne(t *testing.T) {
+	p := parser.New()
+
+	sql := `CREATE TABLE test_table (
+		id BIGINT PRIMARY KEY
+	) SHARD_KEY(id) INTO 1 SHARDS`
+
+	_, _, err := p.Parse(sql, "", "")
+	assert.Error(t, err, "Should reject shard count of 1 — a single shard is identical to no sharding")
+}
+
+func TestParseCreateTableShardKeyAtMin(t *testing.T) {
+	p := parser.New()
+
+	sql := `CREATE TABLE test_table (
+		id BIGINT PRIMARY KEY
+	) SHARD_KEY(id) INTO 2 SHARDS`
+
+	nodes, _, err := p.Parse(sql, "", "")
+	assert.NoError(t, err, "Should allow shard count of 2 (minimum meaningful value)")
+	createStmt, ok := nodes[0].(*ast.CreateTableStmt)
+	assert.True(t, ok)
+	assert.Equal(t, 2, createStmt.ShardKeyInfo.ShardCnt)
+}
+
+func TestParseCreateTableShardKeyExceedsMax(t *testing.T) {
+	p := parser.New()
+
+	sql := `CREATE TABLE test_table (
+		id BIGINT PRIMARY KEY
+	) SHARD_KEY(id) INTO 65 SHARDS`
+
+	_, _, err := p.Parse(sql, "", "")
+	assert.Error(t, err, "Should reject shard count above 64")
+}
+
+func TestParseCreateTableShardKeyAtMax(t *testing.T) {
+	p := parser.New()
+
+	sql := `CREATE TABLE test_table (
+		id BIGINT PRIMARY KEY
+	) SHARD_KEY(id) INTO 64 SHARDS`
+
+	nodes, _, err := p.Parse(sql, "", "")
+	assert.NoError(t, err, "Should allow shard count of 64")
+	createStmt, ok := nodes[0].(*ast.CreateTableStmt)
+	assert.True(t, ok)
+	assert.Equal(t, 64, createStmt.ShardKeyInfo.ShardCnt)
 }

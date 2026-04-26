@@ -120,3 +120,73 @@ func TestBothCoLocated(t *testing.T) {
 	}(), "\n")
 	require.Contains(t, planStr, "HashPartition", "mismatched shard count must use a hash-partition exchange")
 }
+
+// planRows formats EXPLAIN rows into a single string.
+func planRows(rows [][]any) string {
+	s := make([]string, 0, len(rows))
+	for _, r := range rows {
+		s = append(s, fmt.Sprintf("%v", r))
+	}
+	return strings.Join(s, "\n")
+}
+
+// TestCoLocatedJoinGroupBy compares the MPP plan for a JOIN+GROUP BY query on co-sharded tables
+// against the same query on plain (non-sharded) TiFlash tables.
+//
+// Sharded:   no HashPartition exchanges at all (join co-located, agg 1-phase)
+// Plain:     two HashPartition exchanges (one per join side + one for the agg shuffle)
+func TestCoLocatedJoinGroupBy(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	// ── Plain (non-sharded) tables ──────────────────────────────────────────
+	tk.MustExec("create table p1(company_id bigint, v int)")
+	tk.MustExec("create table p2(company_id bigint, score int)")
+
+	// ── Sharded tables ──────────────────────────────────────────────────────
+	tk.MustExec("create table s1(company_id bigint, v int)")
+	tk.MustExec("create table s2(company_id bigint, score int)")
+
+	dom := domain.GetDomain(tk.Session())
+	for _, tbl := range []string{"p1", "p2", "s1", "s2"} {
+		testkit.SetTiFlashReplica(t, dom, "test", tbl)
+	}
+
+	is := dom.InfoSchema()
+	for _, name := range []string{"s1", "s2"} {
+		info, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr(name))
+		require.NoError(t, err)
+		info.Meta().ShardKeyInfo = &model.ShardKeyInfo{Columns: []string{"company_id"}, ShardCnt: 4}
+	}
+
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+
+	const q = "explain format='brief' select /*+ shuffle_join(%s, %s) */ %s.company_id, count(*), sum(%s.score) " +
+		"from %s join %s on %s.company_id = %s.company_id group by %s.company_id"
+
+	plainPlan := planRows(tk.MustQuery(fmt.Sprintf(q, "p1", "p2", "p1", "p2", "p1", "p2", "p1", "p2", "p1")).Rows())
+	shardPlan := planRows(tk.MustQuery(fmt.Sprintf(q, "s1", "s2", "s1", "s2", "s1", "s2", "s1", "s2", "s1")).Rows())
+
+	t.Logf("Plain (non-sharded) plan:\n%s", plainPlan)
+	t.Logf("Sharded plan:\n%s", shardPlan)
+
+	plainHP := strings.Count(plainPlan, "HashPartition")
+	shardHP := strings.Count(shardPlan, "HashPartition")
+
+	t.Logf("HashPartition exchange count — plain: %d, sharded: %d", plainHP, shardHP)
+
+	// Plain tables require at least 2 HashPartition exchanges: one per join side.
+	require.GreaterOrEqual(t, plainHP, 2,
+		"plain join+groupby must have HashPartition exchanges for both join sides")
+
+	// Sharded co-located join+groupby must have zero HashPartition exchanges.
+	require.Equal(t, 0, shardHP,
+		"co-located sharded join+groupby must not insert any HashPartition exchange; plan:\n%s", shardPlan)
+
+	// The sharded plan must be strictly cheaper in terms of exchange operations.
+	require.Less(t, shardHP, plainHP,
+		"sharded plan must have fewer HashPartition exchanges than plain")
+}
+

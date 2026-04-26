@@ -19,6 +19,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"slices"
 	"sort"
@@ -890,6 +891,12 @@ func (s *PartitionProcessor) prune(ds *logicalop.DataSource, opt *optimizetrace.
 	// apply for some partitions like:
 	// a = 1 OR a = 2 => for p1 only "a = 1" and for p2 only "a = 2"
 	// since a cannot be 2 in p1 and a cannot be 1 in p2
+	// Shard-key tables use Type=PartitionTypeNone (0) in their synthetic PartitionInfo
+	// but still carry ShardKeyInfo on the TableInfo. Dispatch to the CRC32-based pruner.
+	if ds.TableInfo.ShardKeyInfo != nil {
+		return s.processShardKeyPartition(ds, pi, opt)
+	}
+
 	switch pi.Type {
 	case pmodel.PartitionTypeRange:
 		return s.processRangePartition(ds, pi, opt)
@@ -900,6 +907,153 @@ func (s *PartitionProcessor) prune(ds *logicalop.DataSource, opt *optimizetrace.
 	}
 
 	return s.makeUnionAllChildren(ds, pi, fullRange(len(pi.Definitions)), opt)
+}
+
+// processShardKeyPartition handles partition pruning for shard-key tables.
+// These tables use CRC32/IEEE hashing over the shard key columns, not a SQL expression.
+// For equality predicates on all shard key columns we compute the exact shard slot;
+// for range / inequality predicates we fall back to a full scan of all shards.
+func (s *PartitionProcessor) processShardKeyPartition(ds *logicalop.DataSource, pi *model.PartitionInfo, opt *optimizetrace.LogicalOptimizeOp) (base.LogicalPlan, error) {
+	rangeOr, err := s.pruneShardKeyPartition(ds.SCtx(), pi, ds.TableInfo, ds.AllConds, ds.TblCols)
+	if err != nil {
+		return nil, err
+	}
+	return s.makeUnionAllChildren(ds, pi, rangeOr, opt)
+}
+
+// pruneShardKeyPartition computes which shard slots to scan given equality predicates.
+// It is called from both the static partition processor (processShardKeyPartition) and
+// the dynamic pruning path (PartitionPruning in partition_prune.go).
+// Returns fullRange if no equality constraint covers all shard-key columns.
+func (s *PartitionProcessor) pruneShardKeyPartition(_ base.PlanContext, pi *model.PartitionInfo, tblInfo *model.TableInfo, conds []expression.Expression, columns []*expression.Column) (partitionRangeOR, error) {
+	ski := tblInfo.ShardKeyInfo
+	shardCnt := len(pi.Definitions)
+	if shardCnt == 0 || ski == nil {
+		return fullRange(shardCnt), nil
+	}
+
+	// Build a map from shard key column ID to its position in the shard key.
+	// The expression columns carry the ColInfo which has the table-level column ID.
+	shardColIDs := make(map[int64]int, len(ski.Columns)) // colID → position in ski.Columns
+	for i, colName := range ski.Columns {
+		for _, col := range tblInfo.Columns {
+			if col.Name.L == colName {
+				shardColIDs[col.ID] = i
+				break
+			}
+		}
+	}
+	if len(shardColIDs) != len(ski.Columns) {
+		return fullRange(shardCnt), nil
+	}
+
+	// Match expression columns to shard positions via column.ID (the table-level column ID).
+	exprColToShardPos := make(map[int64]int) // expression UniqueID → shard position
+	for _, exprCol := range columns {
+		if pos, ok := shardColIDs[exprCol.ID]; ok {
+			exprColToShardPos[exprCol.UniqueID] = pos
+		}
+	}
+	if len(exprColToShardPos) < len(ski.Columns) {
+		return fullRange(shardCnt), nil
+	}
+
+	// Try to find equality conditions covering every shard key column.
+	// colVals[i] holds the set of constant values for ski.Columns[i].
+	colVals := make([][]types.Datum, len(ski.Columns))
+	for _, cond := range conds {
+		sf, ok := cond.(*expression.ScalarFunction)
+		if !ok || sf.FuncName.L != ast.EQ {
+			continue
+		}
+		args := sf.GetArgs()
+		if len(args) != 2 {
+			continue
+		}
+		col, cnst := extractColAndConst(args[0], args[1])
+		if col == nil {
+			col, cnst = extractColAndConst(args[1], args[0])
+		}
+		if col == nil || cnst == nil {
+			continue
+		}
+		pos, isShardCol := exprColToShardPos[col.UniqueID]
+		if !isShardCol {
+			continue
+		}
+		colVals[pos] = appendDistinct(colVals[pos], cnst.Value)
+	}
+
+	// If any shard key column has no equality constraint, we cannot prune.
+	for _, vals := range colVals {
+		if len(vals) == 0 {
+			return fullRange(shardCnt), nil
+		}
+	}
+
+	// Compute the set of shard slots by hashing every combination of column values.
+	slotSet := make(map[int]struct{})
+	var enumerate func(col int, datums []types.Datum)
+	enumerate = func(col int, datums []types.Datum) {
+		if col == len(ski.Columns) {
+			h := crc32.NewIEEE()
+			for _, d := range datums {
+				if d.Kind() == types.KindNull {
+					h.Write([]byte{0})
+				} else {
+					data, err := d.ToHashKey()
+					if err == nil {
+						h.Write(data)
+					}
+				}
+			}
+			slotSet[int(h.Sum32()%uint32(shardCnt))] = struct{}{}
+			return
+		}
+		for _, v := range colVals[col] {
+			enumerate(col+1, append(datums, v))
+		}
+	}
+	enumerate(0, make([]types.Datum, 0, len(ski.Columns)))
+
+	if len(slotSet) == 0 || len(slotSet) == shardCnt {
+		return fullRange(shardCnt), nil
+	}
+
+	used := make([]int, 0, len(slotSet))
+	for slot := range slotSet {
+		used = append(used, slot)
+	}
+	slices.Sort(used)
+	return convertToRangeOr(used, pi), nil
+}
+
+// extractColAndConst returns (col, constant) if left is a Column and right is foldable to a Constant.
+func extractColAndConst(left, right expression.Expression) (*expression.Column, *expression.Constant) {
+	col, ok := left.(*expression.Column)
+	if !ok {
+		return nil, nil
+	}
+	if cnst, ok := right.(*expression.Constant); ok {
+		return col, cnst
+	}
+	return nil, nil
+}
+
+// appendDistinct appends d to vals only if no existing entry compares equal.
+func appendDistinct(vals []types.Datum, d types.Datum) []types.Datum {
+	for _, v := range vals {
+		if v.Kind() == d.Kind() {
+			if key1, err1 := v.ToHashKey(); err1 == nil {
+				if key2, err2 := d.ToHashKey(); err2 == nil {
+					if bytes.Equal(key1, key2) {
+						return vals
+					}
+				}
+			}
+		}
+	}
+	return append(vals, d)
 }
 
 // findByName checks whether object name exists in list.

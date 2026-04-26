@@ -29,7 +29,16 @@ import (
 func PartitionPruning(ctx base.PlanContext, tbl table.PartitionedTable, conds []expression.Expression, partitionNames []model.CIStr,
 	columns []*expression.Column, names types.NameSlice) ([]int, error) {
 	s := PartitionProcessor{}
-	pi := tbl.Meta().Partition
+	tblInfo := tbl.Meta()
+	pi := tblInfo.Partition
+	// Shard-key tables: pi.Type=0 (PartitionTypeNone) but ShardKeyInfo is set.
+	if tblInfo.ShardKeyInfo != nil {
+		rangeOr, err := s.pruneShardKeyPartition(ctx, pi, tblInfo, conds, columns)
+		if err != nil {
+			return nil, err
+		}
+		return s.convertToIntSlice(rangeOr, pi, partitionNames), nil
+	}
 	switch pi.Type {
 	case model.PartitionTypeHash, model.PartitionTypeKey:
 		return s.pruneHashOrKeyPartition(ctx, tbl, partitionNames, conds, columns, names)

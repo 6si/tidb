@@ -4617,8 +4617,12 @@ ShardKeyOpt:
 |   "SHARD_KEY" '(' ColumnNameList ')' "INTO" LengthNum "SHARDS"
 	{
 		shardCnt := int($6.(uint64))
-		if shardCnt <= 0 {
-			yylex.AppendError(errors.New("Shard count must be greater than 0"))
+		if shardCnt <= 1 {
+			yylex.AppendError(errors.New("Shard count must be greater than 1"))
+			return 1
+		}
+		if shardCnt > 64 {
+			yylex.AppendError(errors.New("Shard count must be between 2 and 64"))
 			return 1
 		}
 		$$ = &ast.ShardKeyClause{
