@@ -2716,5 +2716,46 @@
         ]
       }
     ]
+  },
+  {
+    "Name": "TestMPPShardKeyMismatchUsesExchange",
+    "Cases": [
+      {
+        "SQL": "explain format = 'brief' select /*+ shuffle_join(ta, tb) */ count(*) from ta join tb on ta.company_id = tb.company_id",
+        "Plan": [
+          "HashAgg 1.00 root  funcs:count(Column#8)->Column#7",
+          "└─TableReader 1.00 root  MppVersion: 2, data:ExchangeSender",
+          "  └─ExchangeSender 1.00 mpp[tiflash]  ExchangeType: PassThrough",
+          "    └─HashAgg 1.00 mpp[tiflash]  funcs:count(1)->Column#8",
+          "      └─HashJoin 12487.50 mpp[tiflash]  inner join, equal:[eq(test.ta.company_id, test.tb.company_id)]",
+          "        ├─ExchangeReceiver(Build) 9990.00 mpp[tiflash]  ",
+          "        │ └─ExchangeSender 9990.00 mpp[tiflash]  ExchangeType: HashPartition, Compression: FAST, Hash Cols: [name: test.ta.company_id, collate: binary]",
+          "        │   └─Selection 9990.00 mpp[tiflash]  not(isnull(test.ta.company_id))",
+          "        │     └─TableFullScan 10000.00 mpp[tiflash] table:ta pushed down filter:empty, keep order:false, stats:pseudo",
+          "        └─ExchangeReceiver(Probe) 9990.00 mpp[tiflash]  ",
+          "          └─ExchangeSender 9990.00 mpp[tiflash]  ExchangeType: HashPartition, Compression: FAST, Hash Cols: [name: test.tb.company_id, collate: binary]",
+          "            └─Selection 9990.00 mpp[tiflash]  not(isnull(test.tb.company_id))",
+          "              └─TableFullScan 10000.00 mpp[tiflash] table:tb pushed down filter:empty, keep order:false, stats:pseudo"
+        ]
+      },
+      {
+        "SQL": "explain format = 'brief' select /*+ shuffle_join(ta, tc) */ count(*) from ta join tc on ta.company_id = tc.company_id",
+        "Plan": [
+          "HashAgg 1.00 root  funcs:count(Column#8)->Column#7",
+          "└─TableReader 1.00 root  MppVersion: 2, data:ExchangeSender",
+          "  └─ExchangeSender 1.00 mpp[tiflash]  ExchangeType: PassThrough",
+          "    └─HashAgg 1.00 mpp[tiflash]  funcs:count(1)->Column#8",
+          "      └─HashJoin 12487.50 mpp[tiflash]  inner join, equal:[eq(test.ta.company_id, test.tc.company_id)]",
+          "        ├─ExchangeReceiver(Build) 9990.00 mpp[tiflash]  ",
+          "        │ └─ExchangeSender 9990.00 mpp[tiflash]  ExchangeType: HashPartition, Compression: FAST, Hash Cols: [name: test.ta.company_id, collate: binary]",
+          "        │   └─Selection 9990.00 mpp[tiflash]  not(isnull(test.ta.company_id))",
+          "        │     └─TableFullScan 10000.00 mpp[tiflash] table:ta pushed down filter:empty, keep order:false, stats:pseudo",
+          "        └─ExchangeReceiver(Probe) 9990.00 mpp[tiflash]  ",
+          "          └─ExchangeSender 9990.00 mpp[tiflash]  ExchangeType: HashPartition, Compression: FAST, Hash Cols: [name: test.tc.company_id, collate: binary]",
+          "            └─Selection 9990.00 mpp[tiflash]  not(isnull(test.tc.company_id))",
+          "              └─TableFullScan 10000.00 mpp[tiflash] table:tc pushed down filter:empty, keep order:false, stats:pseudo"
+        ]
+      }
+    ]
   }
 ]

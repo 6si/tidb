@@ -911,3 +911,49 @@ func TestMPPShardKeyLocalJoin(t *testing.T) {
 		res.Check(testkit.Rows(output[i].Plan...))
 	}
 }
+
+func TestMPPShardKeyMismatchUsesExchange(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set tidb_cost_model_version=2")
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+
+	tk.MustExec("drop table if exists ta, tb, tc")
+	tk.MustExec("create table ta(company_id bigint, v int)")
+	tk.MustExec("create table tb(company_id bigint, v int)")
+	tk.MustExec("create table tc(company_id bigint, v int)")
+
+	dom := domain.GetDomain(tk.Session())
+	testkit.SetTiFlashReplica(t, dom, "test", "ta")
+	testkit.SetTiFlashReplica(t, dom, "test", "tb")
+	testkit.SetTiFlashReplica(t, dom, "test", "tc")
+
+	is := dom.InfoSchema()
+	taInfo, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("ta"))
+	require.NoError(t, err)
+	tbInfo, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("tb"))
+	require.NoError(t, err)
+	// tc has no shard key — intentionally left without ShardKeyInfo
+
+	// ta: 4 shards; tb: 8 shards — different counts, not co-located.
+	taInfo.Meta().ShardKeyInfo = &model.ShardKeyInfo{Columns: []string{"company_id"}, ShardCnt: 4}
+	tbInfo.Meta().ShardKeyInfo = &model.ShardKeyInfo{Columns: []string{"company_id"}, ShardCnt: 8}
+
+	var input []string
+	var output []struct {
+		SQL  string
+		Plan []string
+	}
+	integrationSuiteData := GetIntegrationSuiteData()
+	integrationSuiteData.LoadTestCases(t, &input, &output)
+	for i, tt := range input {
+		testdata.OnRecord(func() {
+			output[i].SQL = tt
+			output[i].Plan = testdata.ConvertRowsToStrings(tk.MustQuery(tt).Rows())
+		})
+		res := tk.MustQuery(tt)
+		res.Check(testkit.Rows(output[i].Plan...))
+	}
+}
