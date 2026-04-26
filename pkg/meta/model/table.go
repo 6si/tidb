@@ -88,8 +88,33 @@ const (
 // ShardKeyInfo describes the shard key for MPP co-location optimization.
 // Tables with matching shard keys can skip exchange during joins.
 type ShardKeyInfo struct {
-	Columns  []string `json:"columns"`   // Column names forming the shard key
-	ShardCnt int      `json:"shard_cnt"` // Number of shards (must be >= 1)
+	Columns  []string `json:"columns"`             // Column names forming the shard key
+	ShardCnt int      `json:"shard_cnt"`           // Number of shards (must be >= 1)
+	ShardIDs []int64  `json:"shard_ids,omitempty"` // Physical table ID per shard, assigned at DDL time
+}
+
+// ShardKeysCompatible reports whether two shard keys can support a co-located join:
+// both must be non-nil, have the same shard count, and cover the same set of columns.
+func ShardKeysCompatible(a, b *ShardKeyInfo) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a.ShardCnt != b.ShardCnt {
+		return false
+	}
+	if len(a.Columns) != len(b.Columns) {
+		return false
+	}
+	aSet := make(map[string]struct{}, len(a.Columns))
+	for _, col := range a.Columns {
+		aSet[col] = struct{}{}
+	}
+	for _, col := range b.Columns {
+		if _, ok := aSet[col]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // ExtraHandleName is the name of ExtraHandle Column.
@@ -272,6 +297,15 @@ func (t *TableInfo) Clone() *TableInfo {
 
 	if t.Affinity != nil {
 		nt.Affinity = t.Affinity.Clone()
+	}
+
+	if t.ShardKeyInfo != nil {
+		cloned := *t.ShardKeyInfo
+		cloned.Columns = make([]string, len(t.ShardKeyInfo.Columns))
+		copy(cloned.Columns, t.ShardKeyInfo.Columns)
+		cloned.ShardIDs = make([]int64, len(t.ShardKeyInfo.ShardIDs))
+		copy(cloned.ShardIDs, t.ShardKeyInfo.ShardIDs)
+		nt.ShardKeyInfo = &cloned
 	}
 
 	return &nt
