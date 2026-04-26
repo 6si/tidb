@@ -400,27 +400,31 @@ func (p *PhysicalHashJoin) attach2TaskForMpp(tasks ...base.Task) base.Task {
 		rTbl := extractTableFromPlan(rTask.p)
 		lHasShardKey := lTbl != nil && lTbl.ShardKeyInfo != nil
 		rHasShardKey := rTbl != nil && rTbl.ShardKeyInfo != nil
-		if (lHasShardKey || rHasShardKey) && !bothCoLocated(lTask, rTask, lTask.hashCols) {
+		if (lHasShardKey || rHasShardKey) && !bothCoLocated(lTask, rTask, lTask.hashCols, rTask.hashCols) {
 			// Only re-enforce sides that have a shard key (meaning they may have used the
 			// shortcut). Sides without a shard key already have a proper exchanger in place.
 			if lHasShardKey {
-				lProp := &property.PhysicalProperty{
-					TaskTp:           property.MppTaskType,
-					MPPPartitionTp:   property.HashType,
-					MPPPartitionCols: lTask.hashCols,
+				if _, alreadyExchanged := lTask.p.(*PhysicalExchangeReceiver); !alreadyExchanged {
+					lProp := &property.PhysicalProperty{
+						TaskTp:           property.MppTaskType,
+						MPPPartitionTp:   property.HashType,
+						MPPPartitionCols: lTask.hashCols,
+					}
+					// Use enforceExchangerImpl to bypass the per-side shard-key shortcut in
+					// needEnforceExchanger: when the two tables have incompatible shard keys
+					// (e.g. different ShardCnt) each side must physically redistribute its data.
+					lTask = lTask.Copy().(*MppTask).enforceExchangerImpl(lProp)
 				}
-				// Use enforceExchangerImpl to bypass the per-side shard-key shortcut in
-				// needEnforceExchanger: when the two tables have incompatible shard keys
-				// (e.g. different ShardCnt) each side must physically redistribute its data.
-				lTask = lTask.Copy().(*MppTask).enforceExchangerImpl(lProp)
 			}
 			if rHasShardKey {
-				rProp := &property.PhysicalProperty{
-					TaskTp:           property.MppTaskType,
-					MPPPartitionTp:   property.HashType,
-					MPPPartitionCols: rTask.hashCols,
+				if _, alreadyExchanged := rTask.p.(*PhysicalExchangeReceiver); !alreadyExchanged {
+					rProp := &property.PhysicalProperty{
+						TaskTp:           property.MppTaskType,
+						MPPPartitionTp:   property.HashType,
+						MPPPartitionCols: rTask.hashCols,
+					}
+					rTask = rTask.Copy().(*MppTask).enforceExchangerImpl(rProp)
 				}
-				rTask = rTask.Copy().(*MppTask).enforceExchangerImpl(rProp)
 			}
 		}
 	}
@@ -2579,8 +2583,8 @@ func shardKeyColumnsMatch(shardKey *model.ShardKeyInfo, partitionCols []*propert
 // bothCoLocated returns true when both MPP tasks can participate in a co-located join:
 // each underlying table's shard key must cover the given partition columns, and both
 // shard keys must be compatible (same columns and same shard count).
-func bothCoLocated(lTask, rTask *MppTask, partCols []*property.MPPPartitionColumn) bool {
-	if len(partCols) == 0 {
+func bothCoLocated(lTask, rTask *MppTask, lPartCols, rPartCols []*property.MPPPartitionColumn) bool {
+	if len(lPartCols) == 0 || len(rPartCols) == 0 {
 		return false
 	}
 	lTbl := extractTableFromPlan(lTask.p)
@@ -2591,10 +2595,10 @@ func bothCoLocated(lTask, rTask *MppTask, partCols []*property.MPPPartitionColum
 	if lTbl.ShardKeyInfo == nil || rTbl.ShardKeyInfo == nil {
 		return false
 	}
-	if !shardKeyColumnsMatch(lTbl.ShardKeyInfo, partCols) {
+	if !shardKeyColumnsMatch(lTbl.ShardKeyInfo, lPartCols) {
 		return false
 	}
-	if !shardKeyColumnsMatch(rTbl.ShardKeyInfo, partCols) {
+	if !shardKeyColumnsMatch(rTbl.ShardKeyInfo, rPartCols) {
 		return false
 	}
 	return model.ShardKeysCompatible(lTbl.ShardKeyInfo, rTbl.ShardKeyInfo)
