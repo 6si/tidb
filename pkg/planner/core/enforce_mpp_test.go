@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/pingcap/tidb/pkg/domain"
@@ -63,4 +64,59 @@ func TestRowSizeInMPP(t *testing.T) {
 		costs[i] = cost
 	}
 	require.True(t, costs[0] < costs[1] && costs[1] < costs[2]) // rowSize can affect the final cost
+}
+
+func TestBothCoLocated(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t1(company_id bigint, v int)")
+	tk.MustExec("create table t2(company_id bigint, v int)")
+
+	dom := domain.GetDomain(tk.Session())
+	testkit.SetTiFlashReplica(t, dom, "test", "t1")
+	testkit.SetTiFlashReplica(t, dom, "test", "t2")
+
+	is := dom.InfoSchema()
+	t1Info, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t1"))
+	require.NoError(t, err)
+	t2Info, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t2"))
+	require.NoError(t, err)
+
+	t1Info.Meta().ShardKeyInfo = &model.ShardKeyInfo{Columns: []string{"company_id"}, ShardCnt: 4}
+	t2Info.Meta().ShardKeyInfo = &model.ShardKeyInfo{Columns: []string{"company_id"}, ShardCnt: 4}
+
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+
+	// Both co-located: plan should NOT contain HashPartition ExchangeSender before the join.
+	// Use shuffle_join hint to force shuffle join (not broadcast), which is the relevant path
+	// for co-location optimization.
+	rows := tk.MustQuery(
+		"explain format='brief' select /*+ shuffle_join(t1, t2) */ count(*) from t1 join t2 on t1.company_id = t2.company_id",
+	).Rows()
+	planStr := strings.Join(func() []string {
+		s := make([]string, 0, len(rows))
+		for _, r := range rows {
+			s = append(s, fmt.Sprintf("%v", r))
+		}
+		return s
+	}(), "\n")
+	// The only ExchangeSender allowed is the final PassThrough sender that returns results to TiDB.
+	// There should be no Hash-partition ExchangeSender feeding into the join.
+	require.NotContains(t, planStr, "HashPartition", "co-located join should not need a hash-partition exchange")
+
+	// Different shard count: plan MUST contain a HashPartition ExchangeSender.
+	t2Info.Meta().ShardKeyInfo = &model.ShardKeyInfo{Columns: []string{"company_id"}, ShardCnt: 8}
+	rows = tk.MustQuery(
+		"explain format='brief' select /*+ shuffle_join(t1, t2) */ count(*) from t1 join t2 on t1.company_id = t2.company_id",
+	).Rows()
+	planStr = strings.Join(func() []string {
+		s := make([]string, 0, len(rows))
+		for _, r := range rows {
+			s = append(s, fmt.Sprintf("%v", r))
+		}
+		return s
+	}(), "\n")
+	require.Contains(t, planStr, "HashPartition", "mismatched shard count must use a hash-partition exchange")
 }

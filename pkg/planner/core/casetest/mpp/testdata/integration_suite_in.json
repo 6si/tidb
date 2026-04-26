@@ -265,9 +265,9 @@
   {
     "name": "TestMPPShardKeyLocalJoin",
     "cases": [
-      "explain format = 'brief' select count(*) from orders join customers on orders.company_id = customers.company_id",
-      "explain format = 'brief' select count(*) from orders left join customers on orders.company_id = customers.company_id",
-      "explain format = 'brief' select orders.order_id, customers.name from orders join customers on orders.company_id = customers.company_id where orders.amount > 100"
+      "explain format = 'brief' select /*+ shuffle_join(orders, customers) */ count(*) from orders join customers on orders.company_id = customers.company_id",
+      "explain format = 'brief' select /*+ shuffle_join(orders, customers) */ count(*) from orders left join customers on orders.company_id = customers.company_id",
+      "explain format = 'brief' select /*+ shuffle_join(orders, customers) */ orders.order_id, customers.name from orders join customers on orders.company_id = customers.company_id where orders.amount > 100"
     ]
   }
 ]

@@ -2674,24 +2674,21 @@
     "Name": "TestMPPShardKeyLocalJoin",
     "Cases": [
       {
-        "SQL": "explain format = 'brief' select count(*) from orders join customers on orders.company_id = customers.company_id",
+        "SQL": "explain format = 'brief' select /*+ shuffle_join(orders, customers) */ count(*) from orders join customers on orders.company_id = customers.company_id",
         "Plan": [
           "HashAgg 1.00 root  funcs:count(Column#9)->Column#8",
           "└─TableReader 1.00 root  MppVersion: 2, data:ExchangeSender",
           "  └─ExchangeSender 1.00 mpp[tiflash]  ExchangeType: PassThrough",
           "    └─HashAgg 1.00 mpp[tiflash]  funcs:count(1)->Column#9",
-          "      └─Projection 12487.50 mpp[tiflash]  test.orders.company_id",
-          "        └─HashJoin 12487.50 mpp[tiflash]  inner join, equal:[eq(test.orders.company_id, test.customers.company_id)]",
-          "          ├─ExchangeReceiver(Build) 9990.00 mpp[tiflash]  ",
-          "          │ └─ExchangeSender 9990.00 mpp[tiflash]  ExchangeType: Broadcast, Compression: FAST",
-          "          │   └─Selection 9990.00 mpp[tiflash]  not(isnull(test.orders.company_id))",
-          "          │     └─TableFullScan 10000.00 mpp[tiflash] table:orders pushed down filter:empty, keep order:false, stats:pseudo",
-          "          └─Selection(Probe) 9990.00 mpp[tiflash]  not(isnull(test.customers.company_id))",
-          "            └─TableFullScan 10000.00 mpp[tiflash] table:customers pushed down filter:empty, keep order:false, stats:pseudo"
+          "      └─HashJoin 12487.50 mpp[tiflash]  inner join, equal:[eq(test.orders.company_id, test.customers.company_id)]",
+          "        ├─Selection(Build) 9990.00 mpp[tiflash]  not(isnull(test.orders.company_id))",
+          "        │ └─TableFullScan 10000.00 mpp[tiflash] table:orders pushed down filter:empty, keep order:false, stats:pseudo",
+          "        └─Selection(Probe) 9990.00 mpp[tiflash]  not(isnull(test.customers.company_id))",
+          "          └─TableFullScan 10000.00 mpp[tiflash] table:customers pushed down filter:empty, keep order:false, stats:pseudo"
         ]
       },
       {
-        "SQL": "explain format = 'brief' select count(*) from orders left join customers on orders.company_id = customers.company_id",
+        "SQL": "explain format = 'brief' select /*+ shuffle_join(orders, customers) */ count(*) from orders left join customers on orders.company_id = customers.company_id",
         "Plan": [
           "HashAgg 1.00 root  funcs:count(Column#9)->Column#8",
           "└─TableReader 1.00 root  MppVersion: 2, data:ExchangeSender",
@@ -2699,26 +2696,23 @@
           "    └─HashAgg 1.00 mpp[tiflash]  funcs:count(1)->Column#9",
           "      └─Projection 12487.50 mpp[tiflash]  test.orders.company_id",
           "        └─HashJoin 12487.50 mpp[tiflash]  left outer join, equal:[eq(test.orders.company_id, test.customers.company_id)]",
-          "          ├─ExchangeReceiver(Build) 9990.00 mpp[tiflash]  ",
-          "          │ └─ExchangeSender 9990.00 mpp[tiflash]  ExchangeType: Broadcast, Compression: FAST",
-          "          │   └─Selection 9990.00 mpp[tiflash]  not(isnull(test.customers.company_id))",
-          "          │     └─TableFullScan 10000.00 mpp[tiflash] table:customers pushed down filter:empty, keep order:false, stats:pseudo",
+          "          ├─Selection(Build) 9990.00 mpp[tiflash]  not(isnull(test.customers.company_id))",
+          "          │ └─TableFullScan 10000.00 mpp[tiflash] table:customers pushed down filter:empty, keep order:false, stats:pseudo",
           "          └─TableFullScan(Probe) 10000.00 mpp[tiflash] table:orders keep order:false, stats:pseudo"
         ]
       },
       {
-        "SQL": "explain format = 'brief' select orders.order_id, customers.name from orders join customers on orders.company_id = customers.company_id where orders.amount > 100",
+        "SQL": "explain format = 'brief' select /*+ shuffle_join(orders, customers) */ orders.order_id, customers.name from orders join customers on orders.company_id = customers.company_id where orders.amount > 100",
         "Plan": [
           "TableReader 4162.50 root  MppVersion: 2, data:ExchangeSender",
           "└─ExchangeSender 4162.50 mpp[tiflash]  ExchangeType: PassThrough",
           "  └─Projection 4162.50 mpp[tiflash]  test.orders.order_id, test.customers.name",
-          "    └─HashJoin 4162.50 mpp[tiflash]  inner join, equal:[eq(test.orders.company_id, test.customers.company_id)]",
-          "      ├─ExchangeReceiver(Build) 3330.00 mpp[tiflash]  ",
-          "      │ └─ExchangeSender 3330.00 mpp[tiflash]  ExchangeType: Broadcast, Compression: FAST",
-          "      │   └─Selection 3330.00 mpp[tiflash]  gt(test.orders.amount, 100), not(isnull(test.orders.company_id))",
-          "      │     └─TableFullScan 10000.00 mpp[tiflash] table:orders pushed down filter:empty, keep order:false, stats:pseudo",
-          "      └─Selection(Probe) 9990.00 mpp[tiflash]  not(isnull(test.customers.company_id))",
-          "        └─TableFullScan 10000.00 mpp[tiflash] table:customers pushed down filter:empty, keep order:false, stats:pseudo"
+          "    └─Projection 4162.50 mpp[tiflash]  test.orders.order_id, test.customers.name, test.customers.company_id",
+          "      └─HashJoin 4162.50 mpp[tiflash]  inner join, equal:[eq(test.orders.company_id, test.customers.company_id)]",
+          "        ├─Selection(Build) 3330.00 mpp[tiflash]  gt(test.orders.amount, 100), not(isnull(test.orders.company_id))",
+          "        │ └─TableFullScan 10000.00 mpp[tiflash] table:orders pushed down filter:empty, keep order:false, stats:pseudo",
+          "        └─Selection(Probe) 9990.00 mpp[tiflash]  not(isnull(test.customers.company_id))",
+          "          └─TableFullScan 10000.00 mpp[tiflash] table:customers pushed down filter:empty, keep order:false, stats:pseudo"
         ]
       }
     ]
