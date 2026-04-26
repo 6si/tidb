@@ -865,3 +865,49 @@ func TestIssue52828(t *testing.T) {
 	tk.MustQuery("explain SELECT MAX( OUTR . col_int ) AS X FROM C AS OUTR2 INNER JOIN B AS OUTR ON ( OUTR2 . col_decimal_not_null = OUTR . col_decimal_not_null AND OUTR2 . pk = OUTR . col_int_not_null ) " +
 		"WHERE OUTR . col_decimal_not_null IN ( SELECT INNR . col_int_not_null + 1 AS Y FROM DD AS INNR WHERE INNR . pk > INNR . pk OR INNR . col_varchar_10_not_null >= INNR . col_varchar_10 ) GROUP BY OUTR . col_datetime_not_null")
 }
+
+func TestMPPShardKeyLocalJoin(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set tidb_cost_model_version=2")
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+
+	// Two tables with matching shard key: same column, same count.
+	tk.MustExec("drop table if exists orders, customers")
+	tk.MustExec("create table orders(company_id bigint, order_id bigint, amount int)")
+	tk.MustExec("create table customers(company_id bigint, name varchar(64))")
+
+	dom := domain.GetDomain(tk.Session())
+	testkit.SetTiFlashReplica(t, dom, "test", "orders")
+	testkit.SetTiFlashReplica(t, dom, "test", "customers")
+
+	// Inject matching shard key metadata on both tables.
+	is := dom.InfoSchema()
+	ordersTbl, err := is.TableByName(context.Background(),
+		pmodel.NewCIStr("test"), pmodel.NewCIStr("orders"))
+	require.NoError(t, err)
+	ordersTbl.Meta().ShardKeyInfo = &model.ShardKeyInfo{Columns: []string{"company_id"}, ShardCnt: 4}
+
+	customersTbl, err := is.TableByName(context.Background(),
+		pmodel.NewCIStr("test"), pmodel.NewCIStr("customers"))
+	require.NoError(t, err)
+	customersTbl.Meta().ShardKeyInfo = &model.ShardKeyInfo{Columns: []string{"company_id"}, ShardCnt: 4}
+
+	var input []string
+	var output []struct {
+		SQL  string
+		Plan []string
+	}
+	integrationSuiteData := GetIntegrationSuiteData()
+	integrationSuiteData.LoadTestCases(t, &input, &output)
+	for i, tt := range input {
+		testdata.OnRecord(func() {
+			output[i].SQL = tt
+			output[i].Plan = testdata.ConvertRowsToStrings(tk.MustQuery(tt).Rows())
+		})
+		res := tk.MustQuery(tt)
+		res.Check(testkit.Rows(output[i].Plan...))
+	}
+}
