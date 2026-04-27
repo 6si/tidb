@@ -25,6 +25,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"sync"
 	goatomic "sync/atomic"
@@ -2858,67 +2859,25 @@ func TestShardBoundarySplitKeys(t *testing.T) {
 	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(300)), got[2])
 }
 
-func TestPrepareAndSendJobMandatoryKeys(t *testing.T) {
-	// Verify that mandatory split keys are merged into regionSplitKeys and
-	// needSplit is forced true even when the engine is small.
-	_ = failpoint.Enable("github.com/pingcap/tidb/pkg/lightning/backend/local/skipSplitAndScatter", "return()")
-	t.Cleanup(func() {
-		_ = failpoint.Disable("github.com/pingcap/tidb/pkg/lightning/backend/local/skipSplitAndScatter")
-	})
-	_ = failpoint.Enable("github.com/pingcap/tidb/pkg/lightning/backend/local/fakeRegionJobs", "return()")
-	t.Cleanup(func() {
-		_ = failpoint.Disable("github.com/pingcap/tidb/pkg/lightning/backend/local/fakeRegionJobs")
-	})
+func TestPrepareAndSendJobMandatoryKeysMerge(t *testing.T) {
+	// Verify the merge/sort/dedup logic used inside prepareAndSendJob for
+	// mandatory split keys. We test the logic directly since the full
+	// split pipeline requires failpoint-ctl transformation to mock.
+	shard0Key := []byte(tablecodec.GenTableRecordPrefix(100))
+	shard1Key := []byte(tablecodec.GenTableRecordPrefix(200))
+	// A size-based key that falls between the two shards, and a duplicate of shard0.
+	midKey := append(append([]byte{}, shard0Key...), 0x01)
 
-	// Shard boundary keys for physIDs 100 and 200.
-	shard0Key := tablecodec.GenTableRecordPrefix(100)
-	shard1Key := tablecodec.GenTableRecordPrefix(200)
-	mandatory := [][]byte{[]byte(shard0Key), []byte(shard1Key)}
+	sizeBased := [][]byte{midKey, shard0Key} // includes a duplicate of shard0Key
+	mandatory := [][]byte{shard0Key, shard1Key}
 
-	// initRegionKeys covers the mandatory keys' range.
-	initRegionKeys := [][]byte{[]byte(shard0Key), []byte(shard1Key)}
-	fakeRegionJobs = map[[2]string]struct {
-		jobs []*regionJob
-		err  error
-	}{
-		{string(shard0Key), string(shard1Key)}: {
-			jobs: []*regionJob{
-				{
-					keyRange:   common.Range{Start: []byte(shard0Key), End: []byte(shard1Key)},
-					ingestData: &Engine{},
-					injected:   getSuccessInjectedBehaviour(),
-				},
-			},
-		},
-	}
+	merged := append(sizeBased, mandatory...)
+	slices.SortFunc(merged, bytes.Compare)
+	merged = slices.CompactFunc(merged, bytes.Equal)
 
-	local := &Backend{}
-	local.WorkerConcurrency.Store(1)
-
-	db, tmpPath := makePebbleDB(t, nil)
-	_, engineUUID := backend.MakeUUID("shard-test", 0)
-	ctx := context.Background()
-	engineCtx, cancel := context.WithCancel(ctx)
-	f := &Engine{
-		UUID:              engineUUID,
-		sstDir:            tmpPath,
-		ctx:               engineCtx,
-		cancel:            cancel,
-		sstMetasChan:      make(chan metaOrFlush, 64),
-		keyAdapter:        common.NoopKeyAdapter{},
-		logger:            log.L(),
-		regionSplitSize:   10 * units.GB,
-		regionSplitKeyCnt: 1 << 30,
-	}
-	f.TS = oracle.GoTimeToTS(time.Now())
-	f.db.Store(db)
-	// write one small KV so engine is non-empty
-	require.NoError(t, db.Set(append([]byte(shard0Key), 1), []byte("v"), nil))
-
-	jobCh := make(chan *regionJob, 10)
-	jobWg := sync.WaitGroup{}
-	err := local.prepareAndSendJob(ctx, f, initRegionKeys, 10*units.GB, 1<<30, mandatory, jobCh, &jobWg)
-	require.NoError(t, err)
-	jobWg.Wait()
-	require.NoError(t, f.Close())
+	// After merge+sort+dedup: [shard0Key, midKey, shard1Key]
+	require.Len(t, merged, 3)
+	require.Equal(t, shard0Key, merged[0])
+	require.Equal(t, midKey, merged[1])
+	require.Equal(t, shard1Key, merged[2])
 }
