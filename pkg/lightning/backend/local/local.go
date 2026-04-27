@@ -23,6 +23,7 @@ import (
 	"math"
 	"net"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -1006,12 +1007,21 @@ func (local *Backend) prepareAndSendJob(
 	engine common.Engine,
 	regionSplitKeys [][]byte,
 	regionSplitSize, regionSplitKeyCnt int64,
+	mandatorySplitKeys [][]byte,
 	jobToWorkerCh chan<- *regionJob,
 	jobWg *sync.WaitGroup,
 ) error {
 	lfTotalSize, lfLength := engine.KVStatistics()
 	splitRangesBatch := GetMaxBatchSplitRanges()
 	maxRangesPerSec := GetMaxSplitRangePerSec()
+
+	// Merge mandatory shard boundary keys with size-based split keys.
+	// Mandatory keys must always become region boundaries regardless of data size.
+	if len(mandatorySplitKeys) > 0 {
+		regionSplitKeys = append(regionSplitKeys, mandatorySplitKeys...)
+		slices.SortFunc(regionSplitKeys, bytes.Compare)
+		regionSplitKeys = slices.CompactFunc(regionSplitKeys, bytes.Equal)
+	}
 
 	log.FromContext(ctx).Info("import engine ranges",
 		zap.Int("len(regionSplitKeys)", len(regionSplitKeys)),
@@ -1021,7 +1031,7 @@ func (local *Backend) prepareAndSendJob(
 
 	// if all the kv can fit in one region, skip split regions. TiDB will split one region for
 	// the table when table is created.
-	needSplit := len(regionSplitKeys) > 2 || lfTotalSize > regionSplitSize || lfLength > regionSplitKeyCnt
+	needSplit := len(mandatorySplitKeys) > 0 || len(regionSplitKeys) > 2 || lfTotalSize > regionSplitSize || lfLength > regionSplitKeyCnt
 	// split region by given ranges
 	failpoint.Inject("failToSplit", func(_ failpoint.Value) {
 		needSplit = true
@@ -1693,6 +1703,7 @@ func (local *Backend) doImport(
 			regionSplitKeys,
 			regionSplitSize,
 			regionSplitKeyCnt,
+			nil, // mandatorySplitKeys: populated for sharded tables in ImportEngine
 			jobToWorkerCh,
 			&jobWg,
 		)
