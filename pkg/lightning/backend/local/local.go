@@ -958,6 +958,17 @@ func splitRangeBySizeProps(fullRange common.Range, sizeProps *sizeProperties, si
 	return ranges
 }
 
+// shardBoundarySplitKeys returns a record-prefix split key for each shard
+// physical table ID in ski.ShardIDs. These are mandatory split points so each
+// shard gets its own TiKV region regardless of data size.
+func shardBoundarySplitKeys(ski *model.ShardKeyInfo) [][]byte {
+	keys := make([][]byte, 0, len(ski.ShardIDs))
+	for _, physID := range ski.ShardIDs {
+		keys = append(keys, tablecodec.GenTableRecordPrefix(physID))
+	}
+	return keys
+}
+
 func getRegionSplitKeys(
 	ctx context.Context,
 	engine common.Engine,

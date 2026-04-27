@@ -52,6 +52,7 @@ import (
 	"github.com/pingcap/tidb/pkg/lightning/common"
 	"github.com/pingcap/tidb/pkg/lightning/config"
 	"github.com/pingcap/tidb/pkg/lightning/log"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/resourcemanager/pool/workerpool"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/tablecodec"
@@ -2842,4 +2843,17 @@ func (m *mockEngineWithData) GetRegionSplitKeys() ([][]byte, error) {
 
 func (m *mockEngineWithData) Close() error {
 	return nil
+}
+
+func TestShardBoundarySplitKeys(t *testing.T) {
+	ski := &model.ShardKeyInfo{
+		Columns:  []string{"company_id"},
+		ShardCnt: 3,
+		ShardIDs: []int64{100, 200, 300},
+	}
+	got := shardBoundarySplitKeys(ski)
+	require.Len(t, got, 3)
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(100)), got[0])
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(200)), got[1])
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(300)), got[2])
 }
