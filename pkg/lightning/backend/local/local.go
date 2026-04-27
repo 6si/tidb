@@ -1402,6 +1402,7 @@ func (local *Backend) ImportEngine(
 		log.FromContext(ctx).Warn("fail to get region split keys and size", zap.Error(err))
 	}
 
+	var mandatorySplitKeys [][]byte
 	var e common.Engine
 	if externalEngine, ok := local.engineMgr.getExternalEngine(engineUUID); ok {
 		e = externalEngine
@@ -1415,6 +1416,9 @@ func (local *Backend) ImportEngine(
 		localEngine.regionSplitSize = regionSplitSize
 		localEngine.regionSplitKeyCnt = regionSplitKeys
 		e = localEngine
+		if ski := localEngine.tableInfo.Core.ShardKeyInfo; ski != nil && len(ski.ShardIDs) > 0 {
+			mandatorySplitKeys = shardBoundarySplitKeys(ski)
+		}
 	}
 	lfTotalSize, lfLength := e.KVStatistics()
 	if lfTotalSize == 0 {
@@ -1496,7 +1500,7 @@ func (local *Backend) ImportEngine(
 
 	failpoint.InjectCall("ReadyForImportEngine")
 
-	err = local.doImport(ctx, e, splitKeys, regionSplitSize, regionSplitKeys)
+	err = local.doImport(ctx, e, splitKeys, regionSplitSize, regionSplitKeys, mandatorySplitKeys)
 	if err == nil {
 		importedSize, importedLength := e.ImportedStatistics()
 
@@ -1525,6 +1529,7 @@ func (local *Backend) doImport(
 	engine common.Engine,
 	regionSplitKeys [][]byte,
 	regionSplitSize, regionSplitKeyCnt int64,
+	mandatorySplitKeys [][]byte,
 ) error {
 	/*
 	 ┌─────────────────┐                   ┌─────────────┐   ┌────────────┐
@@ -1703,7 +1708,7 @@ func (local *Backend) doImport(
 			regionSplitKeys,
 			regionSplitSize,
 			regionSplitKeyCnt,
-			nil, // mandatorySplitKeys: populated for sharded tables in ImportEngine
+			mandatorySplitKeys,
 			jobToWorkerCh,
 			&jobWg,
 		)
