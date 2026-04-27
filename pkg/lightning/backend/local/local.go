@@ -1002,11 +1002,14 @@ func getRegionSplitKeys(
 
 // mergeSplitKeys merges mandatory split keys into base, returning a sorted,
 // deduplicated slice. Returns base unchanged when mandatory is empty.
+// Never modifies base's underlying array.
 func mergeSplitKeys(base, mandatory [][]byte) [][]byte {
 	if len(mandatory) == 0 {
 		return base
 	}
-	merged := append(base, mandatory...)
+	merged := make([][]byte, len(base)+len(mandatory))
+	copy(merged, base)
+	copy(merged[len(base):], mandatory)
 	slices.SortFunc(merged, bytes.Compare)
 	return slices.CompactFunc(merged, bytes.Equal)
 }

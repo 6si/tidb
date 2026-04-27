@@ -2864,7 +2864,7 @@ func TestMergeSplitKeys(t *testing.T) {
 	shard1Key := []byte(tablecodec.GenTableRecordPrefix(200))
 	midKey := append(append([]byte{}, shard0Key...), 0x01)
 
-	// size-based keys include a duplicate of shard0Key; mandatory adds shard0Key again
+	// base includes shard0Key; mandatory adds it again as a duplicate
 	got := mergeSplitKeys([][]byte{midKey, shard0Key}, [][]byte{shard0Key, shard1Key})
 
 	// After merge+sort+dedup: [shard0Key, midKey, shard1Key]
@@ -2876,12 +2876,24 @@ func TestMergeSplitKeys(t *testing.T) {
 	// empty mandatory leaves base unchanged
 	base := [][]byte{shard0Key, shard1Key}
 	require.Equal(t, base, mergeSplitKeys(base, nil))
+
+	// base with spare capacity must not be mutated
+	bigBase := make([][]byte, 2, 10)
+	bigBase[0] = shard0Key
+	bigBase[1] = midKey
+	_ = mergeSplitKeys(bigBase, [][]byte{shard1Key})
+	require.Equal(t, shard0Key, bigBase[0], "mergeSplitKeys must not mutate base")
+	require.Equal(t, midKey, bigBase[1], "mergeSplitKeys must not mutate base")
+	require.Equal(t, 2, len(bigBase), "mergeSplitKeys must not change base length")
 }
 
 func TestImportEngineMandatoryKeysFromTableInfo(t *testing.T) {
 	// Verify the nil guards in ImportEngine around tableInfo: an Engine with
 	// nil tableInfo must not panic, and one with a valid ShardKeyInfo must
 	// produce the expected mandatory keys via shardBoundarySplitKeys.
+	// Note: ImportEngine itself is not invoked here because the full split
+	// pipeline requires failpoint-ctl transformation to mock. This test
+	// mirrors the guard logic from ImportEngine to verify nil-safety.
 	physID0 := int64(1001)
 	physID1 := int64(1002)
 	ski := &model.ShardKeyInfo{
