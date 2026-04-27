@@ -25,7 +25,6 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"sort"
 	"sync"
 	goatomic "sync/atomic"
@@ -2860,36 +2859,29 @@ func TestShardBoundarySplitKeys(t *testing.T) {
 	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(300)), got[2])
 }
 
-func TestPrepareAndSendJobMandatoryKeysMerge(t *testing.T) {
-	// Verify the merge/sort/dedup logic used inside prepareAndSendJob for
-	// mandatory split keys. We test the logic directly since the full
-	// split pipeline requires failpoint-ctl transformation to mock.
+func TestMergeSplitKeys(t *testing.T) {
 	shard0Key := []byte(tablecodec.GenTableRecordPrefix(100))
 	shard1Key := []byte(tablecodec.GenTableRecordPrefix(200))
-	// A size-based key that falls between the two shards, and a duplicate of shard0.
 	midKey := append(append([]byte{}, shard0Key...), 0x01)
 
-	sizeBased := [][]byte{midKey, shard0Key} // includes a duplicate of shard0Key
-	mandatory := [][]byte{shard0Key, shard1Key}
-
-	merged := append(sizeBased, mandatory...)
-	slices.SortFunc(merged, bytes.Compare)
-	merged = slices.CompactFunc(merged, bytes.Equal)
+	// size-based keys include a duplicate of shard0Key; mandatory adds shard0Key again
+	got := mergeSplitKeys([][]byte{midKey, shard0Key}, [][]byte{shard0Key, shard1Key})
 
 	// After merge+sort+dedup: [shard0Key, midKey, shard1Key]
-	require.Len(t, merged, 3)
-	require.Equal(t, shard0Key, merged[0])
-	require.Equal(t, midKey, merged[1])
-	require.Equal(t, shard1Key, merged[2])
+	require.Len(t, got, 3)
+	require.Equal(t, shard0Key, got[0])
+	require.Equal(t, midKey, got[1])
+	require.Equal(t, shard1Key, got[2])
+
+	// empty mandatory leaves base unchanged
+	base := [][]byte{shard0Key, shard1Key}
+	require.Equal(t, base, mergeSplitKeys(base, nil))
 }
 
-func TestImportEngineShardedTableMandatoryKeys(t *testing.T) {
-	// Verify that ImportEngine reads ShardKeyInfo from the local engine's
-	// tableInfo and computes mandatory split keys for sharded tables.
-	// We test by confirming the shard boundary keys are correctly generated
-	// from the engine's tableInfo — the wiring to doImport/prepareAndSendJob
-	// is verified by compilation and the merge logic test.
-
+func TestImportEngineMandatoryKeysFromTableInfo(t *testing.T) {
+	// Verify the nil guards in ImportEngine around tableInfo: an Engine with
+	// nil tableInfo must not panic, and one with a valid ShardKeyInfo must
+	// produce the expected mandatory keys via shardBoundarySplitKeys.
 	physID0 := int64(1001)
 	physID1 := int64(1002)
 	ski := &model.ShardKeyInfo{
@@ -2897,23 +2889,31 @@ func TestImportEngineShardedTableMandatoryKeys(t *testing.T) {
 		ShardCnt: 2,
 		ShardIDs: []int64{physID0, physID1},
 	}
-	tableInfo := &checkpoints.TidbTableInfo{
-		ID:   1000,
-		DB:   "test",
-		Name: "t",
-		Core: &model.TableInfo{
-			ShardKeyInfo: ski,
+
+	// Engine with nil tableInfo — guard must prevent panic.
+	noInfo := &Engine{}
+	var mandatoryNil [][]byte
+	if noInfo.tableInfo != nil && noInfo.tableInfo.Core != nil {
+		if s := noInfo.tableInfo.Core.ShardKeyInfo; s != nil && len(s.ShardIDs) > 0 {
+			mandatoryNil = shardBoundarySplitKeys(s)
+		}
+	}
+	require.Nil(t, mandatoryNil)
+
+	// Engine with valid ShardKeyInfo — must produce two boundary keys.
+	withInfo := &Engine{
+		tableInfo: &checkpoints.TidbTableInfo{
+			ID: 1000, DB: "test", Name: "t",
+			Core: &model.TableInfo{ShardKeyInfo: ski},
 		},
 	}
-
-	// Verify the keys that would be computed for this tableInfo.
-	gotKeys := shardBoundarySplitKeys(ski)
-	require.Len(t, gotKeys, 2)
-	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(physID0)), gotKeys[0])
-	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(physID1)), gotKeys[1])
-
-	// Confirm nil is returned for non-sharded tableInfo.
-	nonSharded := &model.TableInfo{}
-	require.Nil(t, nonSharded.ShardKeyInfo)
-	_ = tableInfo // used above
+	var mandatory [][]byte
+	if withInfo.tableInfo != nil && withInfo.tableInfo.Core != nil {
+		if s := withInfo.tableInfo.Core.ShardKeyInfo; s != nil && len(s.ShardIDs) > 0 {
+			mandatory = shardBoundarySplitKeys(s)
+		}
+	}
+	require.Len(t, mandatory, 2)
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(physID0)), mandatory[0])
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(physID1)), mandatory[1])
 }

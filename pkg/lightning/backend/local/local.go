@@ -1000,6 +1000,17 @@ func getRegionSplitKeys(
 	return keys, err
 }
 
+// mergeSplitKeys merges mandatory split keys into base, returning a sorted,
+// deduplicated slice. Returns base unchanged when mandatory is empty.
+func mergeSplitKeys(base, mandatory [][]byte) [][]byte {
+	if len(mandatory) == 0 {
+		return base
+	}
+	merged := append(base, mandatory...)
+	slices.SortFunc(merged, bytes.Compare)
+	return slices.CompactFunc(merged, bytes.Equal)
+}
+
 // prepareAndSendJob will read the engine to get estimated key range, then split
 // and scatter regions for these range and send region jobs to jobToWorkerCh.
 func (local *Backend) prepareAndSendJob(
@@ -1015,13 +1026,7 @@ func (local *Backend) prepareAndSendJob(
 	splitRangesBatch := GetMaxBatchSplitRanges()
 	maxRangesPerSec := GetMaxSplitRangePerSec()
 
-	// Merge mandatory shard boundary keys with size-based split keys.
-	// Mandatory keys must always become region boundaries regardless of data size.
-	if len(mandatorySplitKeys) > 0 {
-		regionSplitKeys = append(regionSplitKeys, mandatorySplitKeys...)
-		slices.SortFunc(regionSplitKeys, bytes.Compare)
-		regionSplitKeys = slices.CompactFunc(regionSplitKeys, bytes.Equal)
-	}
+	regionSplitKeys = mergeSplitKeys(regionSplitKeys, mandatorySplitKeys)
 
 	log.FromContext(ctx).Info("import engine ranges",
 		zap.Int("len(regionSplitKeys)", len(regionSplitKeys)),
@@ -1416,8 +1421,10 @@ func (local *Backend) ImportEngine(
 		localEngine.regionSplitSize = regionSplitSize
 		localEngine.regionSplitKeyCnt = regionSplitKeys
 		e = localEngine
-		if ski := localEngine.tableInfo.Core.ShardKeyInfo; ski != nil && len(ski.ShardIDs) > 0 {
-			mandatorySplitKeys = shardBoundarySplitKeys(ski)
+		if localEngine.tableInfo != nil && localEngine.tableInfo.Core != nil {
+			if ski := localEngine.tableInfo.Core.ShardKeyInfo; ski != nil && len(ski.ShardIDs) > 0 {
+				mandatorySplitKeys = shardBoundarySplitKeys(ski)
+			}
 		}
 	}
 	lfTotalSize, lfLength := e.KVStatistics()
