@@ -729,7 +729,7 @@ var tokenMap = map[string]int{
 	"SESSION_STATES":           sessionStates,
 	"SET":                      set,
 	"SETVAL":                   setval,
-	"SHARD_KEY":               shardKey,
+	"SHARD":                    shard,
 	"SHARD_ROW_ID_BITS":        shardRowIDBits,
 	"SHARDS":                   shards,
 	"SHARE":                    share,

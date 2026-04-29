@@ -2204,6 +2204,16 @@ func (e *executor) AddTablePartitions(ctx sessionctx.Context, ident ast.Ident, s
 	}
 
 	meta := t.Meta()
+	// For combined shard+partitioned tables, Meta() returns the synthetic flat shard
+	// PartitionInfo (Type=0, no Columns). We must use the real PartitionInfo for ADD
+	// PARTITION so that BuildAddedPartitionInfo uses the correct type (e.g. LIST COLUMNS).
+	if spt, ok := t.(table.ShardedPartitionedTable); ok {
+		if orig := spt.OrigPartitionInfo(); orig != nil {
+			metaCopy := *meta
+			metaCopy.Partition = orig
+			meta = &metaCopy
+		}
+	}
 	pi := meta.GetPartitionInfo()
 	if pi == nil {
 		return errors.Trace(dbterror.ErrPartitionMgmtOnNonpartitioned)
@@ -2271,6 +2281,9 @@ func (e *executor) AddTablePartitions(ctx sessionctx.Context, ident ast.Ident, s
 	job.AddSessionVars(variable.TiDBScatterRegion, getScatterScopeFromSessionctx(ctx))
 	args := &model.TablePartitionArgs{
 		PartInfo: partInfo,
+	}
+	if ski := meta.ShardKeyInfo; ski != nil && ski.ShardCnt > 0 {
+		args.ShardCnt = ski.ShardCnt
 	}
 
 	if spec.Tp == ast.AlterTableAddLastPartition && spec.Partition != nil {

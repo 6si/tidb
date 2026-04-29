@@ -1216,7 +1216,7 @@ type PartitionDefinition struct {
 	PlacementPolicyRef *PolicyRefInfo `json:"policy_ref_info"`
 	Comment            string         `json:"comment,omitempty"`
 	// ShardIDs holds the physical table IDs for each shard within this partition,
-	// populated at CREATE TABLE time when the table has both PARTITION BY and SHARD_KEY.
+	// populated at CREATE TABLE time when the table has both PARTITION BY and SHARD BY.
 	// len(ShardIDs) == ShardKeyInfo.ShardCnt. Nil when the table is not sharded.
 	ShardIDs []int64 `json:"shard_ids,omitempty"`
 }
@@ -1226,6 +1226,13 @@ func (ci *PartitionDefinition) Clone() PartitionDefinition {
 	nci := *ci
 	nci.LessThan = make([]string, len(ci.LessThan))
 	copy(nci.LessThan, ci.LessThan)
+	if len(ci.InValues) > 0 {
+		nci.InValues = make([][]string, len(ci.InValues))
+		for i, vs := range ci.InValues {
+			nci.InValues[i] = make([]string, len(vs))
+			copy(nci.InValues[i], vs)
+		}
+	}
 	if len(ci.ShardIDs) > 0 {
 		nci.ShardIDs = make([]int64, len(ci.ShardIDs))
 		copy(nci.ShardIDs, ci.ShardIDs)

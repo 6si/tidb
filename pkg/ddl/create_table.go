@@ -833,13 +833,13 @@ func BuildTableInfoWithStmt(ctx *metabuild.Context, s *ast.CreateTableStmt, dbCh
 		return nil, errors.Trace(err)
 	}
 
-	// Set shard key info from the SHARD_KEY clause
+	// Set shard key info from the SHARD BY clause
 	if s.ShardKeyInfo != nil {
 		if tbInfo.TempTableType != model.TempTableNone {
-			return nil, dbterror.ErrNotSupportedYet.GenWithStackByArgs("SHARD_KEY on temporary tables")
+			return nil, dbterror.ErrNotSupportedYet.GenWithStackByArgs("SHARD BY on temporary tables")
 		}
 		if tbInfo.ShardRowIDBits > 0 {
-			return nil, dbterror.ErrNotSupportedYet.GenWithStackByArgs("SHARD_KEY together with SHARD_ROW_ID_BITS")
+			return nil, dbterror.ErrNotSupportedYet.GenWithStackByArgs("SHARD BY together with SHARD_ROW_ID_BITS")
 		}
 		// A column cannot serve both as a partition column and a shard key column.
 		// Partition-by-range/list on the shard key breaks uniform hash distribution.

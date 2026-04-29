@@ -607,7 +607,7 @@ import (
 	serializable          "SERIALIZABLE"
 	session               "SESSION"
 	setval                "SETVAL"
-	shardKey              "SHARD_KEY"
+	shard                 "SHARD"
 	shardRowIDBits        "SHARD_ROW_ID_BITS"
 	shards                "SHARDS"
 	share                 "SHARE"
@@ -4614,9 +4614,9 @@ PartitionOpt:
 
 ShardKeyOpt:
 	{ $$ = nil }
-|   "SHARD_KEY" '(' ColumnNameList ')' "INTO" LengthNum "SHARDS"
+|   "SHARD" "BY" '(' ColumnNameList ')' "SHARDS" LengthNum
 	{
-		shardCnt := int($6.(uint64))
+		shardCnt := int($7.(uint64))
 		if shardCnt <= 1 {
 			yylex.AppendError(errors.New("Shard count must be greater than 1"))
 			return 1
@@ -4626,7 +4626,7 @@ ShardKeyOpt:
 			return 1
 		}
 		$$ = &ast.ShardKeyClause{
-			Columns:  $3.([]*ast.ColumnName),
+			Columns:  $4.([]*ast.ColumnName),
 			ShardCnt: shardCnt,
 		}
 	}

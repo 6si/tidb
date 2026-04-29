@@ -1090,18 +1090,18 @@ const (
 	TemporaryLocal
 )
 
-// ShardKeyClause represents SHARD_KEY(col1, col2) INTO N SHARDS clause
+// ShardKeyClause represents SHARD BY (col1, col2) SHARDS N clause
 type ShardKeyClause struct {
 	node
 
 	Columns  []*ColumnName // Column names forming the shard key
-	ShardCnt int          // Number of shards from INTO N SHARDS
+	ShardCnt int          // Number of shards from SHARDS N
 }
 
 // Restore implements Node interface.
 func (n *ShardKeyClause) Restore(ctx *format.RestoreCtx) error {
-	ctx.WriteKeyWord("SHARD_KEY")
-	ctx.WritePlain("(")
+	ctx.WriteKeyWord("SHARD BY")
+	ctx.WritePlain(" (")
 	for i, col := range n.Columns {
 		if i > 0 {
 			ctx.WritePlain(", ")
@@ -1111,9 +1111,8 @@ func (n *ShardKeyClause) Restore(ctx *format.RestoreCtx) error {
 		}
 	}
 	ctx.WritePlain(")")
-	ctx.WriteKeyWord(" INTO ")
+	ctx.WriteKeyWord(" SHARDS ")
 	ctx.WritePlainf("%d", n.ShardCnt)
-	ctx.WriteKeyWord(" SHARDS")
 	return nil
 }
 
