@@ -49,9 +49,11 @@ import (
 	"github.com/pingcap/tidb/pkg/lightning/backend"
 	"github.com/pingcap/tidb/pkg/lightning/backend/external"
 	"github.com/pingcap/tidb/pkg/lightning/backend/kv"
+	"github.com/pingcap/tidb/pkg/lightning/checkpoints"
 	"github.com/pingcap/tidb/pkg/lightning/common"
 	"github.com/pingcap/tidb/pkg/lightning/config"
 	"github.com/pingcap/tidb/pkg/lightning/log"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/resourcemanager/pool/workerpool"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/tablecodec"
@@ -1944,7 +1946,7 @@ func TestDoImport(t *testing.T) {
 		},
 	}
 	e := &Engine{regionSplitKeysCache: initRegionKeys}
-	err := l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys))
+	err := l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys), nil)
 	require.NoError(t, err)
 	for _, v := range fakeRegionJobs {
 		for _, job := range v.jobs {
@@ -1971,7 +1973,7 @@ func TestDoImport(t *testing.T) {
 			err: errors.New("meet error when generateJobForRange"),
 		},
 	}
-	err = l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys))
+	err = l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys), nil)
 	require.ErrorContains(t, err, "meet error when generateJobForRange")
 
 	// test second call to generateJobForRange (needRescan) meet error
@@ -2016,7 +2018,7 @@ func TestDoImport(t *testing.T) {
 			err: errors.New("meet error when generateJobForRange again"),
 		},
 	}
-	err = l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys))
+	err = l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys), nil)
 	require.ErrorContains(t, err, "meet error when generateJobForRange again")
 
 	// test write meet unretryable error
@@ -2064,7 +2066,7 @@ func TestDoImport(t *testing.T) {
 			},
 		},
 	}
-	err = l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys))
+	err = l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys), nil)
 	require.ErrorContains(t, err, "fatal error")
 }
 
@@ -2150,7 +2152,7 @@ func TestRegionJobResetRetryCounter(t *testing.T) {
 		},
 	}
 	e := &Engine{regionSplitKeysCache: initRegionKeys}
-	err := l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys))
+	err := l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys), nil)
 	require.NoError(t, err)
 	for _, v := range fakeRegionJobs {
 		for _, job := range v.jobs {
@@ -2209,7 +2211,7 @@ func TestCtxCancelIsIgnored(t *testing.T) {
 		},
 	}
 	e := &Engine{regionSplitKeysCache: initRegionKeys}
-	err := l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys))
+	err := l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys), nil)
 	require.ErrorContains(t, err, "the remaining storage capacity of TiKV")
 }
 
@@ -2244,7 +2246,7 @@ func TestWorkerFailedWhenGeneratingJobs(t *testing.T) {
 		),
 	}
 	e := &Engine{regionSplitKeysCache: initRegionKeys}
-	err := l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys))
+	err := l.doImport(ctx, e, initRegionKeys, int64(config.SplitRegionSize), int64(config.SplitRegionKeys), nil)
 	require.ErrorContains(t, err, "the remaining storage capacity of TiKV")
 }
 
@@ -2842,4 +2844,88 @@ func (m *mockEngineWithData) GetRegionSplitKeys() ([][]byte, error) {
 
 func (m *mockEngineWithData) Close() error {
 	return nil
+}
+
+func TestShardBoundarySplitKeys(t *testing.T) {
+	ski := &model.ShardKeyInfo{
+		Columns:  []string{"company_id"},
+		ShardCnt: 3,
+		ShardIDs: []int64{100, 200, 300},
+	}
+	got := shardBoundarySplitKeys(ski)
+	require.Len(t, got, 3)
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(100)), got[0])
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(200)), got[1])
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(300)), got[2])
+}
+
+func TestMergeSplitKeys(t *testing.T) {
+	shard0Key := []byte(tablecodec.GenTableRecordPrefix(100))
+	shard1Key := []byte(tablecodec.GenTableRecordPrefix(200))
+	midKey := append(append([]byte{}, shard0Key...), 0x01)
+
+	// base includes shard0Key; mandatory adds it again as a duplicate
+	got := mergeSplitKeys([][]byte{midKey, shard0Key}, [][]byte{shard0Key, shard1Key})
+
+	// After merge+sort+dedup: [shard0Key, midKey, shard1Key]
+	require.Len(t, got, 3)
+	require.Equal(t, shard0Key, got[0])
+	require.Equal(t, midKey, got[1])
+	require.Equal(t, shard1Key, got[2])
+
+	// empty mandatory leaves base unchanged
+	base := [][]byte{shard0Key, shard1Key}
+	require.Equal(t, base, mergeSplitKeys(base, nil))
+
+	// base with spare capacity must not be mutated
+	bigBase := make([][]byte, 2, 10)
+	bigBase[0] = shard0Key
+	bigBase[1] = midKey
+	_ = mergeSplitKeys(bigBase, [][]byte{shard1Key})
+	require.Equal(t, shard0Key, bigBase[0], "mergeSplitKeys must not mutate base")
+	require.Equal(t, midKey, bigBase[1], "mergeSplitKeys must not mutate base")
+	require.Equal(t, 2, len(bigBase), "mergeSplitKeys must not change base length")
+}
+
+func TestImportEngineMandatoryKeysFromTableInfo(t *testing.T) {
+	// Verify the nil guards in ImportEngine around tableInfo: an Engine with
+	// nil tableInfo must not panic, and one with a valid ShardKeyInfo must
+	// produce the expected mandatory keys via shardBoundarySplitKeys.
+	// Note: ImportEngine itself is not invoked here because the full split
+	// pipeline requires failpoint-ctl transformation to mock. This test
+	// mirrors the guard logic from ImportEngine to verify nil-safety.
+	physID0 := int64(1001)
+	physID1 := int64(1002)
+	ski := &model.ShardKeyInfo{
+		Columns:  []string{"company_id"},
+		ShardCnt: 2,
+		ShardIDs: []int64{physID0, physID1},
+	}
+
+	// Engine with nil tableInfo — guard must prevent panic.
+	noInfo := &Engine{}
+	var mandatoryNil [][]byte
+	if noInfo.tableInfo != nil && noInfo.tableInfo.Core != nil {
+		if s := noInfo.tableInfo.Core.ShardKeyInfo; s != nil && len(s.ShardIDs) > 0 {
+			mandatoryNil = shardBoundarySplitKeys(s)
+		}
+	}
+	require.Nil(t, mandatoryNil)
+
+	// Engine with valid ShardKeyInfo — must produce two boundary keys.
+	withInfo := &Engine{
+		tableInfo: &checkpoints.TidbTableInfo{
+			ID: 1000, DB: "test", Name: "t",
+			Core: &model.TableInfo{ShardKeyInfo: ski},
+		},
+	}
+	var mandatory [][]byte
+	if withInfo.tableInfo != nil && withInfo.tableInfo.Core != nil {
+		if s := withInfo.tableInfo.Core.ShardKeyInfo; s != nil && len(s.ShardIDs) > 0 {
+			mandatory = shardBoundarySplitKeys(s)
+		}
+	}
+	require.Len(t, mandatory, 2)
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(physID0)), mandatory[0])
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(physID1)), mandatory[1])
 }

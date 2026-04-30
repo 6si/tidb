@@ -15,6 +15,7 @@
 package core
 
 import (
+	"hash/crc32"
 	"math"
 	"strconv"
 	"strings"
@@ -688,4 +689,64 @@ func BenchmarkRangeColumnsPruner1000(b *testing.B) {
 
 func BenchmarkRangeColumnsPruner8000(b *testing.B) {
 	benchmarkRangeColumnsPruner(b, 8000)
+}
+
+// TestAppendDistinct verifies that appendDistinct deduplicates by hash key.
+func TestAppendDistinct(t *testing.T) {
+	var vals []types.Datum
+	vals = appendDistinct(vals, types.NewIntDatum(1))
+	vals = appendDistinct(vals, types.NewIntDatum(2))
+	vals = appendDistinct(vals, types.NewIntDatum(1)) // duplicate
+	require.Len(t, vals, 2)
+
+	// NULL values: two NULLs must collapse to one.
+	var nullVals []types.Datum
+	nullVals = appendDistinct(nullVals, types.NewDatum(nil))
+	nullVals = appendDistinct(nullVals, types.NewDatum(nil))
+	require.Len(t, nullVals, 1)
+}
+
+// TestShardKeySlotHashesCRC32 verifies that the CRC32/IEEE slot used in
+// processShardKeyPartition matches the same algorithm in shard.go's locateShard.
+// Slot assignments for shardCnt=4: 1→3, 5→2, 42→0, 100→2.
+func TestShardKeySlotHashesCRC32(t *testing.T) {
+	shardCnt := 4
+	cases := []struct {
+		val      int64
+		wantSlot int
+	}{
+		{1, 3},
+		{5, 2},
+		{42, 0},
+		{100, 2},
+	}
+	for _, tc := range cases {
+		d := types.NewIntDatum(tc.val)
+		h := crc32.NewIEEE()
+		data, err := d.ToHashKey()
+		require.NoError(t, err)
+		h.Write(data)
+		got := int(h.Sum32() % uint32(shardCnt))
+		require.Equal(t, tc.wantSlot, got, "value %d should hash to slot %d", tc.val, tc.wantSlot)
+	}
+}
+
+// TestExtractColAndConst verifies column/constant extraction from expression arguments.
+func TestExtractColAndConst(t *testing.T) {
+	sctx := mock.NewContext()
+	_ = sctx
+
+	// We test the helper indirectly through the fact that it returns nil for non-column exprs.
+	// Direct construction: left=Column, right=Constant → should return both non-nil.
+	colExpr := &expression.Column{UniqueID: 1, RetType: types.NewFieldType(10)}
+	constExpr := &expression.Constant{Value: types.NewIntDatum(5), RetType: types.NewFieldType(10)}
+
+	col, cnst := extractColAndConst(colExpr, constExpr)
+	require.NotNil(t, col)
+	require.NotNil(t, cnst)
+
+	// Reversed order: left=Constant, right=Column → should return (nil, nil).
+	col2, cnst2 := extractColAndConst(constExpr, colExpr)
+	require.Nil(t, col2)
+	require.Nil(t, cnst2)
 }

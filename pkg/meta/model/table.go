@@ -85,6 +85,38 @@ const (
 	CurrLatestTableInfoVersion = TableInfoVersion5
 )
 
+// ShardKeyInfo describes the shard key for MPP co-location optimization.
+// Tables with matching shard keys can skip exchange during joins.
+type ShardKeyInfo struct {
+	Columns  []string `json:"columns"`             // Column names forming the shard key
+	ShardCnt int      `json:"shard_cnt"`           // Number of shards (must be >= 1)
+	ShardIDs []int64  `json:"shard_ids,omitempty"` // Physical table ID per shard, assigned at DDL time
+}
+
+// ShardKeysCompatible reports whether two shard keys can support a co-located join:
+// both must be non-nil, have the same shard count, and cover the same set of columns.
+func ShardKeysCompatible(a, b *ShardKeyInfo) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a.ShardCnt != b.ShardCnt {
+		return false
+	}
+	if len(a.Columns) != len(b.Columns) {
+		return false
+	}
+	aSet := make(map[string]struct{}, len(a.Columns))
+	for _, col := range a.Columns {
+		aSet[col] = struct{}{}
+	}
+	for _, col := range b.Columns {
+		if _, ok := aSet[col]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // ExtraHandleName is the name of ExtraHandle Column.
 var ExtraHandleName = model.NewCIStr("_tidb_rowid")
 
@@ -210,6 +242,10 @@ type TableInfo struct {
 	DBID int64 `json:"-"`
 
 	Mode TableMode `json:"mode,omitempty"`
+
+	// ShardKeyInfo describes the shard key for MPP co-location.
+	// If nil, this table is not sharded.
+	ShardKeyInfo *ShardKeyInfo `json:"shard_key_info,omitempty"`
 }
 
 // SepAutoInc decides whether _rowid and auto_increment id use separate allocator.
@@ -261,6 +297,15 @@ func (t *TableInfo) Clone() *TableInfo {
 
 	if t.Affinity != nil {
 		nt.Affinity = t.Affinity.Clone()
+	}
+
+	if t.ShardKeyInfo != nil {
+		cloned := *t.ShardKeyInfo
+		cloned.Columns = make([]string, len(t.ShardKeyInfo.Columns))
+		copy(cloned.Columns, t.ShardKeyInfo.Columns)
+		cloned.ShardIDs = make([]int64, len(t.ShardKeyInfo.ShardIDs))
+		copy(cloned.ShardIDs, t.ShardKeyInfo.ShardIDs)
+		nt.ShardKeyInfo = &cloned
 	}
 
 	return &nt
@@ -1170,6 +1215,10 @@ type PartitionDefinition struct {
 	InValues           [][]string     `json:"in_values"`
 	PlacementPolicyRef *PolicyRefInfo `json:"policy_ref_info"`
 	Comment            string         `json:"comment,omitempty"`
+	// ShardIDs holds the physical table IDs for each shard within this partition,
+	// populated at CREATE TABLE time when the table has both PARTITION BY and SHARD BY.
+	// len(ShardIDs) == ShardKeyInfo.ShardCnt. Nil when the table is not sharded.
+	ShardIDs []int64 `json:"shard_ids,omitempty"`
 }
 
 // Clone clones PartitionDefinition.
@@ -1177,6 +1226,17 @@ func (ci *PartitionDefinition) Clone() PartitionDefinition {
 	nci := *ci
 	nci.LessThan = make([]string, len(ci.LessThan))
 	copy(nci.LessThan, ci.LessThan)
+	if len(ci.InValues) > 0 {
+		nci.InValues = make([][]string, len(ci.InValues))
+		for i, vs := range ci.InValues {
+			nci.InValues[i] = make([]string, len(vs))
+			copy(nci.InValues[i], vs)
+		}
+	}
+	if len(ci.ShardIDs) > 0 {
+		nci.ShardIDs = make([]int64, len(ci.ShardIDs))
+		copy(nci.ShardIDs, ci.ShardIDs)
+	}
 	return nci
 }
 

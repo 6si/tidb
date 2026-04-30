@@ -34,6 +34,7 @@ import (
 	"github.com/pingcap/tidb/pkg/meta/autoid"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/ast"
+	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/statistics"
@@ -215,6 +216,29 @@ func TableFromMeta(allocs autoid.Allocators, tblInfo *model.TableInfo) (table.Ta
 	}
 	var t TableCommon
 	initTableCommon(&t, tblInfo, tblInfo.ID, columns, allocs, constraints)
+	if ski := tblInfo.ShardKeyInfo; ski != nil && len(ski.ShardIDs) > 0 {
+		// For shard-only tables, inject a synthetic PartitionInfo so the planner's
+		// GetPartitionInfo() check succeeds and it scans per-shard physical key ranges.
+		if tblInfo.GetPartitionInfo() == nil {
+			defs := make([]model.PartitionDefinition, len(ski.ShardIDs))
+			for i, physID := range ski.ShardIDs {
+				defs[i] = model.PartitionDefinition{
+					ID:   physID,
+					Name: pmodel.NewCIStr(fmt.Sprintf("shard_%d", i)),
+				}
+			}
+			tblInfo.Partition = &model.PartitionInfo{
+				// Type=0 (PartitionTypeNone) falls through the partition-processor switch to
+				// makeUnionAllChildren, which scans all shard physical IDs. Hash (Type=2) would
+				// try to parse pi.Expr as a SQL expression, but shard routing uses CRC32, not SQL.
+				Type:        0,
+				Enable:      true,
+				Num:         uint64(len(ski.ShardIDs)),
+				Definitions: defs,
+			}
+		}
+		return newShardedTable(&t, tblInfo)
+	}
 	if tblInfo.GetPartitionInfo() == nil {
 		if err := initTableIndices(&t); err != nil {
 			return nil, err

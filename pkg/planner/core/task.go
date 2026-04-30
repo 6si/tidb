@@ -16,6 +16,7 @@ package core
 
 import (
 	"math"
+	"strings"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
@@ -23,6 +24,7 @@ import (
 	"github.com/pingcap/tidb/pkg/expression/aggregation"
 	"github.com/pingcap/tidb/pkg/infoschema"
 	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/charset"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
@@ -388,6 +390,43 @@ func (p *PhysicalHashJoin) attach2TaskForMpp(tasks ...base.Task) base.Task {
 			return base.InvalidTask
 		}
 		lTask, rTask = p.convertPartitionKeysIfNeed(lTask, rTask)
+		// If either side used the shard key shortcut to skip its exchanger, verify both sides
+		// are truly compatible (same shard key columns and same shard count). If not, force
+		// exchangers on any side that used the shard key shortcut so data is correctly
+		// redistributed before the join.
+		// We only enter this path when at least one side has a shard key, otherwise the
+		// regular exchanger enforcement has already handled both sides correctly.
+		lTbl := extractTableFromPlan(lTask.p)
+		rTbl := extractTableFromPlan(rTask.p)
+		lHasShardKey := lTbl != nil && lTbl.ShardKeyInfo != nil
+		rHasShardKey := rTbl != nil && rTbl.ShardKeyInfo != nil
+		if (lHasShardKey || rHasShardKey) && !bothCoLocated(lTask, rTask, lTask.hashCols, rTask.hashCols) {
+			// Only re-enforce sides that have a shard key (meaning they may have used the
+			// shortcut). Sides without a shard key already have a proper exchanger in place.
+			if lHasShardKey {
+				if _, alreadyExchanged := lTask.p.(*PhysicalExchangeReceiver); !alreadyExchanged {
+					lProp := &property.PhysicalProperty{
+						TaskTp:           property.MppTaskType,
+						MPPPartitionTp:   property.HashType,
+						MPPPartitionCols: lTask.hashCols,
+					}
+					// Use enforceExchangerImpl to bypass the per-side shard-key shortcut in
+					// needEnforceExchanger: when the two tables have incompatible shard keys
+					// (e.g. different ShardCnt) each side must physically redistribute its data.
+					lTask = lTask.Copy().(*MppTask).enforceExchangerImpl(lProp)
+				}
+			}
+			if rHasShardKey {
+				if _, alreadyExchanged := rTask.p.(*PhysicalExchangeReceiver); !alreadyExchanged {
+					rProp := &property.PhysicalProperty{
+						TaskTp:           property.MppTaskType,
+						MPPPartitionTp:   property.HashType,
+						MPPPartitionCols: rTask.hashCols,
+					}
+					rTask = rTask.Copy().(*MppTask).enforceExchangerImpl(rProp)
+				}
+			}
+		}
 	}
 	p.SetChildren(lTask.Plan(), rTask.Plan())
 	// outer task is the task that will pass its MPPPartitionType to the join result
@@ -2488,6 +2527,83 @@ func tryExpandVirtualColumn(p base.PhysicalPlan) {
 	}
 }
 
+// extractTableFromPlan traverses down the plan tree to find the underlying
+// PhysicalTableScan or PhysicalIndexScan and returns its TableInfo.
+func extractTableFromPlan(plan base.PhysicalPlan) *model.TableInfo {
+	for plan != nil {
+		switch p := plan.(type) {
+		case *PhysicalTableScan:
+			return p.Table
+		case *PhysicalIndexScan:
+			return p.Table
+		case *PhysicalExchangeReceiver:
+			if len(p.Children()) > 0 {
+				plan = p.Children()[0]
+			} else {
+				return nil
+			}
+		default:
+			// For other plan nodes, try the first child
+			if len(p.Children()) > 0 {
+				plan = p.Children()[0]
+			} else {
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+// shardKeyColumnsMatch checks whether all the given MPP partition columns are covered by the
+// shard key columns of the table. partitionCols must be non-empty (caller's responsibility).
+//
+// OrigName on a Column is set as "db.table.col", "table.col", or bare "col" depending on context;
+// we strip the prefix to get a bare lowercase column name for comparison against ShardKeyInfo.Columns.
+func shardKeyColumnsMatch(shardKey *model.ShardKeyInfo, partitionCols []*property.MPPPartitionColumn) bool {
+	if shardKey == nil || len(shardKey.Columns) == 0 {
+		return false
+	}
+	shardColSet := make(map[string]struct{}, len(shardKey.Columns))
+	for _, col := range shardKey.Columns {
+		shardColSet[col] = struct{}{}
+	}
+	for _, pc := range partitionCols {
+		// OrigName may be "db.table.col" or "table.col"; extract the bare column name.
+		colName := pc.Col.OrigName
+		if idx := strings.LastIndex(colName, "."); idx >= 0 {
+			colName = colName[idx+1:]
+		}
+		if _, ok := shardColSet[strings.ToLower(colName)]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// bothCoLocated returns true when both MPP tasks can participate in a co-located join:
+// each underlying table's shard key must cover the given partition columns, and both
+// shard keys must be compatible (same columns and same shard count).
+func bothCoLocated(lTask, rTask *MppTask, lPartCols, rPartCols []*property.MPPPartitionColumn) bool {
+	if len(lPartCols) == 0 || len(rPartCols) == 0 {
+		return false
+	}
+	lTbl := extractTableFromPlan(lTask.p)
+	rTbl := extractTableFromPlan(rTask.p)
+	if lTbl == nil || rTbl == nil {
+		return false
+	}
+	if lTbl.ShardKeyInfo == nil || rTbl.ShardKeyInfo == nil {
+		return false
+	}
+	if !shardKeyColumnsMatch(lTbl.ShardKeyInfo, lPartCols) {
+		return false
+	}
+	if !shardKeyColumnsMatch(rTbl.ShardKeyInfo, rPartCols) {
+		return false
+	}
+	return model.ShardKeysCompatible(lTbl.ShardKeyInfo, rTbl.ShardKeyInfo)
+}
+
 func (t *MppTask) needEnforceExchanger(prop *property.PhysicalProperty) bool {
 	switch prop.MPPPartitionTp {
 	case property.AnyType:
@@ -2497,6 +2613,18 @@ func (t *MppTask) needEnforceExchanger(prop *property.PhysicalProperty) bool {
 	case property.SinglePartitionType:
 		return t.partTp != property.SinglePartitionType
 	default:
+		// Shard key optimization: if the underlying table has a shard key
+		// and the required partition columns are covered by the shard key,
+		// the data is already co-located — no exchange needed.
+		// This check must come before the partTp check because a raw table-scan
+		// task starts with partTp=AnyType even when the data is already sharded.
+		if len(prop.MPPPartitionCols) > 0 {
+			if tbl := extractTableFromPlan(t.p); tbl != nil && tbl.ShardKeyInfo != nil {
+				if shardKeyColumnsMatch(tbl.ShardKeyInfo, prop.MPPPartitionCols) {
+					return false
+				}
+			}
+		}
 		if t.partTp != property.HashType {
 			return true
 		}
@@ -2517,6 +2645,20 @@ func (t *MppTask) needEnforceExchanger(prop *property.PhysicalProperty) bool {
 
 func (t *MppTask) enforceExchanger(prop *property.PhysicalProperty) *MppTask {
 	if !t.needEnforceExchanger(prop) {
+		// If the task is skipping the exchanger due to the shard key optimization
+		// (the underlying table is already hash-sharded on the required columns), we
+		// still need to advertise the correct partition type so that the join planner
+		// above sees a properly hash-partitioned input.
+		if prop.MPPPartitionTp == property.HashType && t.partTp != property.HashType &&
+			len(prop.MPPPartitionCols) > 0 {
+			if tbl := extractTableFromPlan(t.p); tbl != nil && tbl.ShardKeyInfo != nil &&
+				shardKeyColumnsMatch(tbl.ShardKeyInfo, prop.MPPPartitionCols) {
+				newTask := t.Copy().(*MppTask)
+				newTask.partTp = property.HashType
+				newTask.hashCols = prop.MPPPartitionCols
+				return newTask
+			}
+		}
 		return t
 	}
 	return t.Copy().(*MppTask).enforceExchangerImpl(prop)

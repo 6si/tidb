@@ -23,6 +23,7 @@ import (
 	"math"
 	"net"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -958,6 +959,17 @@ func splitRangeBySizeProps(fullRange common.Range, sizeProps *sizeProperties, si
 	return ranges
 }
 
+// shardBoundarySplitKeys returns a record-prefix split key for each shard
+// physical table ID in ski.ShardIDs. These are mandatory split points so each
+// shard gets its own TiKV region regardless of data size.
+func shardBoundarySplitKeys(ski *model.ShardKeyInfo) [][]byte {
+	keys := make([][]byte, 0, len(ski.ShardIDs))
+	for _, physID := range ski.ShardIDs {
+		keys = append(keys, tablecodec.GenTableRecordPrefix(physID))
+	}
+	return keys
+}
+
 func getRegionSplitKeys(
 	ctx context.Context,
 	engine common.Engine,
@@ -988,6 +1000,20 @@ func getRegionSplitKeys(
 	return keys, err
 }
 
+// mergeSplitKeys merges mandatory split keys into base, returning a sorted,
+// deduplicated slice. Returns base unchanged when mandatory is empty.
+// Never modifies base's underlying array.
+func mergeSplitKeys(base, mandatory [][]byte) [][]byte {
+	if len(mandatory) == 0 {
+		return base
+	}
+	merged := make([][]byte, len(base)+len(mandatory))
+	copy(merged, base)
+	copy(merged[len(base):], mandatory)
+	slices.SortFunc(merged, bytes.Compare)
+	return slices.CompactFunc(merged, bytes.Equal)
+}
+
 // prepareAndSendJob will read the engine to get estimated key range, then split
 // and scatter regions for these range and send region jobs to jobToWorkerCh.
 func (local *Backend) prepareAndSendJob(
@@ -995,12 +1021,15 @@ func (local *Backend) prepareAndSendJob(
 	engine common.Engine,
 	regionSplitKeys [][]byte,
 	regionSplitSize, regionSplitKeyCnt int64,
+	mandatorySplitKeys [][]byte,
 	jobToWorkerCh chan<- *regionJob,
 	jobWg *sync.WaitGroup,
 ) error {
 	lfTotalSize, lfLength := engine.KVStatistics()
 	splitRangesBatch := GetMaxBatchSplitRanges()
 	maxRangesPerSec := GetMaxSplitRangePerSec()
+
+	regionSplitKeys = mergeSplitKeys(regionSplitKeys, mandatorySplitKeys)
 
 	log.FromContext(ctx).Info("import engine ranges",
 		zap.Int("len(regionSplitKeys)", len(regionSplitKeys)),
@@ -1010,7 +1039,7 @@ func (local *Backend) prepareAndSendJob(
 
 	// if all the kv can fit in one region, skip split regions. TiDB will split one region for
 	// the table when table is created.
-	needSplit := len(regionSplitKeys) > 2 || lfTotalSize > regionSplitSize || lfLength > regionSplitKeyCnt
+	needSplit := len(mandatorySplitKeys) > 0 || len(regionSplitKeys) > 2 || lfTotalSize > regionSplitSize || lfLength > regionSplitKeyCnt
 	// split region by given ranges
 	failpoint.Inject("failToSplit", func(_ failpoint.Value) {
 		needSplit = true
@@ -1381,6 +1410,7 @@ func (local *Backend) ImportEngine(
 		log.FromContext(ctx).Warn("fail to get region split keys and size", zap.Error(err))
 	}
 
+	var mandatorySplitKeys [][]byte
 	var e common.Engine
 	if externalEngine, ok := local.engineMgr.getExternalEngine(engineUUID); ok {
 		e = externalEngine
@@ -1394,6 +1424,11 @@ func (local *Backend) ImportEngine(
 		localEngine.regionSplitSize = regionSplitSize
 		localEngine.regionSplitKeyCnt = regionSplitKeys
 		e = localEngine
+		if localEngine.tableInfo != nil && localEngine.tableInfo.Core != nil {
+			if ski := localEngine.tableInfo.Core.ShardKeyInfo; ski != nil && len(ski.ShardIDs) > 0 {
+				mandatorySplitKeys = shardBoundarySplitKeys(ski)
+			}
+		}
 	}
 	lfTotalSize, lfLength := e.KVStatistics()
 	if lfTotalSize == 0 {
@@ -1475,7 +1510,7 @@ func (local *Backend) ImportEngine(
 
 	failpoint.InjectCall("ReadyForImportEngine")
 
-	err = local.doImport(ctx, e, splitKeys, regionSplitSize, regionSplitKeys)
+	err = local.doImport(ctx, e, splitKeys, regionSplitSize, regionSplitKeys, mandatorySplitKeys)
 	if err == nil {
 		importedSize, importedLength := e.ImportedStatistics()
 
@@ -1504,6 +1539,7 @@ func (local *Backend) doImport(
 	engine common.Engine,
 	regionSplitKeys [][]byte,
 	regionSplitSize, regionSplitKeyCnt int64,
+	mandatorySplitKeys [][]byte,
 ) error {
 	/*
 	 ┌─────────────────┐                   ┌─────────────┐   ┌────────────┐
@@ -1682,6 +1718,7 @@ func (local *Backend) doImport(
 			regionSplitKeys,
 			regionSplitSize,
 			regionSplitKeyCnt,
+			mandatorySplitKeys,
 			jobToWorkerCh,
 			&jobWg,
 		)

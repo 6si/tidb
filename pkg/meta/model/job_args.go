@@ -424,6 +424,9 @@ type TableIDIndexID struct {
 type TablePartitionArgs struct {
 	PartNames []string       `json:"part_names,omitempty"`
 	PartInfo  *PartitionInfo `json:"part_info,omitempty"`
+	// ShardCnt is set for ActionAddTablePartition on a sharded table so that
+	// the ID allocator knows how many physical shard IDs to reserve per partition.
+	ShardCnt int `json:"shard_cnt,omitempty"`
 
 	// set on finished
 	OldPhysicalTblIDs []int64          `json:"old_physical_tbl_ids,omitempty"`

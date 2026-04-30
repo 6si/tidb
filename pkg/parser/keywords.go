@@ -551,6 +551,8 @@ var Keywords = []KeywordsType{
 	{"SERIALIZABLE", false, "unreserved"},
 	{"SESSION", false, "unreserved"},
 	{"SETVAL", false, "unreserved"},
+	{"SHARD", false, "unreserved"},
+	{"SHARDS", false, "unreserved"},
 	{"SHARD_ROW_ID_BITS", false, "unreserved"},
 	{"SHARE", false, "unreserved"},
 	{"SHARED", false, "unreserved"},

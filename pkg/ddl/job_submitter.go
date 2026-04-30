@@ -458,8 +458,31 @@ func (a *gidAllocator) next() int64 {
 
 func (a *gidAllocator) assignIDsForTable(info *model.TableInfo) {
 	info.ID = a.next()
-	if partitionInfo := info.GetPartitionInfo(); partitionInfo != nil {
+	partitionInfo := info.GetPartitionInfo()
+	ski := info.ShardKeyInfo
+	sharded := ski != nil && ski.ShardCnt > 0
+
+	if partitionInfo != nil && sharded {
+		// Partitioned + sharded: allocate one physical ID per (partition × shard).
+		// Each partition stores its own ShardIDs slice; ShardKeyInfo.ShardIDs is unused.
+		for i := range partitionInfo.Definitions {
+			partitionInfo.Definitions[i].ID = a.next()
+			ids := make([]int64, ski.ShardCnt)
+			for j := range ids {
+				ids[j] = a.next()
+			}
+			partitionInfo.Definitions[i].ShardIDs = ids
+		}
+		ski.ShardIDs = nil // not used in the partitioned+sharded case
+	} else if partitionInfo != nil {
 		a.assignIDsForPartitionInfo(partitionInfo)
+	} else if sharded {
+		// Sharded only: allocate one physical ID per shard.
+		ids := make([]int64, ski.ShardCnt)
+		for i := range ids {
+			ids[i] = a.next()
+		}
+		ski.ShardIDs = ids
 	}
 }
 
@@ -471,8 +494,17 @@ func (a *gidAllocator) assignIDsForPartitionInfo(partitionInfo *model.PartitionI
 
 func idCountForTable(info *model.TableInfo) int {
 	c := 1
-	if partitionInfo := info.GetPartitionInfo(); partitionInfo != nil {
+	partitionInfo := info.GetPartitionInfo()
+	ski := info.ShardKeyInfo
+	sharded := ski != nil && ski.ShardCnt > 0
+
+	if partitionInfo != nil && sharded {
+		// Each partition needs 1 ID for itself + ShardCnt IDs for its shards.
+		c += len(partitionInfo.Definitions) * (1 + ski.ShardCnt)
+	} else if partitionInfo != nil {
 		c += len(partitionInfo.Definitions)
+	} else if sharded {
+		c += ski.ShardCnt
 	}
 	return c
 }
@@ -507,7 +539,12 @@ func getRequiredGIDCount(jobWs []*JobWrapper) int {
 			count += len(jobW.JobArgs.(*model.TruncateTableArgs).OldPartitionIDs)
 		case model.ActionAddTablePartition, model.ActionReorganizePartition, model.ActionRemovePartitioning:
 			args := jobW.JobArgs.(*model.TablePartitionArgs)
-			count += len(args.PartInfo.Definitions)
+			if jobW.Type == model.ActionAddTablePartition && args.ShardCnt > 0 {
+				// Sharded table: each partition needs 1 ID for itself + ShardCnt IDs for its shards.
+				count += len(args.PartInfo.Definitions) * (1 + args.ShardCnt)
+			} else {
+				count += len(args.PartInfo.Definitions)
+			}
 		case model.ActionTruncateTable:
 			count += 1 + len(jobW.JobArgs.(*model.TruncateTableArgs).OldPartitionIDs)
 		}
@@ -553,8 +590,21 @@ func assignGIDsForJobs(jobWs []*JobWrapper, ids []int64) {
 			}
 		case model.ActionAddTablePartition, model.ActionReorganizePartition:
 			if !jobW.IDAllocated {
-				pInfo := jobW.JobArgs.(*model.TablePartitionArgs).PartInfo
-				alloc.assignIDsForPartitionInfo(pInfo)
+				args := jobW.JobArgs.(*model.TablePartitionArgs)
+				pInfo := args.PartInfo
+				if jobW.Type == model.ActionAddTablePartition && args.ShardCnt > 0 {
+					// Sharded table: allocate partition ID + ShardCnt shard IDs per definition.
+					for i := range pInfo.Definitions {
+						pInfo.Definitions[i].ID = alloc.next()
+						ids := make([]int64, args.ShardCnt)
+						for j := range ids {
+							ids[j] = alloc.next()
+						}
+						pInfo.Definitions[i].ShardIDs = ids
+					}
+				} else {
+					alloc.assignIDsForPartitionInfo(pInfo)
+				}
 			}
 		case model.ActionRemovePartitioning:
 			// a special partition is used in this case, and we will use the ID

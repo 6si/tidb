@@ -261,5 +261,20 @@
       "desc format = 'brief' select * from ((select count(*) from (select id,name from t order by id)a group by name,id order by id)  union all (select id+1 from t order by 1))c",
       "desc format = 'brief' select * from (select * from t order by id)a order by name"
     ]
+  },
+  {
+    "name": "TestMPPShardKeyLocalJoin",
+    "cases": [
+      "explain format = 'brief' select /*+ shuffle_join(orders, customers) */ count(*) from orders join customers on orders.company_id = customers.company_id",
+      "explain format = 'brief' select /*+ shuffle_join(orders, customers) */ count(*) from orders left join customers on orders.company_id = customers.company_id",
+      "explain format = 'brief' select /*+ shuffle_join(orders, customers) */ orders.order_id, customers.name from orders join customers on orders.company_id = customers.company_id where orders.amount > 100"
+    ]
+  },
+  {
+    "name": "TestMPPShardKeyMismatchUsesExchange",
+    "cases": [
+      "explain format = 'brief' select /*+ shuffle_join(ta, tb) */ count(*) from ta join tb on ta.company_id = tb.company_id",
+      "explain format = 'brief' select /*+ shuffle_join(ta, tc) */ count(*) from ta join tc on ta.company_id = tc.company_id"
+    ]
   }
 ]
