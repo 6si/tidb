@@ -16,7 +16,7 @@ func TestParseCreateTableWithShardKey(t *testing.T) {
 		id BIGINT PRIMARY KEY,
 		company_id BIGINT,
 		name VARCHAR(255)
-	) SHARD_KEY(company_id) INTO 4 SHARDS`
+	) SHARD BY (company_id) SHARDS 4`
 
 	nodes, _, err := p.Parse(sql, "", "")
 	assert.NoError(t, err, "Should parse CREATE TABLE with SHARD_KEY")
@@ -52,7 +52,7 @@ func TestParseCreateTableMultipleShardKeyColumns(t *testing.T) {
 		id BIGINT PRIMARY KEY,
 		company_id BIGINT,
 		tenant_id BIGINT
-	) SHARD_KEY(company_id, tenant_id) INTO 8 SHARDS`
+	) SHARD BY (company_id, tenant_id) SHARDS 8`
 
 	nodes, _, err := p.Parse(sql, "", "")
 	assert.NoError(t, err)
@@ -70,7 +70,7 @@ func TestParseCreateTableShardKeyZero(t *testing.T) {
 
 	sql := `CREATE TABLE test_table (
 		id BIGINT PRIMARY KEY
-	) SHARD_KEY(id) INTO 0 SHARDS`
+	) SHARD BY (id) SHARDS 0`
 
 	_, _, err := p.Parse(sql, "", "")
 	assert.Error(t, err, "Should reject shard count of 0")
@@ -81,7 +81,7 @@ func TestParseCreateTableShardKeyOne(t *testing.T) {
 
 	sql := `CREATE TABLE test_table (
 		id BIGINT PRIMARY KEY
-	) SHARD_KEY(id) INTO 1 SHARDS`
+	) SHARD BY (id) SHARDS 1`
 
 	_, _, err := p.Parse(sql, "", "")
 	assert.Error(t, err, "Should reject shard count of 1 — a single shard is identical to no sharding")
@@ -92,7 +92,7 @@ func TestParseCreateTableShardKeyAtMin(t *testing.T) {
 
 	sql := `CREATE TABLE test_table (
 		id BIGINT PRIMARY KEY
-	) SHARD_KEY(id) INTO 2 SHARDS`
+	) SHARD BY (id) SHARDS 2`
 
 	nodes, _, err := p.Parse(sql, "", "")
 	assert.NoError(t, err, "Should allow shard count of 2 (minimum meaningful value)")
@@ -106,7 +106,7 @@ func TestParseCreateTableShardKeyExceedsMax(t *testing.T) {
 
 	sql := `CREATE TABLE test_table (
 		id BIGINT PRIMARY KEY
-	) SHARD_KEY(id) INTO 65 SHARDS`
+	) SHARD BY (id) SHARDS 65`
 
 	_, _, err := p.Parse(sql, "", "")
 	assert.Error(t, err, "Should reject shard count above 64")
@@ -117,7 +117,7 @@ func TestParseCreateTableShardKeyAtMax(t *testing.T) {
 
 	sql := `CREATE TABLE test_table (
 		id BIGINT PRIMARY KEY
-	) SHARD_KEY(id) INTO 64 SHARDS`
+	) SHARD BY (id) SHARDS 64`
 
 	nodes, _, err := p.Parse(sql, "", "")
 	assert.NoError(t, err, "Should allow shard count of 64")
