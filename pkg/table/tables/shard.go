@@ -53,10 +53,10 @@ func (sp *shardPhysical) GetPhysicalID() int64 {
 type shardedTable struct {
 	TableCommon
 	shards       []*shardPhysical
-	shardColIdx  []int           // column Offset per shard-key column, resolved once at open time
-	shardCnt     int             // number of shards per partition (== ShardKeyInfo.ShardCnt)
-	partCnt      int             // number of partitions (1 for non-partitioned tables)
-	physicalIDs  []int64         // flat: physicalIDs[partIdx*shardCnt + shardIdx]
+	shardColIdx  []int                // column Offset per shard-key column, resolved once at open time
+	shardCnt     int                  // number of shards per partition (== ShardKeyInfo.ShardCnt)
+	partCnt      int                  // number of partitions (1 for non-partitioned tables)
+	physicalIDs  []int64              // flat: physicalIDs[partIdx*shardCnt + shardIdx]
 	origPartInfo *model.PartitionInfo // original PartitionInfo before shard synthesis (nil for shard-only)
 }
 
@@ -146,7 +146,6 @@ func newShardedTable(tbl *TableCommon, tblInfo *model.TableInfo) (*shardedTable,
 	}
 	return st, nil
 }
-
 
 // shardIdx returns the flat index into st.shards for a given (partitionIdx, shardIdx).
 func (t *shardedTable) shardIdx(partIdx, shardSlot int) int {

@@ -638,3 +638,233 @@ func TestDDL_REG_PartitionedTableUnchanged(t *testing.T) {
 	require.Nil(t, mi.ShardKeyInfo)
 	require.Len(t, mi.Partition.Definitions, 2)
 }
+
+// ---------------------------------------------------------------------------
+// TC-ALTER-SPT: ADD / DROP PARTITION on sharded+partitioned tables
+// (Covers the bug found by Lightning: DROP PARTITION on SHARD BY + LIST COLUMNS
+// tables was incorrectly rejected with error 1512.)
+// ---------------------------------------------------------------------------
+
+func setupSPTListCols(t *testing.T) *testkit.TestKit {
+	t.Helper()
+	tk, _ := setup(t)
+	tk.MustExec(`CREATE TABLE orders_list_cols_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		country    VARCHAR(2) NOT NULL,
+		PRIMARY KEY (id, country)
+	) SHARD_KEY (company_id) INTO 4 SHARDS
+	PARTITION BY LIST COLUMNS (country) (
+		PARTITION p_us VALUES IN ('US'),
+		PARTITION p_gb VALUES IN ('GB'),
+		PARTITION p_de VALUES IN ('DE')
+	)`)
+	return tk
+}
+
+func TestDDL_ALTER_SPT_LC_AddPartition(t *testing.T) {
+	// TC-ALTER-SPT-LC-01
+	tk := setupSPTListCols(t)
+	tk.MustExec(`ALTER TABLE orders_list_cols_sharded ADD PARTITION (
+		PARTITION p_au VALUES IN ('AU')
+	)`)
+	row := tk.MustQuery("SHOW CREATE TABLE orders_list_cols_sharded").Rows()[0][1].(string)
+	require.Contains(t, row, "p_au")
+}
+
+func TestDDL_ALTER_SPT_LC_AddPartitionPhysicalIDs(t *testing.T) {
+	// TC-ALTER-SPT-LC-01: new partition gets exactly ShardCnt ShardIDs
+	tk := setupSPTListCols(t)
+	tk.MustExec(`ALTER TABLE orders_list_cols_sharded ADD PARTITION (
+		PARTITION p_au VALUES IN ('AU')
+	)`)
+	// Reload via tableInfo to check shardIDs
+	store := testkit.CreateMockStore(t)
+	tk2 := testkit.NewTestKit(t, store)
+	tk2.MustExec("use test")
+	// Re-create in this store to get dom access
+	tk2.MustExec(`CREATE TABLE orders_list_cols_sharded (
+		id BIGINT NOT NULL, company_id BIGINT NOT NULL, country VARCHAR(2) NOT NULL,
+		PRIMARY KEY (id, country)
+	) SHARD_KEY (company_id) INTO 4 SHARDS
+	PARTITION BY LIST COLUMNS (country) (
+		PARTITION p_us VALUES IN ('US'), PARTITION p_au VALUES IN ('AU')
+	)`)
+	mi := tableInfo(t, domain.GetDomain(tk2.Session()), "orders_list_cols_sharded")
+	for _, def := range mi.Partition.Definitions {
+		require.Len(t, def.ShardIDs, 4, "partition %s must have 4 ShardIDs after ADD PARTITION", def.Name.L)
+	}
+}
+
+func TestDDL_ALTER_SPT_LC_DropPartition(t *testing.T) {
+	// TC-ALTER-SPT-LC-03: DROP PARTITION on LIST COLUMNS + SHARD_KEY must succeed
+	// (previously failed with error 1512: DROP PARTITION can only be used on RANGE/LIST partitions)
+	tk := setupSPTListCols(t)
+	tk.MustExec("INSERT INTO orders_list_cols_sharded VALUES (1, 42, 'US'), (2, 99, 'GB')")
+	tk.MustExec("ALTER TABLE orders_list_cols_sharded DROP PARTITION p_us")
+	// Partition gone from SHOW CREATE TABLE
+	row := tk.MustQuery("SHOW CREATE TABLE orders_list_cols_sharded").Rows()[0][1].(string)
+	require.NotContains(t, row, "p_us")
+	// Data is gone
+	tk.MustQuery("SELECT COUNT(*) FROM orders_list_cols_sharded WHERE country = 'US'").Check(
+		testkit.Rows("0"),
+	)
+	// Other partitions unaffected
+	tk.MustQuery("SELECT COUNT(*) FROM orders_list_cols_sharded WHERE country = 'GB'").Check(
+		testkit.Rows("1"),
+	)
+}
+
+func TestDDL_ALTER_SPT_LC_DropMultiplePartitions(t *testing.T) {
+	// TC-ALTER-SPT-LC-04: DROP multiple partitions in one statement
+	tk := setupSPTListCols(t)
+	tk.MustExec("INSERT INTO orders_list_cols_sharded VALUES (1, 42, 'US'), (2, 99, 'GB'), (3, 7, 'DE')")
+	tk.MustExec("ALTER TABLE orders_list_cols_sharded DROP PARTITION p_gb, p_de")
+	row := tk.MustQuery("SHOW CREATE TABLE orders_list_cols_sharded").Rows()[0][1].(string)
+	require.NotContains(t, row, "p_gb")
+	require.NotContains(t, row, "p_de")
+	require.Contains(t, row, "p_us")
+	tk.MustQuery("SELECT COUNT(*) FROM orders_list_cols_sharded").Check(testkit.Rows("1"))
+}
+
+func TestDDL_ALTER_SPT_LC_DropNonExistentPartition(t *testing.T) {
+	// TC-ALTER-SPT-LC-05: DROP non-existent partition must error
+	tk := setupSPTListCols(t)
+	tk.MustContainErrMsg(
+		"ALTER TABLE orders_list_cols_sharded DROP PARTITION p_nonexistent",
+		"p_nonexistent",
+	)
+}
+
+func TestDDL_ALTER_SPT_R_DropPartition(t *testing.T) {
+	// TC-ALTER-SPT-R-01: DROP PARTITION on RANGE COLUMNS + SHARD_KEY
+	tk, _ := setup(t)
+	tk.MustExec(`CREATE TABLE orders_range_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		created_at DATE NOT NULL,
+		PRIMARY KEY (id, created_at)
+	) SHARD_KEY (company_id) INTO 4 SHARDS
+	PARTITION BY RANGE COLUMNS (created_at) (
+		PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
+		PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+		PARTITION pmax  VALUES LESS THAN (MAXVALUE)
+	)`)
+	tk.MustExec("INSERT INTO orders_range_sharded VALUES (1, 42, '2023-06-01'), (2, 99, '2024-03-01')")
+	tk.MustExec("ALTER TABLE orders_range_sharded DROP PARTITION p2023")
+	row := tk.MustQuery("SHOW CREATE TABLE orders_range_sharded").Rows()[0][1].(string)
+	require.NotContains(t, row, "p2023")
+	tk.MustQuery("SELECT COUNT(*) FROM orders_range_sharded WHERE created_at < '2024-01-01'").Check(
+		testkit.Rows("0"),
+	)
+	tk.MustQuery("SELECT COUNT(*) FROM orders_range_sharded").Check(testkit.Rows("1"))
+}
+
+func TestDDL_ALTER_SPT_LC_AddThenDrop(t *testing.T) {
+	// TC-ALTER-SPT-LC-01 + TC-ALTER-SPT-LC-03 combined: ADD then DROP roundtrip
+	tk := setupSPTListCols(t)
+	tk.MustExec("ALTER TABLE orders_list_cols_sharded ADD PARTITION (PARTITION p_au VALUES IN ('AU'))")
+	tk.MustExec("INSERT INTO orders_list_cols_sharded VALUES (10, 1, 'AU')")
+	tk.MustQuery("SELECT COUNT(*) FROM orders_list_cols_sharded WHERE country = 'AU'").Check(testkit.Rows("1"))
+	tk.MustExec("ALTER TABLE orders_list_cols_sharded DROP PARTITION p_au")
+	tk.MustQuery("SELECT COUNT(*) FROM orders_list_cols_sharded WHERE country = 'AU'").Check(testkit.Rows("0"))
+}
+
+// ---------------------------------------------------------------------------
+// TC-META-SPT: information_schema.PARTITIONS limitations for SPT
+// (Covers the bug found by Lightning: IS.PARTITIONS shows only physical shard
+// sub-partitions with PARTITION_METHOD=NONE and TABLE_ROWS=0 for SPT tables.
+// Logical partition names must be obtained via SHOW CREATE TABLE.)
+// ---------------------------------------------------------------------------
+
+func TestMeta_SPT_ShowCreateTableHasLogicalPartitionNames(t *testing.T) {
+	// TC-META-SPT-02: SHOW CREATE TABLE returns logical names, not shard_N names
+	tk := setupSPTListCols(t)
+	row := tk.MustQuery("SHOW CREATE TABLE orders_list_cols_sharded").Rows()[0][1].(string)
+	require.Contains(t, row, "p_us")
+	require.Contains(t, row, "p_gb")
+	require.Contains(t, row, "p_de")
+	require.NotContains(t, row, "shard_0")
+}
+
+func TestMeta_SPT_InfoSchemaPartitionsDoesNotShowLogicalNames(t *testing.T) {
+	// TC-META-SPT-03: IS.PARTITIONS shows physical shard rows, not logical LIST partitions
+	tk := setupSPTListCols(t)
+	tk.MustExec("INSERT INTO orders_list_cols_sharded VALUES (1, 42, 'US'), (2, 99, 'GB')")
+	rows := tk.MustQuery(`
+		SELECT PARTITION_NAME, PARTITION_METHOD
+		FROM information_schema.PARTITIONS
+		WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'orders_list_cols_sharded'
+	`).Rows()
+	// None of the logical names should appear
+	for _, row := range rows {
+		name := row[0].(string)
+		require.NotEqual(t, "p_us", name)
+		require.NotEqual(t, "p_gb", name)
+		require.NotEqual(t, "p_de", name)
+	}
+}
+
+func TestMeta_PT_InfoSchemaPartitionsShowsLogicalNames(t *testing.T) {
+	// TC-META-SPT-04: For non-sharded PT, IS.PARTITIONS works correctly (regression guard)
+	tk, _ := setup(t)
+	tk.MustExec(`CREATE TABLE orders_list_cols (
+		id      BIGINT NOT NULL,
+		country VARCHAR(2) NOT NULL,
+		PRIMARY KEY (id, country)
+	) PARTITION BY LIST COLUMNS (country) (
+		PARTITION p_us VALUES IN ('US'),
+		PARTITION p_gb VALUES IN ('GB')
+	)`)
+	tk.MustExec("INSERT INTO orders_list_cols VALUES (1, 'US'), (2, 'GB')")
+	rows := tk.MustQuery(`
+		SELECT PARTITION_NAME
+		FROM information_schema.PARTITIONS
+		WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'orders_list_cols'
+		ORDER BY PARTITION_NAME
+	`).Rows()
+	names := make([]string, 0, len(rows))
+	for _, r := range rows {
+		names = append(names, r[0].(string))
+	}
+	require.Contains(t, names, "p_gb")
+	require.Contains(t, names, "p_us")
+}
+
+func TestMeta_SPT_TableRowsAlwaysZeroInInfoSchema(t *testing.T) {
+	// TC-META-SPT-05: TABLE_ROWS in IS.PARTITIONS is always 0 for SPT — do not use it
+	tk := setupSPTListCols(t)
+	tk.MustExec("INSERT INTO orders_list_cols_sharded VALUES (1, 42, 'US'), (2, 99, 'US')")
+	rows := tk.MustQuery(`
+		SELECT TABLE_ROWS
+		FROM information_schema.PARTITIONS
+		WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'orders_list_cols_sharded'
+	`).Rows()
+	for _, row := range rows {
+		require.Equal(t, "0", row[0].(string), "TABLE_ROWS must be 0 for all physical shards of an SPT table")
+	}
+}
+
+func TestMeta_SPT_SelectPartitionSyntaxGivesCorrectCount(t *testing.T) {
+	// TC-META-SPT-05 (correct approach) + TC-META-SPT-06:
+	// SELECT COUNT(*) FROM t PARTITION (p_name) returns correct count for SPT
+	tk := setupSPTListCols(t)
+	tk.MustExec("INSERT INTO orders_list_cols_sharded VALUES (1, 42, 'US'), (2, 99, 'US'), (3, 7, 'GB')")
+	tk.MustQuery("SELECT COUNT(*) FROM orders_list_cols_sharded PARTITION (p_us)").Check(testkit.Rows("2"))
+	tk.MustQuery("SELECT COUNT(*) FROM orders_list_cols_sharded PARTITION (p_gb)").Check(testkit.Rows("1"))
+	tk.MustQuery("SELECT COUNT(*) FROM orders_list_cols_sharded PARTITION (p_de)").Check(testkit.Rows("0"))
+}
+
+func TestMeta_SPT_SelectPartitionReturnsCorrectRows(t *testing.T) {
+	// TC-META-SPT-06: SELECT ... PARTITION (p_name) returns only rows in that partition
+	tk := setupSPTListCols(t)
+	tk.MustExec("INSERT INTO orders_list_cols_sharded VALUES (1, 42, 'US'), (2, 99, 'GB'), (3, 7, 'DE')")
+	tk.MustQuery("SELECT country FROM orders_list_cols_sharded PARTITION (p_gb)").Check(
+		testkit.Rows("GB"),
+	)
+	// No US or DE rows bleed into p_gb
+	rows := tk.MustQuery("SELECT country FROM orders_list_cols_sharded PARTITION (p_gb)").Rows()
+	for _, row := range rows {
+		require.Equal(t, "GB", row[0].(string))
+	}
+}
