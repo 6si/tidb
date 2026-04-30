@@ -234,7 +234,7 @@ func TestTiKVChecksumManagerRejectsPartitionScope(t *testing.T) {
 	// must error immediately so callers are not silently given wrong results.
 	pdClient := &testPDClient{}
 	kvClient := &mockChecksumKVClient{}
-	checksumExec := &TiKVChecksumManager{manager: newGCTTLManager(pdClient, lightningServicePrefix), client: kvClient}
+	checksumExec := &TiKVChecksumManager{manager: newGCTTLManager(pdClient), client: kvClient}
 	_, err := checksumExec.Checksum(context.Background(), &TidbTableInfo{DB: "test", Name: "t"}, "p0")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "partition-scoped checksum is not supported by TiKV checksum manager")

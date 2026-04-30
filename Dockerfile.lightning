@@ -1,0 +1,20 @@
+FROM golang:1.25.8 AS builder
+WORKDIR /tidb
+
+COPY . .
+
+ARG GOPROXY
+ENV GOPROXY=${GOPROXY}
+
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=1 make build_lightning
+
+
+FROM rockylinux:9-minimal
+
+COPY --from=builder /tidb/bin/tidb-lightning /tidb-lightning
+
+WORKDIR /
+EXPOSE 8289
+ENTRYPOINT ["/tidb-lightning"]
