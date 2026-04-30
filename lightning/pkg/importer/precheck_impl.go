@@ -1001,6 +1001,38 @@ func (ci *schemaCheckItem) SchemaIsValid(ctx context.Context, tableInfo *mydump.
 		}
 		delete(fullExtendColsSet, col.Name.O)
 	}
+	// Columns with a configured constant satisfy the "has a value" requirement
+	// just as well as columns with a DDL DEFAULT. Validate each constant can
+	// be cast to the target column type under strict mode so misconfigurations
+	// (e.g. "" for an INT column) are caught before any data is ingested.
+	colConstants, err := ci.cfg.Mydumper.ColumnConstants.GetColumnConstants(tableInfo.DB, tableInfo.Name, ci.cfg.Mydumper.CaseSensitive)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if len(colConstants) > 0 {
+		se, err := kv.NewSession(&encode.SessionOptions{SQLMode: mysql.ModeStrictTransTables}, log.FromContext(ctx))
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		colByName := make(map[string]*model.ColumnInfo, len(core.Columns))
+		for _, col := range core.Columns {
+			colByName[col.Name.L] = col
+		}
+		for colName, constVal := range colConstants {
+			col, ok := colByName[colName]
+			if !ok {
+				msgs = append(msgs, fmt.Sprintf("column-constants references unknown column `%s` in table `%s`.`%s`",
+					colName, tableInfo.DB, tableInfo.Name))
+				continue
+			}
+			if _, err := table.CastColumnValue(se.GetExprCtx(), types.NewStringDatum(constVal), col, false, false); err != nil {
+				msgs = append(msgs, fmt.Sprintf("column-constants value %q for column `%s` in table `%s`.`%s` cannot be cast to column type %s: %v",
+					constVal, colName, tableInfo.DB, tableInfo.Name, col.GetTypeDesc(), err))
+				continue
+			}
+			defaultCols[colName] = struct{}{}
+		}
+	}
 	if len(fullExtendColsSet) > 0 {
 		extendCols := make([]string, 0, len(fullExtendColsSet))
 		for col := range fullExtendColsSet {
@@ -1388,7 +1420,13 @@ func (ci *tableEmptyCheckItem) Check(ctx context.Context) (*precheck.CheckResult
 					}
 				}
 
-				isEmptyPtr, err1 := ci.preInfoGetter.IsTableEmpty(gCtx, tblNameComp.DBName, tblNameComp.TableName)
+				var isEmptyPtr *bool
+				var err1 error
+				if ci.cfg.Mydumper.TargetPartition != "" {
+					isEmptyPtr, err1 = ci.preInfoGetter.IsPartitionEmpty(gCtx, tblNameComp.DBName, tblNameComp.TableName, ci.cfg.Mydumper.TargetPartition)
+				} else {
+					isEmptyPtr, err1 = ci.preInfoGetter.IsTableEmpty(gCtx, tblNameComp.DBName, tblNameComp.TableName)
+				}
 				if err1 != nil {
 					return err1
 				}

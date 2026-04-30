@@ -43,10 +43,11 @@ type metaMgrBuilder interface {
 }
 
 type dbMetaMgrBuilder struct {
-	db           *sql.DB
-	taskID       int64
-	schema       string
-	needChecksum bool
+	db              *sql.DB
+	taskID          int64
+	schema          string
+	needChecksum    bool
+	targetPartition string
 }
 
 func (b *dbMetaMgrBuilder) Init(ctx context.Context) error {
@@ -82,12 +83,13 @@ func (b *dbMetaMgrBuilder) TaskMetaMgr(pd *pdutil.PdController) taskMetaMgr {
 
 func (b *dbMetaMgrBuilder) TableMetaMgr(tr *TableImporter) tableMetaMgr {
 	return &dbTableMetaMgr{
-		session:      b.db,
-		taskID:       b.taskID,
-		tr:           tr,
-		schemaName:   b.schema,
-		tableName:    TableMetaTableName,
-		needChecksum: b.needChecksum,
+		session:         b.db,
+		taskID:          b.taskID,
+		tr:              tr,
+		schemaName:      b.schema,
+		tableName:       TableMetaTableName,
+		needChecksum:    b.needChecksum,
+		targetPartition: b.targetPartition,
 	}
 }
 
@@ -102,12 +104,13 @@ type tableMetaMgr interface {
 }
 
 type dbTableMetaMgr struct {
-	session      *sql.DB
-	taskID       int64
-	tr           *TableImporter
-	schemaName   string
-	tableName    string
-	needChecksum bool
+	session         *sql.DB
+	taskID          int64
+	tr              *TableImporter
+	schemaName      string
+	tableName       string
+	needChecksum    bool
+	targetPartition string
 }
 
 func (m *dbTableMetaMgr) InitTableMeta(ctx context.Context) error {
@@ -344,10 +347,14 @@ FROM %s.%s WHERE table_id = ? FOR UPDATE`, m.schemaName, m.tableName),
 	if myStatus < metaStatusRestoreStarted {
 		// the table might have data if our StartRowID is not 0, or if the table
 		// don't have any auto id.
+		// baseTotalKvs here comes exclusively from this task's own table_meta row
+		// (keyed by table_id+task_id), so concurrent Lightning jobs importing
+		// different partitions of the same table cannot mix their base-checksum
+		// values. Each job only reads/writes its own row.
 		if (myStartRowID > 0 || !hasAutoID) && m.needChecksum && baseTotalKvs == 0 {
 			// if another instance finished import before below checksum logic,
 			// it will cause checksum mismatch, but it's very rare.
-			remoteCk, err := DoChecksum(ctx, m.tr.tableInfo)
+			remoteCk, err := DoChecksum(ctx, m.tr.tableInfo, m.targetPartition)
 			if err != nil {
 				return nil, 0, errors.Trace(err)
 			}

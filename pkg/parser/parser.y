@@ -427,6 +427,7 @@ import (
 	events                "EVENTS"
 	evolve                "EVOLVE"
 	exchange              "EXCHANGE"
+	exclude               "EXCLUDE"
 	exclusive             "EXCLUSIVE"
 	execute               "EXECUTE"
 	expansion             "EXPANSION"
@@ -1248,6 +1249,7 @@ import (
 	ObjectType                             "Grant statement object type"
 	OnDuplicateKeyUpdate                   "ON DUPLICATE KEY UPDATE value list"
 	OnCommitOpt                            "ON COMMIT DELETE |PRESERVE ROWS"
+	ExcludePartitionsOpt                   "EXCLUDE PARTITIONS or empty"
 	DuplicateOpt                           "[IGNORE|REPLACE] in CREATE TABLE ... SELECT statement or LOAD DATA statement"
 	FormatOpt                              "FORMAT 'SQL FILE'..."
 	OfTablesOpt                            "OF table_name [, ...]"
@@ -4551,22 +4553,32 @@ CreateTableStmt:
 		}
 		$$ = stmt
 	}
-|	"CREATE" OptTemporary "TABLE" IfNotExists TableName LikeTableWithOrWithoutParen OnCommitOpt
+|	"CREATE" OptTemporary "TABLE" IfNotExists TableName LikeTableWithOrWithoutParen ExcludePartitionsOpt OnCommitOpt
 	{
 		tmp := &ast.CreateTableStmt{
-			Table:            $5.(*ast.TableName),
-			ReferTable:       $6.(*ast.TableName),
-			IfNotExists:      $4.(bool),
-			TemporaryKeyword: $2.(ast.TemporaryKeyword),
+			Table:             $5.(*ast.TableName),
+			ReferTable:        $6.(*ast.TableName),
+			IfNotExists:       $4.(bool),
+			TemporaryKeyword:  $2.(ast.TemporaryKeyword),
+			ExcludePartitions: $7.(bool),
 		}
-		if ($7 != nil && tmp.TemporaryKeyword != ast.TemporaryGlobal) || (tmp.TemporaryKeyword == ast.TemporaryGlobal && $7 == nil) {
+		if ($8 != nil && tmp.TemporaryKeyword != ast.TemporaryGlobal) || (tmp.TemporaryKeyword == ast.TemporaryGlobal && $8 == nil) {
 			yylex.AppendError(yylex.Errorf("GLOBAL TEMPORARY and ON COMMIT DELETE ROWS must appear together"))
 		} else {
 			if tmp.TemporaryKeyword == ast.TemporaryGlobal {
-				tmp.OnCommitDelete = $7.(bool)
+				tmp.OnCommitDelete = $8.(bool)
 			}
 		}
 		$$ = tmp
+	}
+
+ExcludePartitionsOpt:
+	{
+		$$ = false
+	}
+|	"EXCLUDE" "PARTITIONS"
+	{
+		$$ = true
 	}
 
 OnCommitOpt:
@@ -11299,12 +11311,16 @@ AdminStmt:
 			HandleRanges: $6.([]ast.HandleRange),
 		}
 	}
-|	"ADMIN" "CHECKSUM" "TABLE" TableNameList
+|	"ADMIN" "CHECKSUM" "TABLE" TableNameList PartitionNameListOpt
 	{
-		$$ = &ast.AdminStmt{
+		stmt := &ast.AdminStmt{
 			Tp:     ast.AdminChecksumTable,
 			Tables: $4.([]*ast.TableName),
 		}
+		if names, ok := $5.([]model.CIStr); ok && len(names) > 0 {
+			stmt.PartitionNames = names
+		}
+		$$ = stmt
 	}
 |	"ADMIN" "CANCEL" "DDL" "JOBS" NumList
 	{

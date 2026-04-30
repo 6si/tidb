@@ -17,6 +17,7 @@ package config
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"math"
@@ -135,6 +136,52 @@ func TestPausePDSchedulerScope(t *testing.T) {
 	cfg.TikvImporter.PausePDSchedulerScope = "globAL"
 	require.NoError(t, cfg.Adjust(context.Background()))
 	require.Equal(t, PausePDSchedulerScopeGlobal, cfg.TikvImporter.PausePDSchedulerScope)
+}
+
+func TestPausePDSchedulerScopeOff(t *testing.T) {
+	ts, host, port := startMockServer(t, http.StatusOK,
+		`{"port":4444,"advertise-address":"","path":"123.45.67.89:1234,56.78.90.12:3456"}`,
+	)
+	defer ts.Close()
+	tmpDir := t.TempDir()
+
+	newCfg := func() *Config {
+		cfg := NewConfig()
+		cfg.TiDB.Host = host
+		cfg.TiDB.StatusPort = port
+		cfg.TikvImporter.Backend = BackendLocal
+		cfg.TikvImporter.SortedKVDir = "test"
+		cfg.Mydumper.SourceDir = tmpDir
+		return cfg
+	}
+
+	// "off" (case-insensitive) should be accepted and normalised to lower-case.
+	cfg := newCfg()
+	cfg.TikvImporter.PausePDSchedulerScope = "OFF"
+	require.NoError(t, cfg.Adjust(context.Background()))
+	require.Equal(t, PausePDSchedulerScopeOff, cfg.TikvImporter.PausePDSchedulerScope)
+
+	cfg = newCfg()
+	cfg.TikvImporter.PausePDSchedulerScope = "off"
+	require.NoError(t, cfg.Adjust(context.Background()))
+	require.Equal(t, PausePDSchedulerScopeOff, cfg.TikvImporter.PausePDSchedulerScope)
+
+	// "table" and "global" continue to work.
+	cfg = newCfg()
+	cfg.TikvImporter.PausePDSchedulerScope = "table"
+	require.NoError(t, cfg.Adjust(context.Background()))
+	require.Equal(t, PausePDSchedulerScopeTable, cfg.TikvImporter.PausePDSchedulerScope)
+
+	cfg = newCfg()
+	cfg.TikvImporter.PausePDSchedulerScope = "global"
+	require.NoError(t, cfg.Adjust(context.Background()))
+	require.Equal(t, PausePDSchedulerScopeGlobal, cfg.TikvImporter.PausePDSchedulerScope)
+
+	// An unrecognised value must still be rejected.
+	cfg = newCfg()
+	cfg.TikvImporter.PausePDSchedulerScope = "none"
+	err := cfg.Adjust(context.Background())
+	require.ErrorContains(t, err, "pause-pd-scheduler-scope is invalid")
 }
 
 func TestAdjustPdAddrAndPortViaAdvertiseAddr(t *testing.T) {
@@ -1457,4 +1504,122 @@ func TestRedactConfig(t *testing.T) {
 		require.Contains(t, cfg.Redact(), tt.redact)
 		require.Contains(t, cfg.String(), tt.origin)
 	}
+}
+
+// TestColumnConstantsNewSection verifies that [[mydumper.column-constants]] parses
+// correctly and that GetColumnConstants returns the values map.
+func TestColumnConstantsNewSection(t *testing.T) {
+	tomlData := `
+[[mydumper.column-constants]]
+db    = "mydb"
+table = "mytable"
+[mydumper.column-constants.values]
+customer_name = "acme"
+ts            = "2026-04-17 21:00:00"
+`
+	cfg := NewConfig()
+	_, err := toml.Decode(tomlData, cfg)
+	require.NoError(t, err)
+	require.NoError(t, cfg.Mydumper.adjustIgnoreColumns())
+
+	cc, err := cfg.Mydumper.ColumnConstants.GetColumnConstants("mydb", "mytable", false)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{
+		"customer_name": "acme",
+		"ts":            "2026-04-17 21:00:00",
+	}, cc)
+}
+
+// TestColumnConstantsNewSectionAutoPopulatesIgnore verifies that columns named in
+// [[mydumper.column-constants]] are automatically added to the ignore set so users
+// don't need a separate [[mydumper.ignore-data-columns]] entry.
+func TestColumnConstantsNewSectionAutoPopulatesIgnore(t *testing.T) {
+	tomlData := `
+[[mydumper.column-constants]]
+db    = "mydb"
+table = "mytable"
+[mydumper.column-constants.values]
+customer_name = "acme"
+ts            = "2026-04-17 21:00:00"
+`
+	cfg := NewConfig()
+	_, err := toml.Decode(tomlData, cfg)
+	require.NoError(t, err)
+	require.NoError(t, cfg.Mydumper.adjustIgnoreColumns())
+
+	ic, err := cfg.Mydumper.IgnoreColumns.GetIgnoreColumns("mydb", "mytable", false)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"customer_name", "ts"}, ic.Columns)
+}
+
+// TestColumnConstantsAbsent verifies that GetColumnConstants returns nil when no
+// matching entry exists.
+func TestColumnConstantsAbsent(t *testing.T) {
+	cfg := NewConfig()
+	cc, err := cfg.Mydumper.ColumnConstants.GetColumnConstants("mydb", "mytable", false)
+	require.NoError(t, err)
+	require.Nil(t, cc)
+}
+
+// TestColumnConstantsTableFilter verifies that a ColumnConstantsEntry using
+// table-filter (not db/table) matches correctly and auto-populates IgnoreColumns.
+func TestColumnConstantsTableFilter(t *testing.T) {
+	tomlData := `
+[[mydumper.column-constants]]
+table-filter = ["mydb.mytable"]
+[mydumper.column-constants.values]
+ts = "2026-04-17 21:00:00"
+`
+	cfg := NewConfig()
+	_, err := toml.Decode(tomlData, cfg)
+	require.NoError(t, err)
+	require.NoError(t, cfg.Mydumper.adjustIgnoreColumns())
+
+	cc, err := cfg.Mydumper.ColumnConstants.GetColumnConstants("mydb", "mytable", false)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"ts": "2026-04-17 21:00:00"}, cc)
+
+	ic, err := cfg.Mydumper.IgnoreColumns.GetIgnoreColumns("mydb", "mytable", false)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"ts"}, ic.Columns)
+}
+
+// TestColumnConstantsDuplicateKey verifies that duplicate keys in column-constants
+// values (after lowercasing) return an error.
+func TestColumnConstantsDuplicateKey(t *testing.T) {
+	// TOML allows "TS" and "ts" as distinct keys (case-sensitive), but our
+	// normalization in adjustIgnoreColumns lowercases both to "ts", triggering
+	// the duplicate-detection path.
+	tomlData := `
+[[mydumper.column-constants]]
+db    = "mydb"
+table = "mytable"
+[mydumper.column-constants.values]
+TS = "2026-04-17 21:00:00"
+ts = "2026-04-17 22:00:00"
+`
+	cfg := NewConfig()
+	_, err := toml.Decode(tomlData, cfg)
+	require.NoError(t, err)
+	err = cfg.Mydumper.adjustIgnoreColumns()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "duplicate column-constants entry for column ts")
+}
+
+func TestTargetPartitionConfig(t *testing.T) {
+	cfg := NewConfig()
+	require.Equal(t, "", cfg.Mydumper.TargetPartition)
+
+	tomlStr := `
+[mydumper]
+data-source-dir = "."
+target-partition = "p_acme"
+`
+	err := toml.Unmarshal([]byte(tomlStr), cfg)
+	require.NoError(t, err)
+	require.Equal(t, "p_acme", cfg.Mydumper.TargetPartition)
+
+	jsonBytes, err := json.Marshal(cfg.Mydumper)
+	require.NoError(t, err)
+	require.Contains(t, string(jsonBytes), `"target-partition":"p_acme"`)
 }

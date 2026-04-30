@@ -206,7 +206,7 @@ func (s *tableRestoreSuiteBase) setupSuite(t *testing.T) {
 func (s *tableRestoreSuiteBase) setupTest(t *testing.T) {
 	// Collect into the test TableImporter structure
 	var err error
-	s.tr, err = NewTableImporter("`db`.`table`", s.tableMeta, s.dbInfo, s.tableInfo, &checkpoints.TableCheckpoint{}, nil, nil, nil, log.L())
+	s.tr, err = NewTableImporter("`db`.`table`", s.tableMeta, s.dbInfo, s.tableInfo, &checkpoints.TableCheckpoint{}, nil, nil, nil, nil, log.L())
 	require.NoError(t, err)
 
 	s.cfg = config.NewConfig()
@@ -511,7 +511,7 @@ func (s *tableRestoreSuite) TestPopulateChunksCSVHeader() {
 	cfg.Mydumper.StrictFormat = true
 	rc := &Controller{cfg: cfg, ioWorkers: worker.NewPool(context.Background(), 1, "io"), store: store}
 
-	tr, err := NewTableImporter("`db`.`table`", tableMeta, s.dbInfo, s.tableInfo, &checkpoints.TableCheckpoint{}, nil, nil, nil, log.L())
+	tr, err := NewTableImporter("`db`.`table`", tableMeta, s.dbInfo, s.tableInfo, &checkpoints.TableCheckpoint{}, nil, nil, nil, nil, log.L())
 	require.NoError(s.T(), err)
 	require.NoError(s.T(), tr.populateChunks(context.Background(), rc, cp))
 
@@ -762,7 +762,7 @@ func (s *tableRestoreSuite) TestInitializeColumnsGenerated() {
 		require.NoError(s.T(), err)
 		core.State = model.StatePublic
 		tableInfo := &checkpoints.TidbTableInfo{Name: "table", DB: "db", Core: core}
-		s.tr, err = NewTableImporter("`db`.`table`", s.tableMeta, s.dbInfo, tableInfo, &checkpoints.TableCheckpoint{}, nil, nil, nil, log.L())
+		s.tr, err = NewTableImporter("`db`.`table`", s.tableMeta, s.dbInfo, tableInfo, &checkpoints.TableCheckpoint{}, nil, nil, nil, nil, log.L())
 		require.NoError(s.T(), err)
 		ccp := &checkpoints.ChunkCheckpoint{}
 
@@ -803,7 +803,7 @@ func (s *tableRestoreSuite) TestCompareChecksumSuccess() {
 	mock.ExpectClose()
 
 	ctx := MockDoChecksumCtx(db)
-	remoteChecksum, err := DoChecksum(ctx, s.tr.tableInfo)
+	remoteChecksum, err := DoChecksum(ctx, s.tr.tableInfo, "")
 	require.NoError(s.T(), err)
 	err = s.tr.compareChecksum(remoteChecksum, verification.MakeKVChecksum(1234567, 12345, 1234567890))
 	require.NoError(s.T(), err)
@@ -833,7 +833,7 @@ func (s *tableRestoreSuite) TestCompareChecksumFailure() {
 	mock.ExpectClose()
 	mock.ExpectClose()
 	ctx := MockDoChecksumCtx(db)
-	remoteChecksum, err := DoChecksum(ctx, s.tr.tableInfo)
+	remoteChecksum, err := DoChecksum(ctx, s.tr.tableInfo, "")
 	require.NoError(s.T(), err)
 	err = s.tr.compareChecksum(remoteChecksum, verification.MakeKVChecksum(9876543, 54321, 1357924680))
 	require.Regexp(s.T(), "checksum mismatched.*", err.Error())
@@ -853,7 +853,7 @@ func (s *tableRestoreSuite) TestAnalyzeTable() {
 
 	ctx := context.Background()
 	require.NoError(s.T(), err)
-	err = s.tr.analyzeTable(ctx, db)
+	err = s.tr.analyzeTable(ctx, db, "")
 	require.NoError(s.T(), err)
 }
 

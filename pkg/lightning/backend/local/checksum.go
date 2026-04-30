@@ -83,10 +83,15 @@ func (rc *RemoteChecksum) IsEqual(other *verification.KVChecksum) bool {
 
 // ChecksumManager is a manager that manages checksums.
 type ChecksumManager interface {
-	Checksum(ctx context.Context, tableInfo *checkpoints.TidbTableInfo) (*RemoteChecksum, error)
+	// Checksum computes the remote checksum for tableInfo.
+	// When partitionName is non-empty, the checksum is scoped to that partition only.
+	// TiKV-backed implementations must reject non-empty partitionName with an error.
+	Checksum(ctx context.Context, tableInfo *checkpoints.TidbTableInfo, partitionName string) (*RemoteChecksum, error)
+	Close()
 }
 
-// fetch checksum for tidb sql client
+// tidbChecksumExecutor computes checksums via TiDB SQL (ADMIN CHECKSUM TABLE).
+// It supports partition-scoped checksums via the partitionName argument.
 type tidbChecksumExecutor struct {
 	db      *sql.DB
 	manager *gcLifeTimeManager
@@ -102,7 +107,10 @@ func NewTiDBChecksumExecutor(db *sql.DB) ChecksumManager {
 	}
 }
 
-func (e *tidbChecksumExecutor) Checksum(ctx context.Context, tableInfo *checkpoints.TidbTableInfo) (*RemoteChecksum, error) {
+// Checksum implements ChecksumManager by running ADMIN CHECKSUM TABLE via TiDB SQL.
+// When partitionName is non-empty, the statement is scoped to that partition:
+// ADMIN CHECKSUM TABLE t PARTITION (partitionName).
+func (e *tidbChecksumExecutor) Checksum(ctx context.Context, tableInfo *checkpoints.TidbTableInfo, partitionName string) (*RemoteChecksum, error) {
 	var err error
 	if err = e.manager.addOneJob(ctx, e.db); err != nil {
 		return nil, err
@@ -146,9 +154,14 @@ func (e *tidbChecksumExecutor) Checksum(ctx context.Context, tableInfo *checkpoi
 		}
 	}
 
+	checksumSQL := "ADMIN CHECKSUM TABLE " + tableName
+	if partitionName != "" {
+		checksumSQL += " PARTITION (" + common.EscapeIdentifier(partitionName) + ")"
+	}
+
 	cs := RemoteChecksum{}
 	err = common.SQLWithRetry{DB: conn, Logger: task.Logger}.QueryRow(ctx, "compute remote checksum",
-		"ADMIN CHECKSUM TABLE "+tableName, &cs.Schema, &cs.Table, &cs.Checksum, &cs.TotalKVs, &cs.TotalBytes,
+		checksumSQL, &cs.Schema, &cs.Table, &cs.Checksum, &cs.TotalKVs, &cs.TotalBytes,
 	)
 	dur := task.End(zap.ErrorLevel, err)
 	if m, ok := metric.FromContext(ctx); ok {
@@ -159,6 +172,8 @@ func (e *tidbChecksumExecutor) Checksum(ctx context.Context, tableInfo *checkpoi
 	}
 	return &cs, nil
 }
+
+func (*tidbChecksumExecutor) Close() {}
 
 type gcLifeTimeManager struct {
 	runningJobsLock sync.Mutex
@@ -341,8 +356,13 @@ func (e *TiKVChecksumManager) checksumDB(ctx context.Context, tableInfo *checkpo
 
 var retryGetTSInterval = time.Second
 
-// Checksum implements the ChecksumManager interface.
-func (e *TiKVChecksumManager) Checksum(ctx context.Context, tableInfo *checkpoints.TidbTableInfo) (*RemoteChecksum, error) {
+// Checksum implements the ChecksumManager interface using the TiKV coprocessor.
+// Partition-scoped checksums (non-empty partitionName) are not supported by this
+// implementation; callers must use tidbChecksumExecutor (checksum-via-sql = true) instead.
+func (e *TiKVChecksumManager) Checksum(ctx context.Context, tableInfo *checkpoints.TidbTableInfo, partitionName string) (*RemoteChecksum, error) {
+	if partitionName != "" {
+		return nil, errors.Errorf("partition-scoped checksum is not supported by TiKV checksum manager; use tidb checksum manager instead (set checksum-via-sql = true): partition %s", partitionName)
+	}
 	tbl := common.UniqueTable(tableInfo.DB, tableInfo.Name)
 	var (
 		physicalTS, logicalTS int64
@@ -374,6 +394,11 @@ func (e *TiKVChecksumManager) Checksum(ctx context.Context, tableInfo *checkpoin
 	defer e.manager.removeOneJob(tbl)
 
 	return e.checksumDB(ctx, tableInfo, ts)
+}
+
+// Close stops the background GC TTL manager.
+func (e *TiKVChecksumManager) Close() {
+	e.manager.close()
 }
 
 type tableChecksumTS struct {
@@ -515,3 +540,6 @@ func (m *gcTTLManager) start(ctx context.Context) {
 		}
 	}()
 }
+
+// close is a no-op in v8.5.6 where gcTTLManager lifecycle is context-driven.
+func (m *gcTTLManager) close() {}

@@ -1326,11 +1326,24 @@ func BuildTableInfoWithLike(ident ast.Ident, referTblInfo *model.TableInfo, s *a
 		replica.Available = false
 		tblInfo.TiFlashReplica = &replica
 	}
-	if referTblInfo.Partition != nil {
+	if referTblInfo.Partition != nil && !s.ExcludePartitions {
 		pi := *referTblInfo.Partition
 		pi.Definitions = make([]model.PartitionDefinition, len(referTblInfo.Partition.Definitions))
 		copy(pi.Definitions, referTblInfo.Partition.Definitions)
 		tblInfo.Partition = &pi
+	} else if s.ExcludePartitions {
+		tblInfo.Partition = nil
+		// Global indexes are only valid on partitioned tables; demote them to local.
+		// Also reset GlobalIndexVersion: a stale non-zero version on a local index
+		// causes GenIndexKey to expect a PartitionHandle and panic on DML.
+		for i, idx := range tblInfo.Indices {
+			if idx.Global {
+				clone := *idx
+				clone.Global = false
+				clone.GlobalIndexVersion = 0
+				tblInfo.Indices[i] = &clone
+			}
+		}
 	}
 
 	if referTblInfo.TTLInfo != nil {
@@ -1340,6 +1353,11 @@ func BuildTableInfoWithLike(ident ast.Ident, referTblInfo *model.TableInfo, s *a
 	if s.TemporaryKeyword != ast.TemporaryNone {
 		// temporary table does not support affinity, we should remove it
 		tblInfo.Affinity = nil
+	} else if s.ExcludePartitions {
+		// partition-level affinity is meaningless on a non-partitioned table; clear it.
+		if tblInfo.Affinity != nil && tblInfo.Affinity.Level == ast.TableAffinityLevelPartition {
+			tblInfo.Affinity = nil
+		}
 	} else if referTblInfo.Affinity != nil {
 		tblInfo.Affinity = referTblInfo.Affinity.Clone()
 	}

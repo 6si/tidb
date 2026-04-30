@@ -439,10 +439,11 @@ func NewImportControllerWithPauser(
 	switch {
 	case isSSTImport && cfg.TikvImporter.ParallelImport:
 		metaBuilder = &dbMetaMgrBuilder{
-			db:           db,
-			taskID:       cfg.TaskID,
-			schema:       cfg.App.MetaSchemaName,
-			needChecksum: cfg.PostRestore.Checksum != config.OpLevelOff,
+			db:              db,
+			taskID:          cfg.TaskID,
+			schema:          cfg.App.MetaSchemaName,
+			needChecksum:    cfg.PostRestore.Checksum != config.OpLevelOff,
+			targetPartition: cfg.Mydumper.TargetPartition,
 		}
 	case isSSTImport:
 		metaBuilder = singleMgrBuilder{
@@ -1293,6 +1294,11 @@ func (rc *Controller) importTables(ctx context.Context) (finalErr error) {
 			err       error
 		)
 
+		// pausePDScheduler is false when scope="off": Lightning skips PD task
+		// registration and the scheduler pause/restore lifecycle entirely, which
+		// avoids contention when many Lightning jobs run concurrently.
+		pausePDScheduler := rc.cfg.TikvImporter.PausePDSchedulerScope != config.PausePDSchedulerScopeOff
+
 		if rc.cfg.TikvImporter.PausePDSchedulerScope == config.PausePDSchedulerScopeGlobal {
 			logTask.Info("pause pd scheduler of global scope")
 
@@ -1309,10 +1315,10 @@ func (rc *Controller) importTables(ctx context.Context) (finalErr error) {
 			needSwitchBack, needCleanup, err := rc.taskMgr.CheckAndFinishRestore(restoreCtx, taskFinished)
 			if err != nil {
 				logTask.Warn("check restore pd schedulers failed", zap.Error(err))
-				return
+			} else {
+				switchBack = needSwitchBack
+				cleanup = needCleanup
 			}
-			switchBack = needSwitchBack
-			cleanup = needCleanup
 
 			if needSwitchBack && restoreFn != nil {
 				logTask.Info("add back PD leader&region schedulers")
@@ -1361,11 +1367,13 @@ func (rc *Controller) importTables(ctx context.Context) (finalErr error) {
 		}
 		ctx = context.WithValue(ctx, &checksumManagerKey, manager)
 
-		undo, err := rc.registerTaskToPD(ctx)
-		if err != nil {
-			return errors.Trace(err)
+		if pausePDScheduler {
+			undo, err := rc.registerTaskToPD(ctx)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			defer undo()
 		}
-		defer undo()
 	}
 
 	type task struct {
@@ -1469,7 +1477,11 @@ func (rc *Controller) importTables(ctx context.Context) (finalErr error) {
 			if err != nil {
 				return errors.Trace(err)
 			}
-			tr, err := NewTableImporter(tableName, tableMeta, dbInfo, tableInfo, cp, igCols.ColumnsMap(), kvStore, etcdCli, log.FromContext(ctx))
+			colConstants, err := rc.cfg.Mydumper.ColumnConstants.GetColumnConstants(dbInfo.Name, tableInfo.Name, rc.cfg.Mydumper.CaseSensitive)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			tr, err := NewTableImporter(tableName, tableMeta, dbInfo, tableInfo, cp, igCols.ColumnsMap(), colConstants, kvStore, etcdCli, log.FromContext(ctx))
 			if err != nil {
 				return errors.Trace(err)
 			}
