@@ -1095,7 +1095,7 @@ type ShardKeyClause struct {
 	node
 
 	Columns  []*ColumnName // Column names forming the shard key
-	ShardCnt int          // Number of shards from SHARDS N
+	ShardCnt int           // Number of shards from SHARDS N
 }
 
 // Restore implements Node interface.
@@ -1143,7 +1143,7 @@ type CreateTableStmt struct {
 	// Meanless when TemporaryKeyword is not TemporaryGlobal.
 	// ON COMMIT DELETE ROWS => true
 	// ON COMMIT PRESERVE ROW => false
-	OnCommitDelete bool
+	OnCommitDelete    bool
 	Table             *TableName
 	ReferTable        *TableName
 	Cols              []*ColumnDef
