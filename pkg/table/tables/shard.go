@@ -28,6 +28,7 @@ import (
 
 var _ table.Table = &shardedTable{}
 var _ table.PartitionedTable = &shardedTable{}
+var _ table.ShardedPartitionedTable = &shardedTable{}
 
 // shardPhysical is the physical backing store for one shard slot.
 // It has its own physicalTableID and recordPrefix so TiKV rows land in a
@@ -51,11 +52,12 @@ func (sp *shardPhysical) GetPhysicalID() int64 {
 // laid out as shards[partitionIdx*ShardCnt + shardIdx]. physicalIDs mirrors this layout.
 type shardedTable struct {
 	TableCommon
-	shards      []*shardPhysical
-	shardColIdx []int  // column Offset per shard-key column, resolved once at open time
-	shardCnt    int    // number of shards per partition (== ShardKeyInfo.ShardCnt)
-	partCnt     int    // number of partitions (1 for non-partitioned tables)
-	physicalIDs []int64 // flat: physicalIDs[partIdx*shardCnt + shardIdx]
+	shards       []*shardPhysical
+	shardColIdx  []int           // column Offset per shard-key column, resolved once at open time
+	shardCnt     int             // number of shards per partition (== ShardKeyInfo.ShardCnt)
+	partCnt      int             // number of partitions (1 for non-partitioned tables)
+	physicalIDs  []int64         // flat: physicalIDs[partIdx*shardCnt + shardIdx]
+	origPartInfo *model.PartitionInfo // original PartitionInfo before shard synthesis (nil for shard-only)
 }
 
 // newShardedTable builds a shardedTable from a TableInfo that has ShardKeyInfo
@@ -99,6 +101,7 @@ func newShardedTable(tbl *TableCommon, tblInfo *model.TableInfo) (*shardedTable,
 		(len(partInfo.Definitions) == 0 || len(partInfo.Definitions[0].ShardIDs) == 0)
 	if partInfo != nil && !isSyntheticPI {
 		// Partitioned + sharded: each partition has its own ShardIDs slice.
+		st.origPartInfo = partInfo
 		st.partCnt = len(partInfo.Definitions)
 		st.shards = make([]*shardPhysical, st.partCnt*st.shardCnt)
 		st.physicalIDs = make([]int64, st.partCnt*st.shardCnt)
@@ -303,4 +306,11 @@ func (t *shardedTable) GetPartitionColumnNames() []pmodel.CIStr {
 // CheckForExchangePartition is not applicable to sharded tables.
 func (t *shardedTable) CheckForExchangePartition(_ expression.EvalContext, _ *model.PartitionInfo, _ []types.Datum, _, _ int64) error {
 	return errors.New("EXCHANGE PARTITION is not supported on sharded tables")
+}
+
+// OrigPartitionInfo returns the real PartitionInfo for partitioned+sharded tables,
+// before the synthetic flat PartitionInfo was injected for planner purposes.
+// Returns nil for shard-only (non-partitioned) tables.
+func (t *shardedTable) OrigPartitionInfo() *model.PartitionInfo {
+	return t.origPartInfo
 }

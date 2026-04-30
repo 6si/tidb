@@ -527,6 +527,14 @@ type PartitionedTable interface {
 	CheckForExchangePartition(ctx expression.EvalContext, pi *model.PartitionInfo, r []types.Datum, partID, ntID int64) error
 }
 
+// ShardedPartitionedTable is implemented by sharded+partitioned tables that wrap a
+// real PartitionInfo with a synthetic one for planner purposes. The executor needs
+// the original PartitionInfo for ADD PARTITION operations.
+type ShardedPartitionedTable interface {
+	PartitionedTable
+	OrigPartitionInfo() *model.PartitionInfo
+}
+
 // TableFromMeta builds a table.Table from *model.TableInfo.
 // Currently, it is assigned to tables.TableFromMeta in tidb package's init function.
 var TableFromMeta func(allocators autoid.Allocators, tblInfo *model.TableInfo) (Table, error)
