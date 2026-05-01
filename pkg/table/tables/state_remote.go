@@ -20,11 +20,12 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
+	"github.com/tikv/client-go/v2/oracle"
+
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/parser/terror"
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/sqlexec"
-	"github.com/tikv/client-go/v2/oracle"
 )
 
 // CachedTableLockType define the lock type for cached table
