@@ -19,8 +19,6 @@ import (
 	"testing"
 
 	"github.com/pingcap/log"
-	"github.com/stretchr/testify/require"
-
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
@@ -30,6 +28,7 @@ import (
 	"github.com/pingcap/tidb/pkg/types"
 	_ "github.com/pingcap/tidb/pkg/util/context"
 	"github.com/pingcap/tidb/pkg/util/logutil"
+	"github.com/stretchr/testify/require"
 )
 
 const batchSize = 5000

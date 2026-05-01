@@ -18,7 +18,6 @@ import (
 	"github.com/pingcap/tidb/pkg/expression"
 	tmodel "github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/model"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/planner/core/base"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/types"
@@ -37,7 +36,7 @@ func PartitionPruning(ctx base.PlanContext, tbl table.PartitionedTable, conds []
 	if tblInfo.ShardKeyInfo != nil {
 		// For SHARD BY + LIST COLUMNS: two-stage pruning.
 		if spt, ok := tbl.(table.ShardedPartitionedTable); ok {
-			if origPI := spt.OrigPartitionInfo(); origPI != nil && origPI.Type == pmodel.PartitionTypeList {
+			if origPI := spt.OrigPartitionInfo(); origPI != nil && origPI.Type == model.PartitionTypeList {
 				return pruneShardedListPartitionDynamic(ctx, s, tbl, pi, origPI, tblInfo, conds, partitionNames, columns)
 			}
 		}
