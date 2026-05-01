@@ -216,10 +216,11 @@ func TableFromMeta(allocs autoid.Allocators, tblInfo *model.TableInfo) (table.Ta
 	}
 	var t TableCommon
 	initTableCommon(&t, tblInfo, tblInfo.ID, columns, allocs, constraints)
-	if ski := tblInfo.ShardKeyInfo; ski != nil {
-		// Route ALL sharded tables (both shard-only and partitioned+sharded) through
-		// newShardedTable so the planner sees a *shardedTable and the ShardedPartitionedTable
-		// interface check in PartitionPruning succeeds.
+	if ski := tblInfo.ShardKeyInfo; ski != nil && shardIDsPopulated(ski, tblInfo.GetPartitionInfo()) {
+		// Route ALL fully-initialized sharded tables through newShardedTable so the planner
+		// sees a *shardedTable and the ShardedPartitionedTable interface check in
+		// PartitionPruning succeeds. Tables with unpopulated ShardIDs (e.g. during DDL
+		// validation before IDs are assigned) fall through to regular table construction.
 		// For shard-only tables: inject a synthetic PartitionInfo so the planner's
 		// GetPartitionInfo() check succeeds and it scans per-shard physical key ranges.
 		if tblInfo.GetPartitionInfo() == nil && len(ski.ShardIDs) > 0 {
@@ -252,6 +253,27 @@ func TableFromMeta(allocs autoid.Allocators, tblInfo *model.TableInfo) (table.Ta
 		return &t, nil
 	}
 	return newPartitionedTable(&t, tblInfo)
+}
+
+// shardIDsPopulated reports whether a sharded table's physical shard IDs have been
+// assigned by the DDL executor. Until they are, TableFromMeta is called for DDL
+// validation purposes and we must not route through newShardedTable.
+//
+//   - Shard-only tables: IDs are in ski.ShardIDs — non-empty means populated.
+//   - Partitioned+sharded tables: IDs are in partInfo.Definitions[i].ShardIDs —
+//     we check the first definition that has any ShardIDs.
+func shardIDsPopulated(ski *model.ShardKeyInfo, partInfo *model.PartitionInfo) bool {
+	if len(ski.ShardIDs) > 0 {
+		return true
+	}
+	if partInfo != nil {
+		for i := range partInfo.Definitions {
+			if len(partInfo.Definitions[i].ShardIDs) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func buildGeneratedExpr(tblInfo *model.TableInfo, genExpr string) (ast.ExprNode, error) {
