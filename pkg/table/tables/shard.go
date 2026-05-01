@@ -211,8 +211,15 @@ func (t *shardedTable) locateOrigPartition(evalCtx expression.EvalContext, r []t
 			return locateRangeColumnPartitionByExpr(evalCtx, pe, r)
 		}
 		return locateRangePartitionByExpr(evalCtx, pe, r)
-	case pmodel.PartitionTypeHash, pmodel.PartitionTypeKey:
+	case pmodel.PartitionTypeHash:
 		return locateHashPartitionByExpr(evalCtx, pe, uint64(t.partCnt), r)
+	case pmodel.PartitionTypeKey:
+		// KEY partitions use MySQL's internal column hashing, not a SQL expression.
+		// partExpr.Expr is nil for KEY — must use ForKeyPruning.LocateKeyPartition.
+		if pe.ForKeyPruning == nil {
+			return 0, errors.New("shardedTable: ForKeyPruning is nil for KEY partition")
+		}
+		return pe.ForKeyPruning.LocateKeyPartition(uint64(t.partCnt), r)
 	default:
 		return 0, errors.Errorf("shardedTable: unsupported partition type %v in locateOrigPartition", t.origPartInfo.Type)
 	}
