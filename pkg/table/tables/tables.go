@@ -221,9 +221,17 @@ func TableFromMeta(allocs autoid.Allocators, tblInfo *model.TableInfo) (table.Ta
 		// sees a *shardedTable and the ShardedPartitionedTable interface check in
 		// PartitionPruning succeeds. Tables with unpopulated ShardIDs (e.g. during DDL
 		// validation before IDs are assigned) fall through to regular table construction.
-		// For shard-only tables: inject a synthetic PartitionInfo so the planner's
-		// GetPartitionInfo() check succeeds and it scans per-shard physical key ranges.
-		if tblInfo.GetPartitionInfo() == nil && len(ski.ShardIDs) > 0 {
+		//
+		// Inject a synthetic flat PartitionInfo into a copy of tblInfo so that
+		// tbl.Meta().Partition.Definitions has one entry per physical shard. This ensures
+		// that builder.go's pi.Definitions[idx].ID returns a physical shard ID and
+		// tbl.GetPartition(physID) resolves correctly.
+		//
+		// The original LIST/RANGE PartitionInfo is preserved as origPartInfo inside
+		// shardedTable for two-stage partition pruning.
+		origPI := tblInfo.GetPartitionInfo()
+		if origPI == nil && len(ski.ShardIDs) > 0 {
+			// Shard-only: build flat PI from ski.ShardIDs.
 			defs := make([]model.PartitionDefinition, len(ski.ShardIDs))
 			for i, physID := range ski.ShardIDs {
 				defs[i] = model.PartitionDefinition{
@@ -240,6 +248,35 @@ func TableFromMeta(allocs autoid.Allocators, tblInfo *model.TableInfo) (table.Ta
 				Num:         uint64(len(ski.ShardIDs)),
 				Definitions: defs,
 			}
+		} else if origPI != nil && len(origPI.Definitions) > 0 && len(origPI.Definitions[0].ShardIDs) > 0 {
+			// Partitioned+sharded: build flat PI with one entry per physical shard
+			// (logicalPartCnt * shardCnt entries), laid out as
+			// flatIdx = partIdx*shardCnt + shardSlot.
+			// The original LIST/RANGE PI is saved; tblInfo gets a mutated copy with the
+			// flat PI so that tbl.Meta().Partition reflects the physical layout.
+			flatDefs := make([]model.PartitionDefinition, 0, len(origPI.Definitions)*ski.ShardCnt)
+			for _, def := range origPI.Definitions {
+				for si, physID := range def.ShardIDs {
+					flatDefs = append(flatDefs, model.PartitionDefinition{
+						ID:   physID,
+						Name: pmodel.NewCIStr(fmt.Sprintf("%s_s%d", def.Name.L, si)),
+					})
+				}
+			}
+			// Build the flat PI. We pass it to newShardedTable which stores it as
+			// flatPI on the shardedTable. shardedTable.Meta() is overridden to return
+			// a copy of tblInfo with flatPI substituted in, so that:
+			//   - builder.go sees flat physical shard entries (correct for query execution)
+			//   - t.meta still has the original LIST/RANGE PI (correct for DDL)
+			flatPI := &model.PartitionInfo{
+				Type:        0,
+				Enable:      true,
+				Num:         uint64(len(flatDefs)),
+				Definitions: flatDefs,
+			}
+			// Pass origPI explicitly so newShardedTable can set origPartInfo for
+			// two-stage pruning, and flatPI so Meta() can return the physical layout.
+			return newShardedTable(&t, tblInfo, origPI, flatPI)
 		}
 		return newShardedTable(&t, tblInfo)
 	}
