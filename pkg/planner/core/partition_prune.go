@@ -81,9 +81,21 @@ func pruneShardedListPartitionDynamic(
 	shardCnt := ski.ShardCnt
 
 	// Stage 1: LIST COLUMNS pruning on the logical partitions.
+	// Note: pruneListPartition reads tbl.Meta().Partition internally, which is the flat
+	// synthetic PI (logicalPartCnt*shardCnt entries). Its FullRange fallback iterates over
+	// flat indices, not logical ones. We clamp any returned index >= len(origPI.Definitions)
+	// back to FullRange so that flat indices are never mistaken for logical indices.
 	logicalUsed, err := s.pruneListPartition(ctx, tbl, partitionNames, conds, columns)
 	if err != nil {
 		return nil, err
+	}
+	if len(logicalUsed) != 1 || logicalUsed[0] != FullRange {
+		for _, idx := range logicalUsed {
+			if idx >= len(origPI.Definitions) {
+				logicalUsed = []int{FullRange}
+				break
+			}
+		}
 	}
 	if len(logicalUsed) == 1 && logicalUsed[0] == FullRange {
 		logicalUsed = make([]int, len(origPI.Definitions))
