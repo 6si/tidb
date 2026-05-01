@@ -18,9 +18,11 @@ import (
 	"github.com/pingcap/tidb/pkg/expression"
 	tmodel "github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/model"
+	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/planner/core/base"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/types"
+	"golang.org/x/exp/slices"
 )
 
 // PartitionPruning finds all used partitions according to query conditions, it will
@@ -33,6 +35,12 @@ func PartitionPruning(ctx base.PlanContext, tbl table.PartitionedTable, conds []
 	pi := tblInfo.Partition
 	// Shard-key tables: pi.Type=0 (PartitionTypeNone) but ShardKeyInfo is set.
 	if tblInfo.ShardKeyInfo != nil {
+		// For SHARD BY + LIST COLUMNS: two-stage pruning.
+		if spt, ok := tbl.(table.ShardedPartitionedTable); ok {
+			if origPI := spt.OrigPartitionInfo(); origPI != nil && origPI.Type == pmodel.PartitionTypeList {
+				return pruneShardedListPartitionDynamic(ctx, s, tbl, pi, origPI, tblInfo, conds, partitionNames, columns)
+			}
+		}
 		rangeOr, err := s.pruneShardKeyPartition(ctx, pi, tblInfo, conds, columns)
 		if err != nil {
 			return nil, err
@@ -54,6 +62,66 @@ func PartitionPruning(ctx base.PlanContext, tbl table.PartitionedTable, conds []
 		return s.pruneListPartition(ctx, tbl, partitionNames, conds, columns)
 	}
 	return []int{FullRange}, nil
+}
+
+// pruneShardedListPartitionDynamic is the dynamic-pruning equivalent of
+// processShardedListPartition: two-stage LIST + shard-slot pruning for
+// SHARD BY + LIST COLUMNS tables.
+func pruneShardedListPartitionDynamic(
+	ctx base.PlanContext,
+	s PartitionProcessor,
+	tbl table.PartitionedTable,
+	flatPI, origPI *tmodel.PartitionInfo,
+	tblInfo *tmodel.TableInfo,
+	conds []expression.Expression,
+	partitionNames []model.CIStr,
+	columns []*expression.Column,
+) ([]int, error) {
+	ski := tblInfo.ShardKeyInfo
+	shardCnt := ski.ShardCnt
+
+	// Stage 1: LIST COLUMNS pruning on the logical partitions.
+	logicalUsed, err := s.pruneListPartition(ctx, tbl, partitionNames, conds, columns)
+	if err != nil {
+		return nil, err
+	}
+	if len(logicalUsed) == 1 && logicalUsed[0] == FullRange {
+		logicalUsed = make([]int, len(origPI.Definitions))
+		for i := range origPI.Definitions {
+			logicalUsed[i] = i
+		}
+	}
+
+	// Stage 2: shard slot pruning.
+	shardSlots, err := s.pruneShardKeyPartition(ctx, flatPI, tblInfo, conds, columns)
+	if err != nil {
+		return nil, err
+	}
+	slotSet := make(map[int]struct{}, shardCnt)
+	if len(shardSlots) == 1 && shardSlots[0].start == 0 && shardSlots[0].end == len(flatPI.Definitions) {
+		for i := 0; i < shardCnt; i++ {
+			slotSet[i] = struct{}{}
+		}
+	} else {
+		for _, r := range shardSlots {
+			for idx := r.start; idx < r.end; idx++ {
+				slotSet[idx%shardCnt] = struct{}{}
+			}
+		}
+	}
+
+	surviving := make([]int, 0, len(logicalUsed)*len(slotSet))
+	for _, partIdx := range logicalUsed {
+		for slot := range slotSet {
+			surviving = append(surviving, partIdx*shardCnt+slot)
+		}
+	}
+	slices.Sort(surviving)
+
+	if len(surviving) == len(flatPI.Definitions) {
+		return []int{FullRange}, nil
+	}
+	return surviving, nil
 }
 
 func handleDroppingForRange(pi *tmodel.PartitionInfo, partitionNames []model.CIStr, usedPartitions []int) []int {

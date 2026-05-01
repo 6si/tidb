@@ -58,6 +58,7 @@ type shardedTable struct {
 	partCnt      int                  // number of partitions (1 for non-partitioned tables)
 	physicalIDs  []int64              // flat: physicalIDs[partIdx*shardCnt + shardIdx]
 	origPartInfo *model.PartitionInfo // original PartitionInfo before shard synthesis (nil for shard-only)
+	partExpr     *PartitionExpr       // lazily built from origPartInfo for LIST pruning; nil for shard-only
 }
 
 // newShardedTable builds a shardedTable from a TableInfo that has ShardKeyInfo
@@ -102,6 +103,11 @@ func newShardedTable(tbl *TableCommon, tblInfo *model.TableInfo) (*shardedTable,
 	if partInfo != nil && !isSyntheticPI {
 		// Partitioned + sharded: each partition has its own ShardIDs slice.
 		st.origPartInfo = partInfo
+		// Build the PartitionExpr from the original PartitionInfo so that
+		// findUsedListPartitions can use it for LIST COLUMNS pruning.
+		if pe, err := newPartitionExpr(tblInfo, partInfo.Type, partInfo.Expr, partInfo.Columns, partInfo.Definitions); err == nil {
+			st.partExpr = pe
+		}
 		st.partCnt = len(partInfo.Definitions)
 		st.shards = make([]*shardPhysical, st.partCnt*st.shardCnt)
 		st.physicalIDs = make([]int64, st.partCnt*st.shardCnt)
@@ -312,4 +318,13 @@ func (t *shardedTable) CheckForExchangePartition(_ expression.EvalContext, _ *mo
 // Returns nil for shard-only (non-partitioned) tables.
 func (t *shardedTable) OrigPartitionInfo() *model.PartitionInfo {
 	return t.origPartInfo
+}
+
+// PartitionExpr returns the PartitionExpr built from the original PartitionInfo
+// (e.g. LIST COLUMNS). This satisfies the partitionTable interface in
+// rule_partition_processor.go so that findUsedListPartitions can run LIST pruning
+// on the logical partitions of a SHARD BY + LIST COLUMNS table.
+// Returns nil for shard-only (non-partitioned) tables.
+func (t *shardedTable) PartitionExpr() *PartitionExpr {
+	return t.partExpr
 }
