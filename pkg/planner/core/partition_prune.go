@@ -110,15 +110,18 @@ func pruneShardedListPartitionDynamic(
 		}
 	}
 
+	flatLen := len(flatPI.Definitions)
 	surviving := make([]int, 0, len(logicalUsed)*len(slotSet))
 	for _, partIdx := range logicalUsed {
 		for slot := range slotSet {
-			surviving = append(surviving, partIdx*shardCnt+slot)
+			if idx := partIdx*shardCnt + slot; idx < flatLen {
+				surviving = append(surviving, idx)
+			}
 		}
 	}
 	slices.Sort(surviving)
 
-	if len(surviving) == len(flatPI.Definitions) {
+	if len(surviving) == flatLen {
 		return []int{FullRange}, nil
 	}
 	return surviving, nil

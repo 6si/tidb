@@ -977,16 +977,20 @@ func (s *PartitionProcessor) processShardedListPartition(ds *logicalop.DataSourc
 
 	// Combine: surviving flat indices are partIdx*shardCnt + slot for each
 	// (logicalPartIdx, slotIdx) pair that passes both filters.
+	// Bounds-check guards against stale origPartInfo after concurrent DDL.
+	flatLen := len(flatPI.Definitions)
 	surviving := make([]int, 0, len(logicalUsed)*len(slotSet))
 	for _, partIdx := range logicalUsed {
 		for slot := range slotSet {
-			surviving = append(surviving, partIdx*shardCnt+slot)
+			if idx := partIdx*shardCnt + slot; idx < flatLen {
+				surviving = append(surviving, idx)
+			}
 		}
 	}
 	slices.Sort(surviving)
 
-	if len(surviving) == len(flatPI.Definitions) {
-		return s.makeUnionAllChildren(ds, flatPI, fullRange(len(flatPI.Definitions)), opt)
+	if len(surviving) == flatLen {
+		return s.makeUnionAllChildren(ds, flatPI, fullRange(flatLen), opt)
 	}
 	return s.makeUnionAllChildren(ds, flatPI, convertToRangeOr(surviving, flatPI), opt)
 }
