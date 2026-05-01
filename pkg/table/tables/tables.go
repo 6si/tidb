@@ -216,10 +216,13 @@ func TableFromMeta(allocs autoid.Allocators, tblInfo *model.TableInfo) (table.Ta
 	}
 	var t TableCommon
 	initTableCommon(&t, tblInfo, tblInfo.ID, columns, allocs, constraints)
-	if ski := tblInfo.ShardKeyInfo; ski != nil && len(ski.ShardIDs) > 0 {
-		// For shard-only tables, inject a synthetic PartitionInfo so the planner's
+	if ski := tblInfo.ShardKeyInfo; ski != nil {
+		// Route ALL sharded tables (both shard-only and partitioned+sharded) through
+		// newShardedTable so the planner sees a *shardedTable and the ShardedPartitionedTable
+		// interface check in PartitionPruning succeeds.
+		// For shard-only tables: inject a synthetic PartitionInfo so the planner's
 		// GetPartitionInfo() check succeeds and it scans per-shard physical key ranges.
-		if tblInfo.GetPartitionInfo() == nil {
+		if tblInfo.GetPartitionInfo() == nil && len(ski.ShardIDs) > 0 {
 			defs := make([]model.PartitionDefinition, len(ski.ShardIDs))
 			for i, physID := range ski.ShardIDs {
 				defs[i] = model.PartitionDefinition{
