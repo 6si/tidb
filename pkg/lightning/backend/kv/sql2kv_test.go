@@ -760,7 +760,7 @@ func TestColumnConstantsNoDDLDefault(t *testing.T) {
 			SQLMode: mysql.ModeStrictAllTables,
 			SysVars: map[string]string{"tidb_row_format_version": "2"},
 		},
-		Logger: log.L(),
+		Logger:          log.L(),
 		ColumnConstants: map[string]string{"name": "acme"},
 	}, nil)
 	require.NoError(t, err)
@@ -783,7 +783,7 @@ func TestColumnConstantsTypeMismatch(t *testing.T) {
 			SQLMode: mysql.ModeStrictAllTables,
 			SysVars: map[string]string{"tidb_row_format_version": "2"},
 		},
-		Logger: log.L(),
+		Logger:          log.L(),
 		ColumnConstants: map[string]string{"id": "not_a_number"},
 	}, nil)
 	require.NoError(t, err)
