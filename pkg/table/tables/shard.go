@@ -57,8 +57,9 @@ type shardedTable struct {
 	shardCnt     int                  // number of shards per partition (== ShardKeyInfo.ShardCnt)
 	partCnt      int                  // number of partitions (1 for non-partitioned tables)
 	physicalIDs  []int64              // flat: physicalIDs[partIdx*shardCnt + shardIdx]
-	origPartInfo *model.PartitionInfo // original PartitionInfo before shard synthesis (nil for shard-only)
-	partExpr     *PartitionExpr       // lazily built from origPartInfo for LIST pruning; nil for shard-only
+	origPartInfo     *model.PartitionInfo // original PartitionInfo before shard synthesis (nil for shard-only)
+	partExpr         *PartitionExpr       // cached PartitionExpr for LIST pruning; rebuilt when def count changes
+	partExprDefCount int                  // len(origPartInfo.Definitions) when partExpr was last built
 }
 
 // newShardedTable builds a shardedTable from a TableInfo that has ShardKeyInfo
@@ -320,11 +321,28 @@ func (t *shardedTable) OrigPartitionInfo() *model.PartitionInfo {
 	return t.origPartInfo
 }
 
-// PartitionExpr returns the PartitionExpr built from the original PartitionInfo
-// (e.g. LIST COLUMNS). This satisfies the partitionTable interface in
-// rule_partition_processor.go so that findUsedListPartitions can run LIST pruning
-// on the logical partitions of a SHARD BY + LIST COLUMNS table.
+// PartitionExpr returns a PartitionExpr reflecting the current logical partition
+// layout for LIST COLUMNS pruning. It rebuilds the expression whenever the number
+// of logical partitions in origPartInfo has changed since the cached copy was built
+// (e.g. after DROP PARTITION). This ensures the pruner's ColPrunes / valueMap
+// partition indices are always consistent with origPartInfo.Definitions.
 // Returns nil for shard-only (non-partitioned) tables.
 func (t *shardedTable) PartitionExpr() *PartitionExpr {
+	if t.origPartInfo == nil {
+		return nil
+	}
+	// Rebuild when the cached expr is stale (partition count changed after DDL).
+	if t.partExpr == nil || len(t.origPartInfo.Definitions) != t.partExprDefCount {
+		pe, err := newPartitionExpr(t.meta, t.origPartInfo.Type, t.origPartInfo.Expr,
+			t.origPartInfo.Columns, t.origPartInfo.Definitions)
+		if err != nil {
+			// On error, fall back to nil — caller will use FullRange.
+			t.partExpr = nil
+			t.partExprDefCount = 0
+			return nil
+		}
+		t.partExpr = pe
+		t.partExprDefCount = len(t.origPartInfo.Definitions)
+	}
 	return t.partExpr
 }
