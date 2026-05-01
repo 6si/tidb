@@ -52,11 +52,12 @@ func (sp *shardPhysical) GetPhysicalID() int64 {
 // laid out as shards[partitionIdx*ShardCnt + shardIdx]. physicalIDs mirrors this layout.
 type shardedTable struct {
 	TableCommon
-	shards       []*shardPhysical
-	shardColIdx  []int                // column Offset per shard-key column, resolved once at open time
-	shardCnt     int                  // number of shards per partition (== ShardKeyInfo.ShardCnt)
-	partCnt      int                  // number of partitions (1 for non-partitioned tables)
-	physicalIDs  []int64              // flat: physicalIDs[partIdx*shardCnt + shardIdx]
+	shards           []*shardPhysical
+	shardColIdx      []int                // column Offset per shard-key column, resolved once at open time
+	shardCnt         int                  // number of shards per partition (== ShardKeyInfo.ShardCnt)
+	partCnt          int                  // number of partitions (1 for non-partitioned tables)
+	physicalIDs      []int64              // flat: physicalIDs[partIdx*shardCnt + shardIdx]
+	shardsDefCount   int                  // len(origPartInfo.Definitions) when shards/physicalIDs were last built
 	origPartInfo     *model.PartitionInfo // original PartitionInfo before shard synthesis (nil for shard-only)
 	partExpr         *PartitionExpr       // cached PartitionExpr for LIST pruning; rebuilt when def count changes
 	partExprDefCount int                  // len(origPartInfo.Definitions) when partExpr was last built
@@ -109,6 +110,7 @@ func newShardedTable(tbl *TableCommon, tblInfo *model.TableInfo) (*shardedTable,
 		if pe, err := newPartitionExpr(tblInfo, partInfo.Type, partInfo.Expr, partInfo.Columns, partInfo.Definitions); err == nil {
 			st.partExpr = pe
 		}
+		st.partExprDefCount = len(partInfo.Definitions)
 		st.partCnt = len(partInfo.Definitions)
 		st.shards = make([]*shardPhysical, st.partCnt*st.shardCnt)
 		st.physicalIDs = make([]int64, st.partCnt*st.shardCnt)
@@ -130,6 +132,7 @@ func newShardedTable(tbl *TableCommon, tblInfo *model.TableInfo) (*shardedTable,
 				st.physicalIDs[idx] = physID
 			}
 		}
+		st.shardsDefCount = len(partInfo.Definitions)
 	} else {
 		// Sharded only: ShardKeyInfo.ShardIDs is the flat shard ID list.
 		// (partInfo may be the synthetic one injected by the InfoSchema builder)
@@ -248,9 +251,12 @@ func (t *shardedTable) GetPartitionedTable() table.PartitionedTable {
 }
 
 // GetPartition returns the shardPhysical whose physicalTableID matches physicalID.
+// It lazily rebuilds the shards slice if origPartInfo has changed since construction
+// (e.g. after DROP PARTITION).
 func (t *shardedTable) GetPartition(physicalID int64) table.PhysicalTable {
+	t.rebuildShards()
 	for _, sp := range t.shards {
-		if sp.physicalTableID == physicalID {
+		if sp != nil && sp.physicalTableID == physicalID {
 			return sp
 		}
 	}
@@ -277,8 +283,9 @@ func (t *shardedTable) GetPartitionIdxByRow(_ expression.EvalContext, r []types.
 }
 
 // GetAllPartitionIDs returns all physical shard IDs, used by the planner to build
-// key ranges for full table scans.
+// key ranges for full table scans. Lazily rebuilds after DROP PARTITION.
 func (t *shardedTable) GetAllPartitionIDs() []int64 {
+	t.rebuildShards()
 	ids := make([]int64, len(t.physicalIDs))
 	copy(ids, t.physicalIDs)
 	return ids
@@ -319,6 +326,59 @@ func (t *shardedTable) CheckForExchangePartition(_ expression.EvalContext, _ *mo
 // Returns nil for shard-only (non-partitioned) tables.
 func (t *shardedTable) OrigPartitionInfo() *model.PartitionInfo {
 	return t.origPartInfo
+}
+
+// rebuildShards rebuilds the shards and physicalIDs slices from origPartInfo.Definitions
+// when the partition count has changed (e.g. after DROP PARTITION). Since origPartInfo is
+// the same pointer as tblInfo.Partition, it always reflects the post-DDL state.
+// Only applicable to partitioned+sharded tables (origPartInfo != nil).
+func (t *shardedTable) rebuildShards() {
+	if t.origPartInfo == nil {
+		return
+	}
+	if len(t.origPartInfo.Definitions) == t.shardsDefCount {
+		return
+	}
+	ski := t.meta.ShardKeyInfo
+	newPartCnt := len(t.origPartInfo.Definitions)
+	newShards := make([]*shardPhysical, newPartCnt*t.shardCnt)
+	newIDs := make([]int64, newPartCnt*t.shardCnt)
+	for pi, def := range t.origPartInfo.Definitions {
+		if len(def.ShardIDs) != t.shardCnt {
+			// Definitions incomplete (shouldn't happen post-DDL) — abort rebuild.
+			return
+		}
+		for si, physID := range def.ShardIDs {
+			idx := pi*t.shardCnt + si
+			// Reuse existing shardPhysical if the physID is already present.
+			found := false
+			for _, sp := range t.shards {
+				if sp != nil && sp.physicalTableID == physID {
+					newShards[idx] = sp
+					found = true
+					break
+				}
+			}
+			if !found {
+				var sp shardPhysical
+				if err := initTableCommonWithIndices(&sp.TableCommon, t.meta, physID,
+					t.Columns, t.allocs, t.Constraints); err != nil {
+					return
+				}
+				sp.owner = t
+				newShards[idx] = &sp
+			}
+			newIDs[idx] = physID
+		}
+	}
+	t.shards = newShards
+	t.physicalIDs = newIDs
+	t.partCnt = newPartCnt
+	t.shardsDefCount = newPartCnt
+	// Also invalidate the synthetic flat PI on the embedded TableCommon.meta so that
+	// tbl.Meta().Partition.Definitions length matches the new shard layout.
+	// (origPartInfo is the same pointer as t.meta.Partition for partitioned+sharded tables.)
+	_ = ski
 }
 
 // PartitionExpr returns a PartitionExpr reflecting the current logical partition
