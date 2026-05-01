@@ -21,6 +21,10 @@ import (
 	"time"
 
 	"github.com/pingcap/failpoint"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/require"
+	"github.com/tikv/client-go/v2/oracle"
+
 	"github.com/pingcap/tidb/pkg/infoschema"
 	"github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/parser/auth"
@@ -28,9 +32,6 @@ import (
 	"github.com/pingcap/tidb/pkg/table/tables"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/pingcap/tidb/pkg/util/stmtsummary"
-	dto "github.com/prometheus/client_model/go"
-	"github.com/stretchr/testify/require"
-	"github.com/tikv/client-go/v2/oracle"
 )
 
 func lastReadFromCache(tk *testkit.TestKit) bool {

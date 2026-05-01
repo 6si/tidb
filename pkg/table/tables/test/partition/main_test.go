@@ -17,8 +17,9 @@ package partition
 import (
 	"testing"
 
-	"github.com/pingcap/tidb/pkg/testkit/testsetup"
 	"go.uber.org/goleak"
+
+	"github.com/pingcap/tidb/pkg/testkit/testsetup"
 )
 
 func TestMain(m *testing.M) {

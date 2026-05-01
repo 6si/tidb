@@ -24,6 +24,9 @@ import (
 	gotime "time"
 
 	"github.com/pingcap/errors"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
 	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/model"
@@ -36,8 +39,6 @@ import (
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util"
 	"github.com/pingcap/tidb/pkg/util/logutil"
-	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 )
 
 func TestPartitionAddRecord(t *testing.T) {

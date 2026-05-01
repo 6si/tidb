@@ -19,13 +19,14 @@ import (
 	"hash/crc32"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/pingcap/tidb/pkg/meta/autoid"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/types"
-	"github.com/stretchr/testify/require"
 )
 
 // allColNames lists the full set of columns on the table; shardColNames are the shard key columns.
@@ -49,9 +50,9 @@ func makeShardTableInfoFull(shardCnt int, allColNames []string, shardColNames []
 		shardIDs[i] = int64(100 + i)
 	}
 	return &model.TableInfo{
-		ID:    1,
-		Name:  pmodel.NewCIStr("t"),
-		State: model.StatePublic,
+		ID:      1,
+		Name:    pmodel.NewCIStr("t"),
+		State:   model.StatePublic,
 		Columns: cols,
 		ShardKeyInfo: &model.ShardKeyInfo{
 			Columns:  lowerShardCols,

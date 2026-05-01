@@ -18,6 +18,7 @@ import (
 	"hash/crc32"
 
 	"github.com/pingcap/errors"
+
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/model"
