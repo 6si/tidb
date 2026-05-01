@@ -28,8 +28,6 @@ import (
 
 	"github.com/google/btree"
 	"github.com/pingcap/errors"
-	"go.uber.org/zap"
-
 	"github.com/pingcap/tidb/pkg/errctx"
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/expression/exprctx"
@@ -52,6 +50,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/pingcap/tidb/pkg/util/ranger"
 	"github.com/pingcap/tidb/pkg/util/stringutil"
+	"go.uber.org/zap"
 )
 
 const (

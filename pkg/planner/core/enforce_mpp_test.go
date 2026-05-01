@@ -189,4 +189,3 @@ func TestCoLocatedJoinGroupBy(t *testing.T) {
 	require.Less(t, shardHP, plainHP,
 		"sharded plan must have fewer HashPartition exchanges than plain")
 }
-

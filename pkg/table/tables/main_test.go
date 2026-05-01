@@ -17,9 +17,8 @@ package tables_test
 import (
 	"testing"
 
-	"go.uber.org/goleak"
-
 	"github.com/pingcap/tidb/pkg/testkit/testsetup"
+	"go.uber.org/goleak"
 )
 
 func TestMain(m *testing.M) {
