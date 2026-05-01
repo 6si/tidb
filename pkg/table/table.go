@@ -533,6 +533,10 @@ type PartitionedTable interface {
 type ShardedPartitionedTable interface {
 	PartitionedTable
 	OrigPartitionInfo() *model.PartitionInfo
+	// FlatPartitionInfo returns a synthetic flat PartitionInfo with one entry per
+	// physical shard, used by partitionPruning in builder.go to resolve pruner result
+	// indices to physical shard IDs. Returns nil for shard-only (non-partitioned) tables.
+	FlatPartitionInfo() *model.PartitionInfo
 }
 
 // TableFromMeta builds a table.Table from *model.TableInfo.

@@ -412,8 +412,18 @@ func getDynamicAccessPartition(sctx base.PlanContext, tblInfo *model.TableInfo, 
 		return res
 	}
 
+	// For partitioned+sharded tables, use the flat PI so indices from the two-stage
+	// pruner map to physical shard entries, not to logical partition entries.
+	displayPI := pi
+	if spt, ok := tbl.(table.ShardedPartitionedTable); ok {
+		if fpi := spt.FlatPartitionInfo(); fpi != nil {
+			displayPI = fpi
+		}
+	}
 	for _, idx := range idxArr {
-		res.Partitions = append(res.Partitions, pi.Definitions[idx].Name.O)
+		if idx < len(displayPI.Definitions) {
+			res.Partitions = append(res.Partitions, displayPI.Definitions[idx].Name.O)
+		}
 	}
 	return res
 }

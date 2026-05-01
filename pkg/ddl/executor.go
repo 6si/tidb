@@ -2837,6 +2837,16 @@ func (e *executor) DropTablePartition(ctx sessionctx.Context, ident ast.Ident, s
 		return errors.Trace(infoschema.ErrTableNotExists.GenWithStackByArgs(ident.Schema, ident.Name))
 	}
 	meta := t.Meta()
+	// For partitioned+sharded tables, Meta() returns a tblInfo with a flat synthetic PI
+	// (one entry per physical shard). DDL operations must see the original LIST/RANGE PI
+	// for correct partition name lookups. Use a local copy with origPartInfo substituted in.
+	if spt, ok := t.(table.ShardedPartitionedTable); ok {
+		if origPI := spt.OrigPartitionInfo(); origPI != nil {
+			cloned := *meta
+			cloned.Partition = origPI
+			meta = &cloned
+		}
+	}
 	if meta.GetPartitionInfo() == nil {
 		return errors.Trace(dbterror.ErrPartitionMgmtOnNonpartitioned)
 	}
