@@ -176,7 +176,19 @@ func GetPhysID(tblInfo *model.TableInfo, idx *int) int64 {
 			intest.Assert(false)
 		} else {
 			if pi := tblInfo.GetPartitionInfo(); pi != nil {
-				return pi.Definitions[*idx].ID
+				flatIdx := *idx
+				if ski := tblInfo.ShardKeyInfo; ski != nil && ski.ShardCnt > 0 && flatIdx >= len(pi.Definitions) {
+					// For partitioned+sharded tables, idx is a flat shard index
+					// (partIdx*shardCnt + shardSlot). Resolve to the physical shard ID.
+					logicalIdx := flatIdx / ski.ShardCnt
+					slot := flatIdx % ski.ShardCnt
+					if logicalIdx >= 0 && logicalIdx < len(pi.Definitions) &&
+						slot < len(pi.Definitions[logicalIdx].ShardIDs) {
+						return pi.Definitions[logicalIdx].ShardIDs[slot]
+					}
+					return tblInfo.ID
+				}
+				return pi.Definitions[flatIdx].ID
 			}
 		}
 	}
@@ -699,7 +711,19 @@ func (e *PointGetExecutor) verifyTxnScope() error {
 	tblName := tblInfo.Meta().Name.String()
 	tblID := GetPhysID(tblInfo.Meta(), e.partitionDefIdx)
 	if tblID != tblInfo.Meta().ID {
-		partName = tblInfo.Meta().GetPartitionInfo().Definitions[*e.partitionDefIdx].Name.String()
+		if pi := tblInfo.Meta().GetPartitionInfo(); pi != nil && e.partitionDefIdx != nil {
+			flatIdx := *e.partitionDefIdx
+			ski := tblInfo.Meta().ShardKeyInfo
+			if ski != nil && ski.ShardCnt > 0 && flatIdx >= len(pi.Definitions) {
+				logicalIdx := flatIdx / ski.ShardCnt
+				slot := flatIdx % ski.ShardCnt
+				if logicalIdx >= 0 && logicalIdx < len(pi.Definitions) {
+					partName = fmt.Sprintf("%s_s%d", pi.Definitions[logicalIdx].Name.String(), slot)
+				}
+			} else if flatIdx >= 0 && flatIdx < len(pi.Definitions) {
+				partName = pi.Definitions[flatIdx].Name.String()
+			}
+		}
 	}
 	valid := distsql.VerifyTxnScope(e.txnScope, tblID, is)
 	if valid {
