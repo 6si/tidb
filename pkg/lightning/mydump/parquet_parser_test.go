@@ -509,10 +509,10 @@ func TestParquetJSONEmptyObjectCoercedToNull(t *testing.T) {
 			Converted: schema.ConvertedTypes.JSON,
 			Gen: func(_ int) (any, []int16) {
 				return []parquet.ByteArray{
-					parquet.ByteArray("{}"),           // empty object → NULL
-					parquet.ByteArray(`{"k":"v"}`),    // non-empty → pass through
-					parquet.ByteArray("[]"),           // array → pass through
-					parquet.ByteArray(`null`),         // explicit null string → pass through
+					parquet.ByteArray("{}"),        // empty object → NULL
+					parquet.ByteArray(`{"k":"v"}`), // non-empty → pass through
+					parquet.ByteArray("[]"),        // array → pass through
+					parquet.ByteArray(`null`),      // explicit null string → pass through
 				}, []int16{1, 1, 1, 1}
 			},
 		},
