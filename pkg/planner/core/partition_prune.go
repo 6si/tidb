@@ -46,9 +46,12 @@ func PartitionPruning(ctx base.PlanContext, tbl table.PartitionedTable, conds []
 				if origPI.Type == model.PartitionTypeList {
 					return pruneShardedListPartitionDynamic(ctx, s, tbl, flatPI, origPI, tblInfo, conds, partitionNames, columns)
 				}
-				// RANGE/HASH/KEY partitioned+sharded: shard-slot pruning over all logical partitions.
-				// RANGE pruning by partition boundary is not possible here (needs PartitionExpr over
-				// original RANGE bounds), so we scan all logical partitions but restrict to matching shards.
+				if origPI.Type == model.PartitionTypeRange {
+					// Two-stage: RANGE pruning on logical partitions + shard-slot pruning.
+					return pruneShardedRangeDynamic(ctx, s, tbl, flatPI, origPI, tblInfo, conds, partitionNames, columns, names)
+				}
+				// HASH/KEY partitioned+sharded: shard-slot pruning over all logical partitions.
+				// HASH/KEY has no prunable partition boundary, so we only prune by shard slot.
 				return pruneShardedRangeOrHashDynamic(ctx, s, flatPI, tblInfo, conds, partitionNames, columns)
 			}
 		}
@@ -134,6 +137,75 @@ func pruneShardedListPartitionDynamic(
 	}
 
 	flatLen := len(flatPI.Definitions)
+	surviving := make([]int, 0, len(logicalUsed)*len(slotSet))
+	for _, partIdx := range logicalUsed {
+		for slot := range slotSet {
+			if idx := partIdx*shardCnt + slot; idx < flatLen {
+				surviving = append(surviving, idx)
+			}
+		}
+	}
+	slices.Sort(surviving)
+
+	if len(surviving) == flatLen {
+		return []int{FullRange}, nil
+	}
+	return surviving, nil
+}
+
+// pruneShardedRangeDynamic handles dynamic pruning for RANGE partitioned+sharded tables.
+// Two-stage: first prune logical RANGE partitions by the range predicate, then intersect
+// with the CRC32 shard slot from the shard-key equality predicate.
+func pruneShardedRangeDynamic(
+	ctx base.PlanContext,
+	s PartitionProcessor,
+	tbl table.PartitionedTable,
+	flatPI, origPI *tmodel.PartitionInfo,
+	tblInfo *tmodel.TableInfo,
+	conds []expression.Expression,
+	partitionNames []model.CIStr,
+	columns []*expression.Column,
+	names types.NameSlice,
+) ([]int, error) {
+	ski := tblInfo.ShardKeyInfo
+	shardCnt := ski.ShardCnt
+	flatLen := len(flatPI.Definitions)
+	if shardCnt == 0 || flatLen == 0 {
+		return []int{FullRange}, nil
+	}
+
+	// Stage 1: RANGE pruning on logical partitions using the original PI.
+	// pruneRangePartition uses tbl.PartitionExpr() which is built from origPI.
+	rangeOr, err := s.pruneRangePartition(ctx, origPI, tbl, conds, columns, names)
+	if err != nil {
+		return []int{FullRange}, nil
+	}
+	logicalUsed := s.convertToIntSlice(rangeOr, origPI, partitionNames)
+	if len(logicalUsed) == 1 && logicalUsed[0] == FullRange {
+		logicalUsed = make([]int, len(origPI.Definitions))
+		for i := range origPI.Definitions {
+			logicalUsed[i] = i
+		}
+	}
+
+	// Stage 2: shard-slot pruning.
+	shardSlots, err := s.pruneShardKeyPartition(ctx, flatPI, tblInfo, conds, columns)
+	if err != nil {
+		return nil, err
+	}
+	slotSet := make(map[int]struct{}, shardCnt)
+	if len(shardSlots) == 1 && shardSlots[0].start == 0 && shardSlots[0].end == flatLen {
+		for i := range shardCnt {
+			slotSet[i] = struct{}{}
+		}
+	} else {
+		for _, r := range shardSlots {
+			for idx := r.start; idx < r.end; idx++ {
+				slotSet[idx%shardCnt] = struct{}{}
+			}
+		}
+	}
+
 	surviving := make([]int, 0, len(logicalUsed)*len(slotSet))
 	for _, partIdx := range logicalUsed {
 		for slot := range slotSet {

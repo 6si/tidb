@@ -931,9 +931,11 @@ func (s *PartitionProcessor) processShardKeyPartition(ds *logicalop.DataSource, 
 			if origPI.Type == pmodel.PartitionTypeList {
 				return s.processShardedListPartition(ds, origPI, flatPI, opt)
 			}
-			// For RANGE/HASH partitioned+sharded: two-stage pruning.
-			// Stage 1: all logical partitions survive (RANGE/HASH not prunable by shard key).
-			// Stage 2: shard-slot pruning — expand each surviving slot to all logical partitions.
+			if origPI.Type == pmodel.PartitionTypeRange {
+				// Two-stage: RANGE pruning on logical partitions + shard-slot pruning.
+				return s.processShardedRangePartition(ds, origPI, flatPI, opt)
+			}
+			// HASH/KEY partitioned+sharded: shard-slot pruning only (no prunable partition boundary).
 			return s.processShardedPartitionBySlot(ds, flatPI, opt)
 		}
 	}
@@ -1051,6 +1053,61 @@ func (s *PartitionProcessor) processShardedListPartition(ds *logicalop.DataSourc
 	// (logicalPartIdx, slotIdx) pair that passes both filters.
 	// Bounds-check guards against stale origPartInfo after concurrent DDL.
 	flatLen := len(flatPI.Definitions)
+	surviving := make([]int, 0, len(logicalUsed)*len(slotSet))
+	for _, partIdx := range logicalUsed {
+		for slot := range slotSet {
+			if idx := partIdx*shardCnt + slot; idx < flatLen {
+				surviving = append(surviving, idx)
+			}
+		}
+	}
+	slices.Sort(surviving)
+
+	if len(surviving) == flatLen {
+		return s.makeUnionAllChildren(ds, flatPI, fullRange(flatLen), opt)
+	}
+	return s.makeUnionAllChildren(ds, flatPI, convertToRangeOr(surviving, flatPI), opt)
+}
+
+// processShardedRangePartition implements two-stage pruning for SHARD BY + RANGE tables.
+// origPI is the real RANGE PartitionInfo; flatPI is the synthetic flat PartitionInfo.
+func (s *PartitionProcessor) processShardedRangePartition(ds *logicalop.DataSource, origPI, flatPI *model.PartitionInfo, opt *optimizetrace.LogicalOptimizeOp) (base.LogicalPlan, error) {
+	ski := ds.TableInfo.ShardKeyInfo
+	shardCnt := ski.ShardCnt
+	flatLen := len(flatPI.Definitions)
+
+	// Stage 1: RANGE pruning on logical partitions using the original PI.
+	rangeOr, err := s.pruneRangePartition(ds.SCtx(), origPI, ds.Table.(table.PartitionedTable), ds.AllConds, ds.TblCols, ds.OutputNames())
+	if err != nil {
+		// On error, fall back to full scan.
+		return s.makeUnionAllChildren(ds, flatPI, fullRange(flatLen), opt)
+	}
+	logicalUsed := s.convertToIntSlice(rangeOr, origPI, ds.PartitionNames)
+	if len(logicalUsed) == 1 && logicalUsed[0] == FullRange {
+		logicalUsed = make([]int, len(origPI.Definitions))
+		for i := range origPI.Definitions {
+			logicalUsed[i] = i
+		}
+	}
+
+	// Stage 2: shard-slot pruning.
+	shardSlots, err := s.pruneShardKeyPartition(ds.SCtx(), flatPI, ds.TableInfo, ds.AllConds, ds.TblCols)
+	if err != nil {
+		return nil, err
+	}
+	slotSet := make(map[int]struct{}, shardCnt)
+	if len(shardSlots) == 1 && shardSlots[0].start == 0 && shardSlots[0].end == flatLen {
+		for i := 0; i < shardCnt; i++ {
+			slotSet[i] = struct{}{}
+		}
+	} else {
+		for _, r := range shardSlots {
+			for idx := r.start; idx < r.end; idx++ {
+				slotSet[idx%shardCnt] = struct{}{}
+			}
+		}
+	}
+
 	surviving := make([]int, 0, len(logicalUsed)*len(slotSet))
 	for _, partIdx := range logicalUsed {
 		for slot := range slotSet {
