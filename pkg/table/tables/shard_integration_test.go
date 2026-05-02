@@ -1074,6 +1074,18 @@ func TestDMLBulkOperations(t *testing.T) {
 	tk.MustQuery("SELECT COUNT(*) FROM orders_sharded WHERE id = 300").
 		Check(testkit.Rows("1"))
 
+	// TC-DML-BULK-03b: ON DUPLICATE KEY UPDATE changing the shard key column (cross-shard move).
+	// The row (id=400, company_id=1) must atomically move to the new shard for company_id=999.
+	// No ghost row may remain in the old shard.
+	tk.MustExec("INSERT INTO orders_sharded VALUES (400, 1, 5.00)")
+	tk.MustExec("INSERT INTO orders_sharded VALUES (400, 1, 5.00) ON DUPLICATE KEY UPDATE company_id = 999, amount = 99.00")
+	tk.MustQuery("SELECT amount FROM orders_sharded WHERE id = 400 AND company_id = 999").
+		Check(testkit.Rows("99.00"))
+	tk.MustQuery("SELECT COUNT(*) FROM orders_sharded WHERE id = 400 AND company_id = 1").
+		Check(testkit.Rows("0"))
+	tk.MustQuery("SELECT COUNT(*) FROM orders_sharded WHERE id = 400").
+		Check(testkit.Rows("1"))
+
 	// TC-DML-BULK-01 (LOAD DATA): skipped — requires file system access; covered by lightning tests.
 }
 
@@ -1297,6 +1309,16 @@ func TestAnalyzeStats(t *testing.T) {
 
 	// TC-STATS-02: plan row estimate works after ANALYZE (query runs without error)
 	tk.MustQuery("EXPLAIN SELECT * FROM orders_sharded WHERE company_id = 42").Rows()
+
+	// TC-STATS-04: SHOW STATS_HISTOGRAMS returns rows after ANALYZE on SST
+	histRows := tk.MustQuery("SHOW STATS_HISTOGRAMS WHERE db_name = 'test' AND table_name = 'orders_sharded'").Rows()
+	require.NotEmpty(t, histRows,
+		"TC-STATS-04: SHOW STATS_HISTOGRAMS must return rows after ANALYZE on SST")
+
+	// TC-STATS-05: SHOW STATS_HISTOGRAMS returns rows after ANALYZE on SPT
+	histRows = tk.MustQuery("SHOW STATS_HISTOGRAMS WHERE db_name = 'test' AND table_name = 'orders_range_sharded'").Rows()
+	require.NotEmpty(t, histRows,
+		"TC-STATS-05: SHOW STATS_HISTOGRAMS must return rows after ANALYZE on SPT")
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,6 +1439,12 @@ func TestMPP_Aggregation(t *testing.T) {
 		"SELECT company_id, SUM(amount) AS total FROM orders_sharded GROUP BY company_id HAVING total > 1000")
 	require.NotContains(t, plan, "HashPartition",
 		"TC-MPP-AGG-04: HAVING on shard-key agg must not require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-AGG-05: COUNT(DISTINCT) grouped by shard key — distinct scoped per shard, no exchange
+	plan = mppPlan(tk,
+		"SELECT company_id, COUNT(DISTINCT amount) FROM orders_sharded GROUP BY company_id")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-AGG-05: COUNT(DISTINCT) grouped by shard key must not require HashPartition exchange; plan:\n"+plan)
 
 	// TC-MPP-SST-08: Global SUM (no GROUP BY) — partial agg merge requires some exchange.
 	// Actual behavior: optimizer uses PassThrough exchange (coordinator pulls partial results),
