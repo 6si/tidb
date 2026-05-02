@@ -34,7 +34,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/domain"
+	"github.com/pingcap/tidb/pkg/domain/infosync"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/testkit"
@@ -1727,6 +1729,65 @@ func TestBRCDCShowCreateRoundtrip(t *testing.T) {
 	result.CheckContain("SHARD BY (`company_id`, `user_id`) SHARDS 4")
 	result.CheckContain("PARTITION BY RANGE COLUMNS")
 	tk.MustExec("DROP TABLE t_spt_composite")
+}
+
+// TestTiFlashPlacementRulesShardedTable verifies that ALTER TABLE ... SET TIFLASH REPLICA
+// emits placement rules for ALL physical shard IDs of an SST, not just the base table ID.
+// Regression test for: ConfigureTiFlashPDForTable(baseID) missing shard_1..shard_N rules.
+func TestTiFlashPlacementRulesShardedTable(t *testing.T) {
+	// Set up mock TiFlash store BEFORE store creation so checkTiFlashReplicaCount passes.
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/infoschema/mockTiFlashStoreCount", `return(true)`))
+	defer func() {
+		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/infoschema/mockTiFlashStoreCount"))
+	}()
+
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tiflash := infosync.NewMockTiFlash()
+	infosync.SetMockTiFlash(tiflash)
+	defer func() {
+		tiflash.Lock()
+		tiflash.StatusServer.Close()
+		tiflash.Unlock()
+	}()
+
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	) SHARD BY (company_id) SHARDS 4`)
+
+	// CREATE TABLE ... SHARD BY allocates ShardIDs in the DDL job submitter and persists
+	// them to meta. Read them from the live InfoSchema (no setShardKey needed here).
+	is := dom.InfoSchema()
+	tbl, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("orders_sharded"))
+	require.NoError(t, err)
+	ski := tbl.Meta().ShardKeyInfo
+	require.NotNil(t, ski, "ShardKeyInfo must be set by CREATE TABLE ... SHARD BY")
+	require.Len(t, ski.ShardIDs, 4, "expected 4 shard IDs allocated by DDL")
+
+	// SET TIFLASH REPLICA goes through the DDL handler which reads raw tblInfo from meta.
+	tk.MustExec("ALTER TABLE orders_sharded SET TIFLASH REPLICA 1")
+
+	// All 4 shard IDs must have placement rules in the mock PD.
+	tiflash.Lock()
+	rules := tiflash.GlobalTiFlashPlacementRules
+	tiflash.Unlock()
+	for _, shardID := range ski.ShardIDs {
+		ruleID := infosync.MakeRuleID(shardID)
+		_, ok := rules[ruleID]
+		require.True(t, ok,
+			"placement rule %q missing for shard ID %d — base table rule only was emitted (regression)", ruleID, shardID)
+	}
+
+	// Base table ID must NOT have a rule (data lives in shards, not the base table region).
+	baseRuleID := infosync.MakeRuleID(tbl.Meta().ID)
+	_, baseHasRule := rules[baseRuleID]
+	require.False(t, baseHasRule,
+		"base table rule %q should not be emitted for SST — shards cover all data", baseRuleID)
 }
 
 // TestTiKVCoprocessorJoins covers §24 — joins on sharded tables executed via TiKV
