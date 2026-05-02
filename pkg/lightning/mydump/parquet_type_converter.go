@@ -226,7 +226,17 @@ func setFloat64Data(val float64, d *types.Datum) {
 
 func getByteArraySetter(converted *convertedType) setter[parquet.ByteArray] {
 	switch converted.converted {
-	case schema.ConvertedTypes.None, schema.ConvertedTypes.BSON, schema.ConvertedTypes.JSON, schema.ConvertedTypes.UTF8, schema.ConvertedTypes.Enum:
+	case schema.ConvertedTypes.JSON:
+		return func(val parquet.ByteArray, d *types.Datum) {
+			// Upstream Parquet producer writes `{}` for JSON columns with no data.
+			// Coerce to NULL to avoid ~7-byte storage overhead vs 1 bit for NULL.
+			if len(val) == 2 && val[0] == '{' && val[1] == '}' {
+				d.SetNull()
+				return
+			}
+			d.SetBytesAsString(val, "utf8mb4_bin", 0)
+		}
+	case schema.ConvertedTypes.None, schema.ConvertedTypes.BSON, schema.ConvertedTypes.UTF8, schema.ConvertedTypes.Enum:
 		return func(val parquet.ByteArray, d *types.Datum) {
 			// length is unused here
 			d.SetBytesAsString(val, "utf8mb4_bin", 0)

@@ -498,3 +498,51 @@ func TestBasicReadFile(t *testing.T) {
 		require.Equal(t, string(generated[i]), reader.lastRow.Row[0].GetString())
 	}
 }
+
+func TestParquetJSONEmptyObjectCoercedToNull(t *testing.T) {
+	// Upstream Parquet producer writes `{}` for JSON columns with no data.
+	// Lightning should convert these to NULL instead of storing a 7-byte empty JSON object.
+	pc := []ParquetColumn{
+		{
+			Name:      "jcol",
+			Type:      parquet.Types.ByteArray,
+			Converted: schema.ConvertedTypes.JSON,
+			Gen: func(_ int) (any, []int16) {
+				return []parquet.ByteArray{
+					parquet.ByteArray("{}"),           // empty object → NULL
+					parquet.ByteArray(`{"k":"v"}`),    // non-empty → pass through
+					parquet.ByteArray("[]"),           // array → pass through
+					parquet.ByteArray(`null`),         // explicit null string → pass through
+				}, []int16{1, 1, 1, 1}
+			},
+		},
+	}
+
+	dir := t.TempDir()
+	name := "json_coerce.parquet"
+	require.NoError(t, WriteParquetFile(dir, name, pc, 4))
+
+	store, err := storage.NewLocalStorage(dir)
+	require.NoError(t, err)
+	r, err := store.Open(context.Background(), name, nil)
+	require.NoError(t, err)
+	reader, err := NewParquetParser(context.Background(), store, r, name, ParquetFileMeta{})
+	require.NoError(t, err)
+	defer reader.Close()
+
+	// Row 0: `{}` must be NULL
+	require.NoError(t, reader.ReadRow())
+	require.True(t, reader.lastRow.Row[0].IsNull(), "expected {} to be coerced to NULL")
+
+	// Row 1: non-empty JSON object must pass through as string
+	require.NoError(t, reader.ReadRow())
+	require.Equal(t, `{"k":"v"}`, reader.lastRow.Row[0].GetString())
+
+	// Row 2: JSON array must pass through
+	require.NoError(t, reader.ReadRow())
+	require.Equal(t, "[]", reader.lastRow.Row[0].GetString())
+
+	// Row 3: string "null" must pass through
+	require.NoError(t, reader.ReadRow())
+	require.Equal(t, "null", reader.lastRow.Row[0].GetString())
+}
