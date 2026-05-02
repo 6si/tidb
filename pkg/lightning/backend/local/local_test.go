@@ -2854,14 +2854,14 @@ func TestShardBoundarySplitKeys(t *testing.T) {
 	}
 	got := shardBoundarySplitKeys(ski)
 	require.Len(t, got, 3)
-	require.Equal(t, []byte(tablecodec.GenTablePrefix(100)), got[0])
-	require.Equal(t, []byte(tablecodec.GenTablePrefix(200)), got[1])
-	require.Equal(t, []byte(tablecodec.GenTablePrefix(300)), got[2])
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(100)), got[0])
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(200)), got[1])
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(300)), got[2])
 }
 
 func TestMergeSplitKeys(t *testing.T) {
-	shard0Key := []byte(tablecodec.GenTablePrefix(100))
-	shard1Key := []byte(tablecodec.GenTablePrefix(200))
+	shard0Key := []byte(tablecodec.GenTableRecordPrefix(100))
+	shard1Key := []byte(tablecodec.GenTableRecordPrefix(200))
 	midKey := append(append([]byte{}, shard0Key...), 0x01)
 
 	// base includes shard0Key; mandatory adds it again as a duplicate
@@ -2926,6 +2926,6 @@ func TestImportEngineMandatoryKeysFromTableInfo(t *testing.T) {
 		}
 	}
 	require.Len(t, mandatory, 2)
-	require.Equal(t, []byte(tablecodec.GenTablePrefix(physID0)), mandatory[0])
-	require.Equal(t, []byte(tablecodec.GenTablePrefix(physID1)), mandatory[1])
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(physID0)), mandatory[0])
+	require.Equal(t, []byte(tablecodec.GenTableRecordPrefix(physID1)), mandatory[1])
 }

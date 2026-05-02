@@ -41,27 +41,6 @@ func splitPartitionTableRegion(ctx sessionctx.Context, store kv.SplittableStore,
 		for _, def := range parts {
 			regionIDs = append(regionIDs, preSplitPhysicalTableByShardRowID(ctxWithTimeout, store, tbInfo, def.ID, scatterScope)...)
 		}
-	} else if ski := tbInfo.ShardKeyInfo; ski != nil {
-		// SPT: each partition definition carries its own ShardIDs. Pre-split at
-		// GenTablePrefix for each shard physical ID to avoid gap regions.
-		for _, def := range parts {
-			if len(def.ShardIDs) > 0 {
-				splitKeys := make([][]byte, 0, len(def.ShardIDs)+1)
-				splitKeys = append(splitKeys, tablecodec.GenTablePrefix(def.ID))
-				for _, shardID := range def.ShardIDs {
-					splitKeys = append(splitKeys, tablecodec.GenTablePrefix(shardID))
-				}
-				scatter, tableID := getScatterConfig(scatterScope, tbInfo.ID)
-				ids, err := store.SplitRegions(ctxWithTimeout, splitKeys, scatter, &tableID)
-				if err != nil {
-					logutil.DDLLogger().Warn("pre split shard partition regions failed",
-						zap.Stringer("table", tbInfo.Name), zap.Int64("partitionID", def.ID), zap.Error(err))
-				}
-				regionIDs = append(regionIDs, ids...)
-			} else {
-				regionIDs = append(regionIDs, SplitRecordRegion(ctxWithTimeout, store, def.ID, tbInfo.ID, scatterScope))
-			}
-		}
 	} else {
 		for _, def := range parts {
 			regionIDs = append(regionIDs, SplitRecordRegion(ctxWithTimeout, store, def.ID, tbInfo.ID, scatterScope))
@@ -77,13 +56,7 @@ func splitTableRegion(ctx sessionctx.Context, store kv.SplittableStore, tbInfo *
 	defer cancel()
 	ctxWithTimeout = kv.WithInternalSourceType(ctxWithTimeout, kv.InternalTxnDDL)
 	var regionIDs []uint64
-	if ski := tbInfo.ShardKeyInfo; ski != nil && len(ski.ShardIDs) > 0 {
-		// SHARD BY table: pre-split one region per physical shard at GenTablePrefix so
-		// each shard's key space is isolated from the start. Using GenTableRecordPrefix
-		// would create [GenTablePrefix, GenTableRecordPrefix) gap regions that confuse
-		// TiFlash's region range validator.
-		regionIDs = preSplitShardKeyTableRegion(ctxWithTimeout, store, tbInfo, scatterScope)
-	} else if shardingBits(tbInfo) > 0 && tbInfo.PreSplitRegions > 0 {
+	if shardingBits(tbInfo) > 0 && tbInfo.PreSplitRegions > 0 {
 		regionIDs = preSplitPhysicalTableByShardRowID(ctxWithTimeout, store, tbInfo, tbInfo.ID, scatterScope)
 	} else {
 		regionIDs = append(regionIDs, SplitRecordRegion(ctxWithTimeout, store, tbInfo.ID, tbInfo.ID, scatterScope))
@@ -91,25 +64,6 @@ func splitTableRegion(ctx sessionctx.Context, store kv.SplittableStore, tbInfo *
 	if scatterScope != variable.ScatterOff {
 		WaitScatterRegionFinish(ctxWithTimeout, store, regionIDs...)
 	}
-}
-
-// preSplitShardKeyTableRegion pre-splits one region per physical shard for SHARD BY tables.
-// Split keys are GenTablePrefix(shardID) — not GenTableRecordPrefix — so no gap regions
-// are created between the table header and record areas of each shard.
-func preSplitShardKeyTableRegion(ctx context.Context, store kv.SplittableStore, tbInfo *model.TableInfo, scatterScope string) []uint64 {
-	ski := tbInfo.ShardKeyInfo
-	splitKeys := make([][]byte, 0, len(ski.ShardIDs)+1)
-	splitKeys = append(splitKeys, tablecodec.GenTablePrefix(tbInfo.ID))
-	for _, shardID := range ski.ShardIDs {
-		splitKeys = append(splitKeys, tablecodec.GenTablePrefix(shardID))
-	}
-	scatter, tableID := getScatterConfig(scatterScope, tbInfo.ID)
-	regionIDs, err := store.SplitRegions(ctx, splitKeys, scatter, &tableID)
-	if err != nil {
-		logutil.DDLLogger().Warn("pre split shard key table regions failed",
-			zap.Stringer("table", tbInfo.Name), zap.Int("successful region count", len(regionIDs)), zap.Error(err))
-	}
-	return regionIDs
 }
 
 // `tID` is used to control the scope of scatter. If it is `ScatterTable`, the corresponding tableID is used.
