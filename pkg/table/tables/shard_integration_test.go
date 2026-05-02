@@ -1592,6 +1592,144 @@ func TestMPP_MixedTables(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// §10 TiFlash Replica (mock-level coverage)
+// ---------------------------------------------------------------------------
+
+// TestTiFlashReplicaMock covers the parts of §10 that are testable without a
+// real TiFlash cluster:
+//   - SetTiFlashReplica marks a sharded table as TiFlash-available in the mock
+//   - EXPLAIN with isolation_read_engines=tiflash + MPP routes to cop[tiflash]
+//   - READ_FROM_STORAGE(TIFLASH[...]) hint is accepted on a sharded table
+//
+// Cluster-level §10 tests (TC-TIFLASH-01..06) that require a running TiFlash
+// node are not covered here:
+//   - SHOW TABLE orders_sharded REGIONS — requires real TiKV/TiFlash regions
+//   - AVAILABLE=1 in information_schema.TIFLASH_REPLICA — requires replication
+//   - Verify N learner peers per physical shard — requires pd-ctl
+func TestTiFlashReplicaMock(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	) SHARD BY (company_id) SHARDS 4`)
+
+	// TC-TIFLASH-mock-01: SetTiFlashReplica marks the table as TiFlash-available
+	testkit.SetTiFlashReplica(t, dom, "test", "orders_sharded")
+
+	// TC-TIFLASH-mock-02: EXPLAIN with tiflash read engine + MPP routes to tiflash
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+	plan := mppPlan(tk, "SELECT COUNT(*) FROM orders_sharded WHERE company_id = 42")
+	require.Contains(t, plan, "tiflash",
+		"TC-TIFLASH-mock-02: plan must route to tiflash engine; got:\n"+plan)
+
+	// TC-TIFLASH-mock-03: READ_FROM_STORAGE(TIFLASH[...]) hint is accepted with MPP on
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	rows := tk.MustQuery(
+		"EXPLAIN SELECT /*+ READ_FROM_STORAGE(TIFLASH[orders_sharded]) */ COUNT(*) FROM orders_sharded").Rows()
+	planStr := explainToStr(rows)
+	require.Contains(t, planStr, "tiflash",
+		"TC-TIFLASH-mock-03: READ_FROM_STORAGE hint must route to tiflash; got:\n"+planStr)
+}
+
+// ---------------------------------------------------------------------------
+// §22 BR / TiCDC — SHOW CREATE TABLE roundtrip (unit-testable subset)
+// ---------------------------------------------------------------------------
+
+// TestBRCDCShowCreateRoundtrip verifies that SHOW CREATE TABLE emits the correct
+// SHARD BY clause for all SPT combinations. This is the unit-testable proxy for
+// BR restore correctness: BR restores by replaying SHOW CREATE TABLE DDL, so if
+// the clause is wrong the restored table will be missing its shard routing.
+//
+// Full BR/restore and TiCDC tests (TC-BR-01, TC-TICDC-01) require a running
+// BR binary and a downstream TiCDC sink — they are cluster-level only and
+// cannot be run in the testkit mock environment.
+func TestBRCDCShowCreateRoundtrip(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	// SST: SHARD BY only, no partitioning
+	tk.MustExec(`CREATE TABLE t_sst (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		PRIMARY KEY (id)
+	) SHARD BY (company_id) SHARDS 4`)
+	tk.MustQuery("SHOW CREATE TABLE t_sst").CheckContain("SHARD BY (`company_id`) SHARDS 4")
+	tk.MustExec("DROP TABLE t_sst")
+
+	// SPT-R: RANGE COLUMNS + SHARD BY
+	tk.MustExec(`CREATE TABLE t_spt_r (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		created_at DATE NOT NULL,
+		PRIMARY KEY (id, created_at)
+	) SHARD BY (company_id) SHARDS 4
+	PARTITION BY RANGE COLUMNS (created_at) (
+		PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+		PARTITION pmax  VALUES LESS THAN (MAXVALUE)
+	)`)
+	result := tk.MustQuery("SHOW CREATE TABLE t_spt_r")
+	result.CheckContain("SHARD BY (`company_id`) SHARDS 4")
+	result.CheckContain("PARTITION BY RANGE COLUMNS(`created_at`)")
+	result.CheckContain("p2024")
+	tk.MustExec("DROP TABLE t_spt_r")
+
+	// SPT-LC: LIST COLUMNS + SHARD BY
+	tk.MustExec(`CREATE TABLE t_spt_lc (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		country    VARCHAR(2) NOT NULL,
+		PRIMARY KEY (id, country)
+	) SHARD BY (company_id) SHARDS 4
+	PARTITION BY LIST COLUMNS (country) (
+		PARTITION p_us VALUES IN ('US'),
+		PARTITION p_gb VALUES IN ('GB')
+	)`)
+	result = tk.MustQuery("SHOW CREATE TABLE t_spt_lc")
+	result.CheckContain("SHARD BY (`company_id`) SHARDS 4")
+	result.CheckContain("PARTITION BY LIST COLUMNS")
+	result.CheckContain("p_us")
+	result.CheckContain("p_gb")
+	tk.MustExec("DROP TABLE t_spt_lc")
+
+	// SPT-K: KEY + SHARD BY
+	tk.MustExec(`CREATE TABLE t_spt_k (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		bucket_id  BIGINT NOT NULL,
+		PRIMARY KEY (id, bucket_id)
+	) SHARD BY (company_id) SHARDS 8
+	PARTITION BY KEY (bucket_id) PARTITIONS 4`)
+	result = tk.MustQuery("SHOW CREATE TABLE t_spt_k")
+	result.CheckContain("SHARD BY (`company_id`) SHARDS 8")
+	result.CheckContain("PARTITION BY KEY (`bucket_id`) PARTITIONS 4")
+	tk.MustExec("DROP TABLE t_spt_k")
+
+	// SPT composite shard key: multi-column SHARD BY + RANGE
+	tk.MustExec(`CREATE TABLE t_spt_composite (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		user_id    BIGINT NOT NULL,
+		created_at DATE NOT NULL,
+		PRIMARY KEY (id, created_at)
+	) SHARD BY (company_id, user_id) SHARDS 4
+	PARTITION BY RANGE COLUMNS (created_at) (
+		PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+		PARTITION pmax  VALUES LESS THAN (MAXVALUE)
+	)`)
+	result = tk.MustQuery("SHOW CREATE TABLE t_spt_composite")
+	result.CheckContain("SHARD BY (`company_id`, `user_id`) SHARDS 4")
+	result.CheckContain("PARTITION BY RANGE COLUMNS")
+	tk.MustExec("DROP TABLE t_spt_composite")
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
