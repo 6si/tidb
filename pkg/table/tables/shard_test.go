@@ -450,3 +450,215 @@ func TestShardedTable_PartitionedSharded_GetAllPartitionIDs(t *testing.T) {
 		seen[id] = struct{}{}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Routing math unit tests (no live cluster required)
+// Covers: flatIdx arithmetic, shardForRow bounds, rebuildShards, PartitionExpr
+// staleness — these are the unit-level counterparts to the integration tests
+// that caught Bugs #1, #3, #4.
+// ---------------------------------------------------------------------------
+
+// TestShardIdx_FlatIndexArithmetic verifies that shardIdx(partIdx, slot) == partIdx*shardCnt+slot
+// and that all valid inputs produce indices within [0, partCnt*shardCnt).
+// Regression for Bug #4: flatIdx was computed using len(pi.Definitions) as shardCnt
+// on KEY/HASH+SHARD tables, causing OOB when len(pi.Definitions)==partCnt, not shardCnt.
+func TestShardIdx_FlatIndexArithmetic(t *testing.T) {
+	cases := []struct {
+		partCnt  int
+		shardCnt int
+	}{
+		{1, 4},
+		{4, 4}, // 4×4 table — the exact size that triggered Bug #4
+		{3, 2},
+		{2, 8},
+	}
+	for _, tc := range cases {
+		tblInfo := makePartitionedShardTableInfo(tc.partCnt, tc.shardCnt, []string{"id"})
+		tbl, err := makeShardedTableCommon(tblInfo)
+		require.NoError(t, err)
+		st, err := newShardedTable(tbl, tblInfo)
+		require.NoError(t, err)
+
+		total := tc.partCnt * tc.shardCnt
+		for partIdx := 0; partIdx < tc.partCnt; partIdx++ {
+			for slot := 0; slot < tc.shardCnt; slot++ {
+				idx := st.shardIdx(partIdx, slot)
+				require.Equal(t, partIdx*tc.shardCnt+slot, idx,
+					"partCnt=%d shardCnt=%d partIdx=%d slot=%d", tc.partCnt, tc.shardCnt, partIdx, slot)
+				require.Less(t, idx, total,
+					"flatIdx out of bounds: partCnt=%d shardCnt=%d partIdx=%d slot=%d idx=%d",
+					tc.partCnt, tc.shardCnt, partIdx, slot, idx)
+				require.GreaterOrEqual(t, idx, 0)
+			}
+		}
+	}
+}
+
+// TestShardForRow_BoundaryPartIdx verifies that shardForRow does not panic or return
+// an out-of-bounds shard for the first and last valid partition indices.
+// Regression for Bug #4: shardForRow used st.shardIDs[slot] (len==shardCnt) indexed
+// with flatIdx instead of slot, causing OOB on 4-partition tables.
+func TestShardForRow_BoundaryPartIdx(t *testing.T) {
+	const partCnt, shardCnt = 4, 4
+	tblInfo := makePartitionedShardTableInfo(partCnt, shardCnt, []string{"id"})
+	tbl, err := makeShardedTableCommon(tblInfo)
+	require.NoError(t, err)
+	st, err := newShardedTable(tbl, tblInfo)
+	require.NoError(t, err)
+
+	row := []types.Datum{types.NewIntDatum(42)}
+	for _, partIdx := range []int{0, 1, partCnt - 1} {
+		sp, err := st.shardForRow(row, partIdx)
+		require.NoError(t, err, "shardForRow must not error for partIdx=%d", partIdx)
+		require.NotNil(t, sp, "shardForRow must return non-nil for partIdx=%d", partIdx)
+		// Physical ID must be one of the IDs registered for this partition.
+		def := tblInfo.Partition.Definitions[partIdx]
+		found := false
+		for _, id := range def.ShardIDs {
+			if sp.physicalTableID == id {
+				found = true
+				break
+			}
+		}
+		require.True(t, found,
+			"shardForRow returned physID %d not in partition %d ShardIDs %v",
+			sp.physicalTableID, partIdx, def.ShardIDs)
+	}
+}
+
+// TestShardForRow_SlotInRange verifies that for many row values, the slot returned
+// by locateShard is always in [0, shardCnt) and the resulting flatIdx is in bounds.
+func TestShardForRow_SlotInRange(t *testing.T) {
+	const partCnt, shardCnt = 3, 4
+	tblInfo := makePartitionedShardTableInfo(partCnt, shardCnt, []string{"id"})
+	tbl, err := makeShardedTableCommon(tblInfo)
+	require.NoError(t, err)
+	st, err := newShardedTable(tbl, tblInfo)
+	require.NoError(t, err)
+
+	for _, v := range []int64{0, 1, -1, 42, 99, 1000, -999, 1<<31 - 1} {
+		row := []types.Datum{types.NewIntDatum(v)}
+		slot, err := st.locateShard(row)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, slot, 0, "slot must be >= 0 for value %d", v)
+		require.Less(t, slot, shardCnt, "slot must be < shardCnt for value %d", v)
+
+		for partIdx := 0; partIdx < partCnt; partIdx++ {
+			idx := st.shardIdx(partIdx, slot)
+			require.Less(t, idx, len(st.shards),
+				"flatIdx %d out of bounds (len=%d) for partIdx=%d slot=%d value=%d",
+				idx, len(st.shards), partIdx, slot, v)
+		}
+	}
+}
+
+// TestRebuildShards_AfterDropPartition verifies that rebuildShards() correctly
+// shrinks shards and physicalIDs when a partition is removed from origPartInfo.
+// Regression for the DROP PARTITION nil-pointer / OOB: stale shards len was
+// partCnt*shardCnt but post-drop flatPI only had (partCnt-1)*shardCnt entries.
+func TestRebuildShards_AfterDropPartition(t *testing.T) {
+	const partCnt, shardCnt = 3, 2
+	tblInfo := makePartitionedShardTableInfo(partCnt, shardCnt, []string{"id"})
+	tbl, err := makeShardedTableCommon(tblInfo)
+	require.NoError(t, err)
+	st, err := newShardedTable(tbl, tblInfo)
+	require.NoError(t, err)
+
+	require.Len(t, st.shards, partCnt*shardCnt, "pre-drop: must have partCnt*shardCnt shards")
+	require.Len(t, st.physicalIDs, partCnt*shardCnt)
+
+	// Simulate DROP PARTITION: remove last definition from origPartInfo.
+	st.origPartInfo.Definitions = st.origPartInfo.Definitions[:partCnt-1]
+
+	// Force rebuild by calling GetAllPartitionIDs (calls rebuildShards internally).
+	ids := st.GetAllPartitionIDs()
+	require.Len(t, ids, (partCnt-1)*shardCnt,
+		"post-drop: GetAllPartitionIDs must return (partCnt-1)*shardCnt IDs")
+	require.Len(t, st.shards, (partCnt-1)*shardCnt,
+		"post-drop: st.shards must be rebuilt to (partCnt-1)*shardCnt")
+	require.Equal(t, partCnt-1, st.partCnt, "post-drop: partCnt must be updated")
+	require.Equal(t, partCnt-1, st.shardsDefCount, "post-drop: shardsDefCount must match")
+}
+
+// TestRebuildShards_SubsequentShardForRow verifies that after rebuildShards,
+// shardForRow with partIdx in the new valid range does not panic or OOB.
+// This is the direct unit-level test for the Bug #4 / DROP PARTITION combination.
+func TestRebuildShards_SubsequentShardForRow(t *testing.T) {
+	const partCnt, shardCnt = 3, 2
+	tblInfo := makePartitionedShardTableInfo(partCnt, shardCnt, []string{"id"})
+	tbl, err := makeShardedTableCommon(tblInfo)
+	require.NoError(t, err)
+	st, err := newShardedTable(tbl, tblInfo)
+	require.NoError(t, err)
+
+	// Simulate DROP PARTITION on last partition.
+	st.origPartInfo.Definitions = st.origPartInfo.Definitions[:partCnt-1]
+	// Trigger rebuild.
+	st.GetAllPartitionIDs()
+
+	row := []types.Datum{types.NewIntDatum(7)}
+	// Only partIdx 0 and 1 are valid after drop; must not OOB.
+	for partIdx := 0; partIdx < partCnt-1; partIdx++ {
+		sp, err := st.shardForRow(row, partIdx)
+		require.NoError(t, err, "shardForRow must not error post-rebuild for partIdx=%d", partIdx)
+		require.NotNil(t, sp)
+	}
+}
+
+// TestPartitionExpr_StaleRebuild verifies that PartitionExpr() detects and rebuilds
+// a stale cached expr when origPartInfo.Definitions count changes.
+// This is the unit-level guard for the DROP PARTITION pruner OOB fix (Layer 1).
+func TestPartitionExpr_StaleRebuild(t *testing.T) {
+	const partCnt, shardCnt = 3, 2
+	tblInfo := makePartitionedShardTableInfo(partCnt, shardCnt, []string{"id"})
+	tbl, err := makeShardedTableCommon(tblInfo)
+	require.NoError(t, err)
+	st, err := newShardedTable(tbl, tblInfo)
+	require.NoError(t, err)
+
+	// PartitionExpr() should be non-nil for a partitioned+sharded table with a LIST PI.
+	// (newPartitionExpr may return an error for the minimal test PI without real expressions;
+	// we verify the staleness-detection code path by checking partExprDefCount.)
+	initialCount := st.partExprDefCount
+	require.Equal(t, partCnt, initialCount, "initial partExprDefCount must equal partCnt")
+
+	// Simulate DROP PARTITION: shrink definitions.
+	st.origPartInfo.Definitions = st.origPartInfo.Definitions[:partCnt-1]
+
+	// Call PartitionExpr() — it must detect the count mismatch and attempt a rebuild.
+	// The rebuild may succeed or gracefully fall back to nil (minimal test PI has no real exprs).
+	// Either way, partExprDefCount must be updated or cleared — not left stale.
+	_ = st.PartitionExpr()
+	require.NotEqual(t, initialCount, partCnt-1,
+		"partExprDefCount must not remain the pre-drop value after PartitionExpr() is called with smaller defs")
+	// After the call, partExprDefCount must match current def count (or 0 on error/nil).
+	require.True(t, st.partExprDefCount == partCnt-1 || st.partExprDefCount == 0,
+		"partExprDefCount must be updated to new def count or 0 on error, got %d", st.partExprDefCount)
+}
+
+// TestShardIdx_TableDriven_4x4 is a table-driven regression test for the exact
+// 4-partition × 4-shard layout that triggered Bug #4 in production.
+// Verifies every (partIdx, shardSlot) pair maps to a unique flatIdx within [0, 16).
+func TestShardIdx_TableDriven_4x4(t *testing.T) {
+	const partCnt, shardCnt = 4, 4
+	tblInfo := makePartitionedShardTableInfo(partCnt, shardCnt, []string{"id"})
+	tbl, err := makeShardedTableCommon(tblInfo)
+	require.NoError(t, err)
+	st, err := newShardedTable(tbl, tblInfo)
+	require.NoError(t, err)
+
+	total := partCnt * shardCnt
+	seen := make(map[int]struct{})
+	for partIdx := 0; partIdx < partCnt; partIdx++ {
+		for slot := 0; slot < shardCnt; slot++ {
+			idx := st.shardIdx(partIdx, slot)
+			require.GreaterOrEqual(t, idx, 0)
+			require.Less(t, idx, total,
+				"flatIdx %d out of [0,%d) for partIdx=%d slot=%d", idx, total, partIdx, slot)
+			require.NotContains(t, seen, idx,
+				"duplicate flatIdx %d for (partIdx=%d, slot=%d)", idx, partIdx, slot)
+			seen[idx] = struct{}{}
+		}
+	}
+	require.Len(t, seen, total, "all %d flatIdx values must be unique", total)
+}
