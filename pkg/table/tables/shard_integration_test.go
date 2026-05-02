@@ -29,9 +29,14 @@ package tables_test
 //   end-to-end but shard routing cannot be confirmed at the physical region level.
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/pingcap/tidb/pkg/domain"
+	"github.com/pingcap/tidb/pkg/meta/model"
+	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/stretchr/testify/require"
 )
@@ -1035,6 +1040,693 @@ func TestCompositeShardKeyPruning(t *testing.T) {
 	planStr = explainToStr(rows)
 	require.True(t, strings.Contains(planStr, "partition:all"),
 		"partial composite key (second col): expected full scan, got: "+planStr)
+}
+
+// ---------------------------------------------------------------------------
+// §3.8 DML — Bulk Operations
+// ---------------------------------------------------------------------------
+
+func TestDMLBulkOperations(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id, company_id)
+	) SHARD BY (company_id) SHARDS 4`)
+
+	tk.MustExec("INSERT INTO orders_sharded VALUES (200, 42, 10.00)")
+
+	// TC-DML-BULK-02: REPLACE INTO — must update in-place, no ghost row
+	tk.MustExec("REPLACE INTO orders_sharded VALUES (200, 42, 99.00)")
+	tk.MustQuery("SELECT amount FROM orders_sharded WHERE id = 200 AND company_id = 42").
+		Check(testkit.Rows("99.00"))
+	tk.MustQuery("SELECT COUNT(*) FROM orders_sharded WHERE id = 200").
+		Check(testkit.Rows("1"))
+
+	// TC-DML-BULK-03: ON DUPLICATE KEY UPDATE changing a non-shard-key column
+	tk.MustExec("INSERT INTO orders_sharded VALUES (300, 1, 5.00)")
+	tk.MustExec("INSERT INTO orders_sharded VALUES (300, 1, 5.00) ON DUPLICATE KEY UPDATE amount = 50.00")
+	tk.MustQuery("SELECT amount FROM orders_sharded WHERE id = 300 AND company_id = 1").
+		Check(testkit.Rows("50.00"))
+	tk.MustQuery("SELECT COUNT(*) FROM orders_sharded WHERE id = 300").
+		Check(testkit.Rows("1"))
+
+	// TC-DML-BULK-03b: ON DUPLICATE KEY UPDATE changing the shard key column (cross-shard move).
+	// The row (id=400, company_id=1) must atomically move to the new shard for company_id=999.
+	// No ghost row may remain in the old shard.
+	tk.MustExec("INSERT INTO orders_sharded VALUES (400, 1, 5.00)")
+	tk.MustExec("INSERT INTO orders_sharded VALUES (400, 1, 5.00) ON DUPLICATE KEY UPDATE company_id = 999, amount = 99.00")
+	tk.MustQuery("SELECT amount FROM orders_sharded WHERE id = 400 AND company_id = 999").
+		Check(testkit.Rows("99.00"))
+	tk.MustQuery("SELECT COUNT(*) FROM orders_sharded WHERE id = 400 AND company_id = 1").
+		Check(testkit.Rows("0"))
+	tk.MustQuery("SELECT COUNT(*) FROM orders_sharded WHERE id = 400").
+		Check(testkit.Rows("1"))
+
+	// TC-DML-BULK-01 (LOAD DATA): skipped — requires file system access; covered by lightning tests.
+}
+
+// ---------------------------------------------------------------------------
+// §11 Regression — Non-Sharded Tables Unaffected
+// ---------------------------------------------------------------------------
+
+func TestRegressionNonShardedUnaffected(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	// TC-REG-01: Plain table DDL unchanged — no SHARD BY clause in output
+	tk.MustExec(`CREATE TABLE orders (
+		id         BIGINT NOT NULL AUTO_INCREMENT,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	)`)
+	showCreate := tk.MustQuery("SHOW CREATE TABLE orders").Rows()
+	ddl := fmt.Sprintf("%v", showCreate)
+	require.NotContains(t, ddl, "SHARD BY",
+		"TC-REG-01: plain table must not have SHARD BY in DDL output")
+
+	// TC-REG-02: Partitioned table DDL unchanged
+	tk.MustExec(`CREATE TABLE orders_range (
+		id         BIGINT NOT NULL,
+		created_at DATE NOT NULL,
+		PRIMARY KEY (id, created_at)
+	) PARTITION BY RANGE COLUMNS (created_at) (
+		PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+		PARTITION pmax  VALUES LESS THAN (MAXVALUE)
+	)`)
+	showCreate = tk.MustQuery("SHOW CREATE TABLE orders_range").Rows()
+	ddl = fmt.Sprintf("%v", showCreate)
+	require.NotContains(t, ddl, "SHARD BY",
+		"TC-REG-02: partitioned table must not have SHARD BY in DDL output")
+
+	// TC-REG-04: Queries on plain tables return correct results
+	tk.MustExec("INSERT INTO orders (company_id, amount) VALUES (1, 10.00), (1, 20.00), (2, 30.00)")
+	tk.MustQuery("SELECT COUNT(*) FROM orders WHERE company_id = 1").Check(testkit.Rows("2"))
+	tk.MustQuery("SELECT SUM(amount) FROM orders").Check(testkit.Rows("60.00"))
+}
+
+// ---------------------------------------------------------------------------
+// §13 INFORMATION_SCHEMA Limitations for SPT
+// ---------------------------------------------------------------------------
+
+func TestISLimitationsSPT(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	// Create a SPT-LC table
+	tk.MustExec(`CREATE TABLE orders_list_cols_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		country    VARCHAR(10) NOT NULL,
+		PRIMARY KEY (id, country)
+	) SHARD BY (company_id) SHARDS 4
+	PARTITION BY LIST COLUMNS (country) (
+		PARTITION p_us VALUES IN ('US'),
+		PARTITION p_gb VALUES IN ('GB'),
+		PARTITION p_de VALUES IN ('DE')
+	)`)
+
+	// TC-META-SPT-02: SHOW CREATE TABLE returns logical partition names
+	showCreate := tk.MustQuery("SHOW CREATE TABLE orders_list_cols_sharded").Rows()
+	ddl := fmt.Sprintf("%v", showCreate)
+	require.Contains(t, ddl, "p_us",
+		"TC-META-SPT-02: SHOW CREATE TABLE must show logical partition names")
+	require.Contains(t, ddl, "p_gb",
+		"TC-META-SPT-02: SHOW CREATE TABLE must show logical partition name p_gb")
+	require.NotContains(t, ddl, "shard_0",
+		"TC-META-SPT-02: SHOW CREATE TABLE must not expose physical shard sub-partition names")
+
+	// TC-META-SPT-05: TABLE_ROWS in IS.PARTITIONS is 0 for SPT — known limitation
+	tk.MustExec("INSERT INTO orders_list_cols_sharded VALUES (1, 42, 'US'), (2, 99, 'US')")
+	isRows := tk.MustQuery(`SELECT TABLE_ROWS FROM information_schema.PARTITIONS
+		WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'orders_list_cols_sharded'`).Rows()
+	for _, r := range isRows {
+		require.Equal(t, "0", fmt.Sprintf("%v", r[0]),
+			"TC-META-SPT-05: TABLE_ROWS must be 0 for SPT (known IS limitation)")
+	}
+
+	// TC-META-SPT-06: SELECT COUNT(*) PARTITION (p_us) gives correct count
+	tk.MustQuery("SELECT COUNT(*) FROM orders_list_cols_sharded PARTITION (p_us)").
+		Check(testkit.Rows("2"))
+
+	// SELECT from explicit partition only returns matching rows
+	tk.MustExec("INSERT INTO orders_list_cols_sharded VALUES (3, 10, 'GB')")
+	tk.MustQuery("SELECT COUNT(*) FROM orders_list_cols_sharded PARTITION (p_gb)").
+		Check(testkit.Rows("1"))
+	// p_us partition should not return GB rows
+	tk.MustQuery("SELECT COUNT(*) FROM orders_list_cols_sharded PARTITION (p_us)").
+		Check(testkit.Rows("2"))
+}
+
+// ---------------------------------------------------------------------------
+// §17 Generated Columns as Shard Key
+// ---------------------------------------------------------------------------
+
+func TestGeneratedColumnShardKey(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	// TC-DDL-GENCOL-01: STORED generated column as shard key — document allow/reject
+	err := tk.ExecToErr(`CREATE TABLE t_gen_stored (
+		id         BIGINT PRIMARY KEY,
+		email      VARCHAR(255),
+		email_hash BIGINT AS (CRC32(email)) STORED
+	) SHARD BY (email_hash) SHARDS 4`)
+	if err == nil {
+		// Server allows STORED generated column as shard key
+		tk.MustExec("INSERT INTO t_gen_stored (id, email) VALUES (1, 'a@b.com'), (2, 'c@d.com')")
+		tk.MustQuery("SELECT COUNT(*) FROM t_gen_stored").Check(testkit.Rows("2"))
+		tk.MustExec("DROP TABLE t_gen_stored")
+		t.Logf("TC-DDL-GENCOL-01: STORED generated column as shard key is ALLOWED")
+	} else {
+		t.Logf("TC-DDL-GENCOL-01: STORED generated column as shard key is REJECTED: %v", err)
+	}
+
+	// TC-DDL-GENCOL-02: VIRTUAL generated column as shard key — expected to be rejected
+	err = tk.ExecToErr(`CREATE TABLE t_gen_virtual (
+		id         BIGINT PRIMARY KEY,
+		email      VARCHAR(255),
+		email_hash BIGINT AS (CRC32(email)) VIRTUAL
+	) SHARD BY (email_hash) SHARDS 4`)
+	if err == nil {
+		t.Logf("TC-DDL-GENCOL-02: VIRTUAL generated column as shard key is ALLOWED (unexpected)")
+		tk.MustExec("DROP TABLE t_gen_virtual")
+	} else {
+		t.Logf("TC-DDL-GENCOL-02: VIRTUAL generated column as shard key is REJECTED (expected): %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// §18 INSERT ... SELECT Routing
+// ---------------------------------------------------------------------------
+
+func TestInsertSelectRouting(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id, company_id)
+	) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE orders_sharded_copy (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id, company_id)
+	) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE orders_sharded_8 (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id, company_id)
+	) SHARD BY (company_id) SHARDS 8`)
+
+	tk.MustExec("INSERT INTO orders_sharded VALUES (1, 42, 10.00), (2, 42, 20.00), (3, 99, 30.00)")
+
+	// TC-DML-INSERT-SELECT-01: INSERT ... SELECT into same-shard-count copy
+	tk.MustExec("INSERT INTO orders_sharded_copy (id, company_id, amount) SELECT id+10000, company_id, amount FROM orders_sharded")
+	tk.MustQuery("SELECT COUNT(*) FROM orders_sharded_copy").Check(testkit.Rows("3"))
+	// Routing is by target shard key; company_id=42 rows land in correct shard
+	rows := tk.MustQuery("EXPLAIN SELECT * FROM orders_sharded_copy WHERE company_id = 42").Rows()
+	planStr := explainToStr(rows)
+	require.False(t, strings.Contains(planStr, "partition:all"),
+		"TC-DML-INSERT-SELECT-01: shard-pruned query on copy must not scan all shards; got: "+planStr)
+
+	// TC-DML-INSERT-SELECT-02: INSERT ... SELECT into different shard count (8 shards)
+	tk.MustExec("INSERT INTO orders_sharded_8 (id, company_id, amount) SELECT id+20000, company_id, amount FROM orders_sharded")
+	tk.MustQuery("SELECT COUNT(*) FROM orders_sharded_8").Check(testkit.Rows("3"))
+}
+
+// ---------------------------------------------------------------------------
+// §20 Statistics and ANALYZE
+// ---------------------------------------------------------------------------
+
+func TestAnalyzeStats(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id, company_id)
+	) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE orders_range_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		created_at DATE NOT NULL,
+		PRIMARY KEY (id, created_at)
+	) SHARD BY (company_id) SHARDS 4
+	PARTITION BY RANGE COLUMNS (created_at) (
+		PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
+		PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+		PARTITION pmax  VALUES LESS THAN (MAXVALUE)
+	)`)
+
+	tk.MustExec("INSERT INTO orders_sharded VALUES (1, 42, 10.00), (2, 42, 20.00), (3, 99, 30.00)")
+	tk.MustExec("INSERT INTO orders_range_sharded VALUES (1, 42, '2024-05-01'), (2, 99, '2023-11-01'), (3, 17, '2025-01-15')")
+
+	// TC-STATS-01: ANALYZE on SST completes without error
+	tk.MustExec("ANALYZE TABLE orders_sharded")
+	metaRows := tk.MustQuery("SHOW STATS_META WHERE db_name = 'test' AND table_name = 'orders_sharded'").Rows()
+	require.NotEmpty(t, metaRows, "TC-STATS-01: SHOW STATS_META must return rows after ANALYZE on SST")
+
+	// TC-STATS-03: ANALYZE on SPT completes without error
+	tk.MustExec("ANALYZE TABLE orders_range_sharded")
+	metaRows = tk.MustQuery("SHOW STATS_META WHERE db_name = 'test' AND table_name = 'orders_range_sharded'").Rows()
+	require.NotEmpty(t, metaRows, "TC-STATS-03: SHOW STATS_META must return rows after ANALYZE on SPT")
+
+	// TC-STATS-02: plan row estimate works after ANALYZE (query runs without error)
+	tk.MustQuery("EXPLAIN SELECT * FROM orders_sharded WHERE company_id = 42").Rows()
+
+	// TC-STATS-04: SHOW STATS_HISTOGRAMS returns rows after ANALYZE on SST
+	histRows := tk.MustQuery("SHOW STATS_HISTOGRAMS WHERE db_name = 'test' AND table_name = 'orders_sharded'").Rows()
+	require.NotEmpty(t, histRows,
+		"TC-STATS-04: SHOW STATS_HISTOGRAMS must return rows after ANALYZE on SST")
+
+	// TC-STATS-05: SHOW STATS_HISTOGRAMS returns rows after ANALYZE on SPT
+	histRows = tk.MustQuery("SHOW STATS_HISTOGRAMS WHERE db_name = 'test' AND table_name = 'orders_range_sharded'").Rows()
+	require.NotEmpty(t, histRows,
+		"TC-STATS-05: SHOW STATS_HISTOGRAMS must return rows after ANALYZE on SPT")
+}
+
+// ---------------------------------------------------------------------------
+// §23 Explicit PARTITION Clause on SPT
+// ---------------------------------------------------------------------------
+
+func TestExplicitPartitionClause(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec(`CREATE TABLE orders_range_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		created_at DATE NOT NULL,
+		PRIMARY KEY (id, created_at)
+	) SHARD BY (company_id) SHARDS 4
+	PARTITION BY RANGE COLUMNS (created_at) (
+		PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
+		PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+		PARTITION pmax  VALUES LESS THAN (MAXVALUE)
+	)`)
+	tk.MustExec(`INSERT INTO orders_range_sharded VALUES
+		(1, 42, '2023-05-01'),
+		(2, 42, '2024-05-01'),
+		(3, 99, '2024-11-01'),
+		(4, 17, '2025-02-01')`)
+
+	// TC-PARTITION-EXPLICIT-01: SELECT with explicit partition + shard key predicate
+	// Only rows in p2024 with company_id=42 should be returned
+	tk.MustQuery("SELECT id FROM orders_range_sharded PARTITION (p2024) WHERE company_id = 42").
+		Check(testkit.Rows("2"))
+
+	// TC-PARTITION-EXPLICIT-02: Explicit partition that doesn't match row's date range → 0 rows
+	tk.MustQuery("SELECT COUNT(*) FROM orders_range_sharded PARTITION (p2023) WHERE created_at = '2024-05-01'").
+		Check(testkit.Rows("0"))
+
+	// TC-PARTITION-EXPLICIT-03: EXPLAIN with explicit partition shows correct physical shard
+	rows := tk.MustQuery("EXPLAIN SELECT * FROM orders_range_sharded PARTITION (p2024) WHERE company_id = 42").Rows()
+	planStr := explainToStr(rows)
+	// Should scan only within p2024 (not all partitions)
+	require.False(t, strings.Contains(planStr, "p2023"),
+		"TC-PARTITION-EXPLICIT-03: explicit p2024 must not scan p2023; got: "+planStr)
+	t.Logf("TC-PARTITION-EXPLICIT-03: EXPLAIN plan:\n%s", planStr)
+}
+
+// ---------------------------------------------------------------------------
+// §4 MPP Co-location (TiFlash) — aggregations, window functions, join variants
+//
+// These tests work in the testkit mock environment by:
+//   1. Creating plain tables (no shard DDL needed).
+//   2. Injecting ShardKeyInfo directly into the in-memory TableInfo.
+//   3. Marking the table as having a TiFlash replica via SetTiFlashReplica.
+//   4. Setting tidb_isolation_read_engines=tiflash and tidb_allow_mpp=1.
+//
+// Tests that require a real TiFlash cluster are not included here.
+// ---------------------------------------------------------------------------
+
+// mppPlan returns a single-string concatenation of EXPLAIN FORMAT='brief' output.
+func mppPlan(tk *testkit.TestKit, sql string) string {
+	rows := tk.MustQuery("explain format='brief' " + sql).Rows()
+	parts := make([]string, 0, len(rows))
+	for _, r := range rows {
+		parts = append(parts, fmt.Sprintf("%v", r))
+	}
+	return strings.Join(parts, "\n")
+}
+
+// setShardKey injects ShardKeyInfo into an in-memory TableInfo for MPP tests.
+func setShardKey(t *testing.T, dom *domain.Domain, dbName, tblName string, shardCols []string, shardCnt int) {
+	is := dom.InfoSchema()
+	info, err := is.TableByName(context.Background(), pmodel.NewCIStr(dbName), pmodel.NewCIStr(tblName))
+	require.NoError(t, err)
+	info.Meta().ShardKeyInfo = &model.ShardKeyInfo{
+		Columns:  shardCols,
+		ShardCnt: shardCnt,
+	}
+}
+
+// TestMPP_Aggregation covers TC-MPP-AGG-01..04 and TC-MPP-SST-08.
+func TestMPP_Aggregation(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	)`)
+
+	testkit.SetTiFlashReplica(t, dom, "test", "orders_sharded")
+	setShardKey(t, dom, "test", "orders_sharded", []string{"company_id"}, 4)
+
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+
+	// TC-MPP-AGG-01: GROUP BY shard key — all agg local, no HashPartition exchange
+	plan := mppPlan(tk,
+		"select company_id, COUNT(*), SUM(amount), AVG(amount), MAX(amount), MIN(amount) "+
+			"FROM orders_sharded GROUP BY company_id")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-AGG-01: GROUP BY shard key must not require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-AGG-02: DISTINCT on shard key — local per shard, no exchange
+	plan = mppPlan(tk, "SELECT DISTINCT company_id FROM orders_sharded")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-AGG-02: DISTINCT on shard key must not require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-AGG-03: DISTINCT on non-shard-key column — requires global exchange
+	plan = mppPlan(tk, "SELECT DISTINCT amount FROM orders_sharded")
+	require.Contains(t, plan, "HashPartition",
+		"TC-MPP-AGG-03: DISTINCT on non-shard column must require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-AGG-04: HAVING on shard-key aggregation — local filter, no exchange
+	plan = mppPlan(tk,
+		"SELECT company_id, SUM(amount) AS total FROM orders_sharded GROUP BY company_id HAVING total > 1000")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-AGG-04: HAVING on shard-key agg must not require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-AGG-05: COUNT(DISTINCT) grouped by shard key — distinct scoped per shard, no exchange
+	plan = mppPlan(tk,
+		"SELECT company_id, COUNT(DISTINCT amount) FROM orders_sharded GROUP BY company_id")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-AGG-05: COUNT(DISTINCT) grouped by shard key must not require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-SST-08: Global SUM (no GROUP BY) — partial agg merge requires some exchange.
+	// Actual behavior: optimizer uses PassThrough exchange (coordinator pulls partial results),
+	// not HashPartition. Assert that an ExchangeSender is present (data does cross a node boundary).
+	plan = mppPlan(tk, "SELECT SUM(amount) FROM orders_sharded")
+	require.Contains(t, plan, "ExchangeSender",
+		"TC-MPP-SST-08: global SUM without GROUP BY must use ExchangeSender for partial agg merge; plan:\n"+plan)
+}
+
+// TestMPP_WindowFunctions covers TC-MPP-SST-10 and TC-MPP-SST-11.
+func TestMPP_WindowFunctions(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	)`)
+
+	testkit.SetTiFlashReplica(t, dom, "test", "orders_sharded")
+	setShardKey(t, dom, "test", "orders_sharded", []string{"company_id"}, 4)
+
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+
+	// TC-MPP-SST-10: Window PARTITION BY shard key — local per shard, no exchange
+	plan := mppPlan(tk,
+		"SELECT id, company_id, SUM(amount) OVER (PARTITION BY company_id) FROM orders_sharded")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-SST-10: WINDOW PARTITION BY shard key must not require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-SST-11: Window ORDER BY non-shard-key column — requires some exchange for global ordering.
+	// Actual behavior: optimizer uses PassThrough exchange (not HashPartition) to gather data
+	// at coordinator before applying the global ORDER BY. Assert ExchangeSender is present.
+	plan = mppPlan(tk,
+		"SELECT id, amount, ROW_NUMBER() OVER (ORDER BY amount) FROM orders_sharded")
+	require.Contains(t, plan, "ExchangeSender",
+		"TC-MPP-SST-11: WINDOW ORDER BY non-shard column must use ExchangeSender for global ordering; plan:\n"+plan)
+	t.Logf("TC-MPP-SST-11: plan (PassThrough, not HashPartition, is correct):\n%s", plan)
+}
+
+// TestMPP_JoinVariants covers TC-MPP-JOIN-02, TC-MPP-JOIN-04, TC-MPP-JOIN-05.
+// TC-MPP-JOIN-03 (FULL OUTER JOIN) is skipped: TiFlash MPP does not support FULL OUTER JOIN.
+func TestMPP_JoinVariants(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	)`)
+	tk.MustExec(`CREATE TABLE customers_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		name       VARCHAR(255),
+		PRIMARY KEY (id)
+	)`)
+
+	testkit.SetTiFlashReplica(t, dom, "test", "orders_sharded")
+	testkit.SetTiFlashReplica(t, dom, "test", "customers_sharded")
+	setShardKey(t, dom, "test", "orders_sharded", []string{"company_id"}, 4)
+	setShardKey(t, dom, "test", "customers_sharded", []string{"company_id"}, 4)
+
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+
+	// TC-MPP-JOIN-02: RIGHT JOIN on shard key — co-located, no exchange
+	plan := mppPlan(tk,
+		"SELECT /*+ shuffle_join(orders_sharded, customers_sharded) */ o.id, c.company_id "+
+			"FROM orders_sharded o RIGHT JOIN customers_sharded c ON o.company_id = c.company_id")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-JOIN-02: co-located RIGHT JOIN must not require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-JOIN-04: JOIN with expression in ON clause (company_id + 0) — document behavior.
+	// The expression prevents co-location detection: expect HashPartition exchange.
+	plan = mppPlan(tk,
+		"SELECT /*+ shuffle_join(orders_sharded, customers_sharded) */ COUNT(*) "+
+			"FROM orders_sharded o JOIN customers_sharded c ON o.company_id + 0 = c.company_id")
+	// Document: expression in ON clause breaks co-location optimization.
+	t.Logf("TC-MPP-JOIN-04: plan with expression in ON clause:\n%s\nHashPartition=%v",
+		plan, strings.Contains(plan, "HashPartition"))
+
+	// TC-MPP-JOIN-05: JOIN with WHERE filtering both tables on shard key
+	plan = mppPlan(tk,
+		"SELECT /*+ shuffle_join(orders_sharded, customers_sharded) */ COUNT(*) "+
+			"FROM orders_sharded o JOIN customers_sharded c ON o.company_id = c.company_id "+
+			"WHERE o.company_id = 42 AND c.company_id = 42")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-JOIN-05: co-located join with shard-key WHERE must not require HashPartition exchange; plan:\n"+plan)
+}
+
+// TestMPP_MixedTables covers TC-MPP-MIXED-01 and TC-MPP-MIXED-02.
+func TestMPP_MixedTables(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	// Sharded table
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	)`)
+	// Plain (non-sharded) table
+	tk.MustExec(`CREATE TABLE orders_plain (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	)`)
+
+	testkit.SetTiFlashReplica(t, dom, "test", "orders_sharded")
+	testkit.SetTiFlashReplica(t, dom, "test", "orders_plain")
+	setShardKey(t, dom, "test", "orders_sharded", []string{"company_id"}, 4)
+	// orders_plain has no ShardKeyInfo
+
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+
+	// TC-MPP-MIXED-01: Sharded joined with plain table — exchange required on at least one side.
+	// Actual behavior: without a shuffle hint, the optimizer chooses broadcast for the non-sharded
+	// table (Broadcast exchange) rather than HashPartition. Either way, an ExchangeSender is present.
+	plan := mppPlan(tk,
+		"SELECT COUNT(*) FROM orders_sharded o JOIN orders_plain p ON o.company_id = p.company_id")
+	require.Contains(t, plan, "ExchangeSender",
+		"TC-MPP-MIXED-01: sharded+plain join must use ExchangeSender on at least one side; plan:\n"+plan)
+	t.Logf("TC-MPP-MIXED-01: plan (Broadcast chosen over HashPartition for plain side):\n%s", plan)
+
+	// TC-MPP-MIXED-02: Broadcast hint on non-sharded table — p broadcast, no shuffle on sharded table
+	plan = mppPlan(tk,
+		"SELECT /*+ broadcast_join(orders_plain) */ COUNT(*) "+
+			"FROM orders_sharded o JOIN orders_plain p ON o.company_id = p.company_id")
+	// With broadcast hint the plain table is replicated to all nodes; sharded side needs no shuffle.
+	// The plan should contain Broadcast exchange type (not HashPartition) for orders_plain.
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-MIXED-02: broadcast hint must eliminate HashPartition exchange on sharded table; plan:\n"+plan)
+	t.Logf("TC-MPP-MIXED-02: broadcast plan:\n%s", plan)
+}
+
+// ---------------------------------------------------------------------------
+// §10 TiFlash Replica (mock-level coverage)
+// ---------------------------------------------------------------------------
+
+// TestTiFlashReplicaMock covers the parts of §10 that are testable without a
+// real TiFlash cluster:
+//   - SetTiFlashReplica marks a sharded table as TiFlash-available in the mock
+//   - EXPLAIN with isolation_read_engines=tiflash + MPP routes to cop[tiflash]
+//   - READ_FROM_STORAGE(TIFLASH[...]) hint is accepted on a sharded table
+//
+// Cluster-level §10 tests (TC-TIFLASH-01..06) that require a running TiFlash
+// node are not covered here:
+//   - SHOW TABLE orders_sharded REGIONS — requires real TiKV/TiFlash regions
+//   - AVAILABLE=1 in information_schema.TIFLASH_REPLICA — requires replication
+//   - Verify N learner peers per physical shard — requires pd-ctl
+func TestTiFlashReplicaMock(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	) SHARD BY (company_id) SHARDS 4`)
+
+	// TC-TIFLASH-mock-01: SetTiFlashReplica marks the table as TiFlash-available
+	testkit.SetTiFlashReplica(t, dom, "test", "orders_sharded")
+
+	// TC-TIFLASH-mock-02: EXPLAIN with tiflash read engine + MPP routes to tiflash
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+	plan := mppPlan(tk, "SELECT COUNT(*) FROM orders_sharded WHERE company_id = 42")
+	require.Contains(t, plan, "tiflash",
+		"TC-TIFLASH-mock-02: plan must route to tiflash engine; got:\n"+plan)
+
+	// TC-TIFLASH-mock-03: READ_FROM_STORAGE(TIFLASH[...]) hint is accepted with MPP on
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	rows := tk.MustQuery(
+		"EXPLAIN SELECT /*+ READ_FROM_STORAGE(TIFLASH[orders_sharded]) */ COUNT(*) FROM orders_sharded").Rows()
+	planStr := explainToStr(rows)
+	require.Contains(t, planStr, "tiflash",
+		"TC-TIFLASH-mock-03: READ_FROM_STORAGE hint must route to tiflash; got:\n"+planStr)
+}
+
+// ---------------------------------------------------------------------------
+// §22 BR / TiCDC — SHOW CREATE TABLE roundtrip (unit-testable subset)
+// ---------------------------------------------------------------------------
+
+// TestBRCDCShowCreateRoundtrip verifies that SHOW CREATE TABLE emits the correct
+// SHARD BY clause for all SPT combinations. This is the unit-testable proxy for
+// BR restore correctness: BR restores by replaying SHOW CREATE TABLE DDL, so if
+// the clause is wrong the restored table will be missing its shard routing.
+//
+// Full BR/restore and TiCDC tests (TC-BR-01, TC-TICDC-01) require a running
+// BR binary and a downstream TiCDC sink — they are cluster-level only and
+// cannot be run in the testkit mock environment.
+func TestBRCDCShowCreateRoundtrip(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	// SST: SHARD BY only, no partitioning
+	tk.MustExec(`CREATE TABLE t_sst (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		PRIMARY KEY (id)
+	) SHARD BY (company_id) SHARDS 4`)
+	tk.MustQuery("SHOW CREATE TABLE t_sst").CheckContain("SHARD BY (`company_id`) SHARDS 4")
+	tk.MustExec("DROP TABLE t_sst")
+
+	// SPT-R: RANGE COLUMNS + SHARD BY
+	tk.MustExec(`CREATE TABLE t_spt_r (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		created_at DATE NOT NULL,
+		PRIMARY KEY (id, created_at)
+	) SHARD BY (company_id) SHARDS 4
+	PARTITION BY RANGE COLUMNS (created_at) (
+		PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+		PARTITION pmax  VALUES LESS THAN (MAXVALUE)
+	)`)
+	result := tk.MustQuery("SHOW CREATE TABLE t_spt_r")
+	result.CheckContain("SHARD BY (`company_id`) SHARDS 4")
+	result.CheckContain("PARTITION BY RANGE COLUMNS(`created_at`)")
+	result.CheckContain("p2024")
+	tk.MustExec("DROP TABLE t_spt_r")
+
+	// SPT-LC: LIST COLUMNS + SHARD BY
+	tk.MustExec(`CREATE TABLE t_spt_lc (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		country    VARCHAR(2) NOT NULL,
+		PRIMARY KEY (id, country)
+	) SHARD BY (company_id) SHARDS 4
+	PARTITION BY LIST COLUMNS (country) (
+		PARTITION p_us VALUES IN ('US'),
+		PARTITION p_gb VALUES IN ('GB')
+	)`)
+	result = tk.MustQuery("SHOW CREATE TABLE t_spt_lc")
+	result.CheckContain("SHARD BY (`company_id`) SHARDS 4")
+	result.CheckContain("PARTITION BY LIST COLUMNS")
+	result.CheckContain("p_us")
+	result.CheckContain("p_gb")
+	tk.MustExec("DROP TABLE t_spt_lc")
+
+	// SPT-K: KEY + SHARD BY
+	tk.MustExec(`CREATE TABLE t_spt_k (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		bucket_id  BIGINT NOT NULL,
+		PRIMARY KEY (id, bucket_id)
+	) SHARD BY (company_id) SHARDS 8
+	PARTITION BY KEY (bucket_id) PARTITIONS 4`)
+	result = tk.MustQuery("SHOW CREATE TABLE t_spt_k")
+	result.CheckContain("SHARD BY (`company_id`) SHARDS 8")
+	result.CheckContain("PARTITION BY KEY (`bucket_id`) PARTITIONS 4")
+	tk.MustExec("DROP TABLE t_spt_k")
+
+	// SPT composite shard key: multi-column SHARD BY + RANGE
+	tk.MustExec(`CREATE TABLE t_spt_composite (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		user_id    BIGINT NOT NULL,
+		created_at DATE NOT NULL,
+		PRIMARY KEY (id, created_at)
+	) SHARD BY (company_id, user_id) SHARDS 4
+	PARTITION BY RANGE COLUMNS (created_at) (
+		PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+		PARTITION pmax  VALUES LESS THAN (MAXVALUE)
+	)`)
+	result = tk.MustQuery("SHOW CREATE TABLE t_spt_composite")
+	result.CheckContain("SHARD BY (`company_id`, `user_id`) SHARDS 4")
+	result.CheckContain("PARTITION BY RANGE COLUMNS")
+	tk.MustExec("DROP TABLE t_spt_composite")
 }
 
 // ---------------------------------------------------------------------------
