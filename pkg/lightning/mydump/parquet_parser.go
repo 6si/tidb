@@ -177,7 +177,7 @@ func (it *columnIterator[T, R]) Next(d *types.Datum) error {
 	return nil
 }
 
-func createColumnIterator(tp parquet.Type, converted *convertedType, loc *time.Location, batchSize int) iterator {
+func createColumnIterator(tp parquet.Type, converted *convertedType, loc *time.Location, batchSize int, coerceJSONEmptyToNull bool) iterator {
 	switch tp {
 	case parquet.Types.Boolean:
 		return newColumnIterator[bool, *file.BooleanColumnChunkReader](batchSize, getBoolDataSetter)
@@ -192,7 +192,7 @@ func createColumnIterator(tp parquet.Type, converted *convertedType, loc *time.L
 	case parquet.Types.Int96:
 		return newColumnIterator[parquet.Int96, *file.Int96ColumnChunkReader](batchSize, getInt96Setter(converted, loc))
 	case parquet.Types.ByteArray:
-		return newColumnIterator[parquet.ByteArray, *file.ByteArrayColumnChunkReader](batchSize, getByteArraySetter(converted))
+		return newColumnIterator[parquet.ByteArray, *file.ByteArrayColumnChunkReader](batchSize, getByteArraySetter(converted, coerceJSONEmptyToNull))
 	case parquet.Types.FixedLenByteArray:
 		return newColumnIterator[parquet.FixedLenByteArray, *file.FixedLenByteArrayColumnChunkReader](batchSize, getFixedLenByteArraySetter(converted))
 	default:
@@ -311,6 +311,11 @@ type ParquetParser struct {
 
 	lastRow Row
 	logger  log.Logger
+
+	// jsonEmptyObjectToNull and nullableJSONColumns control {} → NULL coercion.
+	// Both are set from ParquetFileMeta at construction time.
+	jsonEmptyObjectToNull bool
+	nullableJSONColumns   map[string]bool
 }
 
 // Init initializes the Parquet parser and allocate necessary buffers
@@ -326,8 +331,10 @@ func (pp *ParquetParser) Init(loc *time.Location) error {
 		loc = timeutil.SystemLocation()
 	}
 	for i := range numCols {
+		colName := strings.ToLower(meta.Schema.Column(i).Name())
+		coerce := pp.jsonEmptyObjectToNull && pp.nullableJSONColumns[colName]
 		pp.iterators[i] = createColumnIterator(
-			meta.Schema.Column(i).PhysicalType(), &pp.colTypes[i], loc, readBatchSize)
+			meta.Schema.Column(i).PhysicalType(), &pp.colTypes[i], loc, readBatchSize, coerce)
 		if pp.iterators[i] == nil {
 			return errors.Errorf("unsupported parquet type %s", meta.Schema.Column(i).PhysicalType().String())
 		}
@@ -616,12 +623,14 @@ func NewParquetParser(
 	})
 
 	parser := &ParquetParser{
-		readers:  subreaders,
-		colTypes: colTypes,
-		colNames: colNames,
-		alloc:    allocator,
-		logger:   log.Logger{Logger: logger},
-		rowPool:  &pool,
+		readers:               subreaders,
+		colTypes:              colTypes,
+		colNames:              colNames,
+		alloc:                 allocator,
+		logger:                log.Logger{Logger: logger},
+		rowPool:               &pool,
+		jsonEmptyObjectToNull: meta.JSONEmptyObjectToNull,
+		nullableJSONColumns:   meta.NullableJSONColumns,
 	}
 	if err := parser.Init(meta.Loc); err != nil {
 		return nil, errors.Trace(err)

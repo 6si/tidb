@@ -37,6 +37,7 @@ import (
 	verify "github.com/pingcap/tidb/pkg/lightning/verification"
 	"github.com/pingcap/tidb/pkg/lightning/worker"
 	"github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/store/driver/txn"
 	"github.com/pingcap/tidb/pkg/table/tables"
 	"github.com/pingcap/tidb/pkg/tablecodec"
@@ -107,7 +108,12 @@ func openParser(
 	case mydump.SourceTypeSQL:
 		parser = mydump.NewChunkParser(ctx, cfg.TiDB.SQLMode, reader, blockBufSize, ioWorkers)
 	case mydump.SourceTypeParquet:
-		parser, err = mydump.NewParquetParser(ctx, store, reader, chunk.FileMeta.Path, chunk.FileMeta.ParquetMeta)
+		parquetMeta := chunk.FileMeta.ParquetMeta
+		if cfg.Mydumper.JSONEmptyObjectToNull {
+			parquetMeta.JSONEmptyObjectToNull = true
+			parquetMeta.NullableJSONColumns = buildNullableJSONColumns(tblInfo)
+		}
+		parser, err = mydump.NewParquetParser(ctx, store, reader, chunk.FileMeta.Path, parquetMeta)
 		if err != nil {
 			return nil, err
 		}
@@ -160,6 +166,21 @@ func getColumnNames(tableInfo *model.TableInfo, permutation []int) []string {
 		}
 	}
 	return names
+}
+
+// buildNullableJSONColumns returns a set of lowercase column names that are JSON type and nullable.
+// Used to gate {} → NULL coercion so NOT NULL columns are never affected.
+func buildNullableJSONColumns(tableInfo *model.TableInfo) map[string]bool {
+	if tableInfo == nil {
+		return nil
+	}
+	result := make(map[string]bool)
+	for _, col := range tableInfo.Columns {
+		if col.GetType() == mysql.TypeJSON && !mysql.HasNotNullFlag(col.GetFlag()) {
+			result[col.Name.L] = true
+		}
+	}
+	return result
 }
 
 func (cr *chunkProcessor) process(

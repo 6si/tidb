@@ -909,6 +909,10 @@ type MydumperRuntime struct {
 	// DataInvalidCharReplace is the replacement characters for non-compatible characters, which shouldn't duplicate with the separators or line breaks.
 	// Changing the default value will result in increased parsing time. Non-compatible characters do not cause an increase in error.
 	DataInvalidCharReplace string `toml:"data-invalid-char-replace" json:"data-invalid-char-replace"`
+	// JSONEmptyObjectToNull converts `{}` in JSON-typed Parquet columns to NULL.
+	// Default false (off) to preserve existing behavior. Set true to opt in per import job.
+	// Only nullable columns are coerced; NOT NULL columns are unaffected.
+	JSONEmptyObjectToNull bool `toml:"json-empty-object-to-null" json:"json-empty-object-to-null"`
 }
 
 func (m *MydumperRuntime) adjust() error {

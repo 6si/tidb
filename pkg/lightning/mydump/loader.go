@@ -94,6 +94,12 @@ type ParquetFileMeta struct {
 	// memory usage for reader, preserve for later PR
 	MemoryUsage int
 	Loc         *time.Location
+	// JSONEmptyObjectToNull enables coercion of `{}` in JSON columns to NULL.
+	// Only applies to nullable columns; NOT NULL columns are unaffected.
+	JSONEmptyObjectToNull bool
+	// NullableJSONColumns is the set of lowercase column names whose type is JSON and are nullable.
+	// Populated by the importer from TableInfo before parsing begins.
+	NullableJSONColumns map[string]bool
 }
 
 // SourceFileMeta contains some analyzed metadata for a source file by MyDumper Loader.
