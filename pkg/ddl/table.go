@@ -1234,6 +1234,39 @@ func onUpdateTiFlashReplicaStatus(jobCtx *jobContext, job *model.Job) (ver int64
 				}
 			}
 		}
+	} else if ski := tblInfo.ShardKeyInfo; ski != nil && len(ski.ShardIDs) > 0 {
+		// SST: physical shard IDs are in ShardKeyInfo.ShardIDs, not in a PartitionInfo.
+		// Track availability against AvailablePartitionIDs (reused for shard IDs) and
+		// flip Available when all shards report in.
+		isKnownShard := false
+		for _, id := range ski.ShardIDs {
+			if id == physicalID {
+				isKnownShard = true
+				break
+			}
+		}
+		if !isKnownShard {
+			job.State = model.JobStateCancelled
+			return ver, errors.Errorf("unknown physical shard ID %v in sharded table %v", physicalID, tblInfo.Name.O)
+		}
+		if available {
+			tblInfo.TiFlashReplica.AvailablePartitionIDs = append(tblInfo.TiFlashReplica.AvailablePartitionIDs, physicalID)
+			allAvailable := true
+			for _, id := range ski.ShardIDs {
+				allAvailable = allAvailable && tblInfo.TiFlashReplica.IsPartitionAvailable(id)
+			}
+			tblInfo.TiFlashReplica.Available = allAvailable
+		} else {
+			for i, id := range tblInfo.TiFlashReplica.AvailablePartitionIDs {
+				if id == physicalID {
+					newIDs := append(tblInfo.TiFlashReplica.AvailablePartitionIDs[:i:i], tblInfo.TiFlashReplica.AvailablePartitionIDs[i+1:]...)
+					tblInfo.TiFlashReplica.AvailablePartitionIDs = newIDs
+					tblInfo.TiFlashReplica.Available = false
+					logutil.DDLLogger().Info("TiFlash shard replica became unavailable", zap.Int64("tableID", tblInfo.ID), zap.Int64("shardID", id))
+					break
+				}
+			}
+		}
 	} else {
 		job.State = model.JobStateCancelled
 		return ver, errors.Errorf("unknown physical ID %v in table %v", physicalID, tblInfo.Name.O)
