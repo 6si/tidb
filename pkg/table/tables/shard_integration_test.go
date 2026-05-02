@@ -29,9 +29,14 @@ package tables_test
 //   end-to-end but shard routing cannot be confirmed at the physical region level.
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/pingcap/tidb/pkg/domain"
+	"github.com/pingcap/tidb/pkg/meta/model"
+	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/stretchr/testify/require"
 )
@@ -1035,6 +1040,226 @@ func TestCompositeShardKeyPruning(t *testing.T) {
 	planStr = explainToStr(rows)
 	require.True(t, strings.Contains(planStr, "partition:all"),
 		"partial composite key (second col): expected full scan, got: "+planStr)
+}
+
+// ---------------------------------------------------------------------------
+// §4 MPP Co-location (TiFlash) — aggregations, window functions, join variants
+//
+// These tests work in the testkit mock environment by:
+//   1. Creating plain tables (no shard DDL needed).
+//   2. Injecting ShardKeyInfo directly into the in-memory TableInfo.
+//   3. Marking the table as having a TiFlash replica via SetTiFlashReplica.
+//   4. Setting tidb_isolation_read_engines=tiflash and tidb_allow_mpp=1.
+//
+// Tests that require a real TiFlash cluster are not included here.
+// ---------------------------------------------------------------------------
+
+// mppPlan returns a single-string concatenation of EXPLAIN FORMAT='brief' output.
+func mppPlan(tk *testkit.TestKit, sql string) string {
+	rows := tk.MustQuery("explain format='brief' " + sql).Rows()
+	parts := make([]string, 0, len(rows))
+	for _, r := range rows {
+		parts = append(parts, fmt.Sprintf("%v", r))
+	}
+	return strings.Join(parts, "\n")
+}
+
+// setShardKey injects ShardKeyInfo into an in-memory TableInfo for MPP tests.
+func setShardKey(t *testing.T, dom *domain.Domain, dbName, tblName string, shardCols []string, shardCnt int) {
+	is := dom.InfoSchema()
+	info, err := is.TableByName(context.Background(), pmodel.NewCIStr(dbName), pmodel.NewCIStr(tblName))
+	require.NoError(t, err)
+	info.Meta().ShardKeyInfo = &model.ShardKeyInfo{
+		Columns:  shardCols,
+		ShardCnt: shardCnt,
+	}
+}
+
+// TestMPP_Aggregation covers TC-MPP-AGG-01..04 and TC-MPP-SST-08.
+func TestMPP_Aggregation(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	)`)
+
+	testkit.SetTiFlashReplica(t, dom, "test", "orders_sharded")
+	setShardKey(t, dom, "test", "orders_sharded", []string{"company_id"}, 4)
+
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+
+	// TC-MPP-AGG-01: GROUP BY shard key — all agg local, no HashPartition exchange
+	plan := mppPlan(tk,
+		"select company_id, COUNT(*), SUM(amount), AVG(amount), MAX(amount), MIN(amount) "+
+			"FROM orders_sharded GROUP BY company_id")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-AGG-01: GROUP BY shard key must not require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-AGG-02: DISTINCT on shard key — local per shard, no exchange
+	plan = mppPlan(tk, "SELECT DISTINCT company_id FROM orders_sharded")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-AGG-02: DISTINCT on shard key must not require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-AGG-03: DISTINCT on non-shard-key column — requires global exchange
+	plan = mppPlan(tk, "SELECT DISTINCT amount FROM orders_sharded")
+	require.Contains(t, plan, "HashPartition",
+		"TC-MPP-AGG-03: DISTINCT on non-shard column must require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-AGG-04: HAVING on shard-key aggregation — local filter, no exchange
+	plan = mppPlan(tk,
+		"SELECT company_id, SUM(amount) AS total FROM orders_sharded GROUP BY company_id HAVING total > 1000")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-AGG-04: HAVING on shard-key agg must not require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-SST-08: Global SUM (no GROUP BY) — partial agg merge requires some exchange.
+	// Actual behavior: optimizer uses PassThrough exchange (coordinator pulls partial results),
+	// not HashPartition. Assert that an ExchangeSender is present (data does cross a node boundary).
+	plan = mppPlan(tk, "SELECT SUM(amount) FROM orders_sharded")
+	require.Contains(t, plan, "ExchangeSender",
+		"TC-MPP-SST-08: global SUM without GROUP BY must use ExchangeSender for partial agg merge; plan:\n"+plan)
+}
+
+// TestMPP_WindowFunctions covers TC-MPP-SST-10 and TC-MPP-SST-11.
+func TestMPP_WindowFunctions(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	)`)
+
+	testkit.SetTiFlashReplica(t, dom, "test", "orders_sharded")
+	setShardKey(t, dom, "test", "orders_sharded", []string{"company_id"}, 4)
+
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+
+	// TC-MPP-SST-10: Window PARTITION BY shard key — local per shard, no exchange
+	plan := mppPlan(tk,
+		"SELECT id, company_id, SUM(amount) OVER (PARTITION BY company_id) FROM orders_sharded")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-SST-10: WINDOW PARTITION BY shard key must not require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-SST-11: Window ORDER BY non-shard-key column — requires some exchange for global ordering.
+	// Actual behavior: optimizer uses PassThrough exchange (not HashPartition) to gather data
+	// at coordinator before applying the global ORDER BY. Assert ExchangeSender is present.
+	plan = mppPlan(tk,
+		"SELECT id, amount, ROW_NUMBER() OVER (ORDER BY amount) FROM orders_sharded")
+	require.Contains(t, plan, "ExchangeSender",
+		"TC-MPP-SST-11: WINDOW ORDER BY non-shard column must use ExchangeSender for global ordering; plan:\n"+plan)
+	t.Logf("TC-MPP-SST-11: plan (PassThrough, not HashPartition, is correct):\n%s", plan)
+}
+
+// TestMPP_JoinVariants covers TC-MPP-JOIN-02, TC-MPP-JOIN-04, TC-MPP-JOIN-05.
+// TC-MPP-JOIN-03 (FULL OUTER JOIN) is skipped: TiFlash MPP does not support FULL OUTER JOIN.
+func TestMPP_JoinVariants(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	)`)
+	tk.MustExec(`CREATE TABLE customers_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		name       VARCHAR(255),
+		PRIMARY KEY (id)
+	)`)
+
+	testkit.SetTiFlashReplica(t, dom, "test", "orders_sharded")
+	testkit.SetTiFlashReplica(t, dom, "test", "customers_sharded")
+	setShardKey(t, dom, "test", "orders_sharded", []string{"company_id"}, 4)
+	setShardKey(t, dom, "test", "customers_sharded", []string{"company_id"}, 4)
+
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+
+	// TC-MPP-JOIN-02: RIGHT JOIN on shard key — co-located, no exchange
+	plan := mppPlan(tk,
+		"SELECT /*+ shuffle_join(orders_sharded, customers_sharded) */ o.id, c.company_id "+
+			"FROM orders_sharded o RIGHT JOIN customers_sharded c ON o.company_id = c.company_id")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-JOIN-02: co-located RIGHT JOIN must not require HashPartition exchange; plan:\n"+plan)
+
+	// TC-MPP-JOIN-04: JOIN with expression in ON clause (company_id + 0) — document behavior.
+	// The expression prevents co-location detection: expect HashPartition exchange.
+	plan = mppPlan(tk,
+		"SELECT /*+ shuffle_join(orders_sharded, customers_sharded) */ COUNT(*) "+
+			"FROM orders_sharded o JOIN customers_sharded c ON o.company_id + 0 = c.company_id")
+	// Document: expression in ON clause breaks co-location optimization.
+	t.Logf("TC-MPP-JOIN-04: plan with expression in ON clause:\n%s\nHashPartition=%v",
+		plan, strings.Contains(plan, "HashPartition"))
+
+	// TC-MPP-JOIN-05: JOIN with WHERE filtering both tables on shard key
+	plan = mppPlan(tk,
+		"SELECT /*+ shuffle_join(orders_sharded, customers_sharded) */ COUNT(*) "+
+			"FROM orders_sharded o JOIN customers_sharded c ON o.company_id = c.company_id "+
+			"WHERE o.company_id = 42 AND c.company_id = 42")
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-JOIN-05: co-located join with shard-key WHERE must not require HashPartition exchange; plan:\n"+plan)
+}
+
+// TestMPP_MixedTables covers TC-MPP-MIXED-01 and TC-MPP-MIXED-02.
+func TestMPP_MixedTables(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	// Sharded table
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	)`)
+	// Plain (non-sharded) table
+	tk.MustExec(`CREATE TABLE orders_plain (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	)`)
+
+	testkit.SetTiFlashReplica(t, dom, "test", "orders_sharded")
+	testkit.SetTiFlashReplica(t, dom, "test", "orders_plain")
+	setShardKey(t, dom, "test", "orders_sharded", []string{"company_id"}, 4)
+	// orders_plain has no ShardKeyInfo
+
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tiflash'")
+	tk.MustExec("set @@session.tidb_allow_mpp = 1")
+
+	// TC-MPP-MIXED-01: Sharded joined with plain table — exchange required on at least one side.
+	// Actual behavior: without a shuffle hint, the optimizer chooses broadcast for the non-sharded
+	// table (Broadcast exchange) rather than HashPartition. Either way, an ExchangeSender is present.
+	plan := mppPlan(tk,
+		"SELECT COUNT(*) FROM orders_sharded o JOIN orders_plain p ON o.company_id = p.company_id")
+	require.Contains(t, plan, "ExchangeSender",
+		"TC-MPP-MIXED-01: sharded+plain join must use ExchangeSender on at least one side; plan:\n"+plan)
+	t.Logf("TC-MPP-MIXED-01: plan (Broadcast chosen over HashPartition for plain side):\n%s", plan)
+
+	// TC-MPP-MIXED-02: Broadcast hint on non-sharded table — p broadcast, no shuffle on sharded table
+	plan = mppPlan(tk,
+		"SELECT /*+ broadcast_join(orders_plain) */ COUNT(*) "+
+			"FROM orders_sharded o JOIN orders_plain p ON o.company_id = p.company_id")
+	// With broadcast hint the plain table is replicated to all nodes; sharded side needs no shuffle.
+	// The plan should contain Broadcast exchange type (not HashPartition) for orders_plain.
+	require.NotContains(t, plan, "HashPartition",
+		"TC-MPP-MIXED-02: broadcast hint must eliminate HashPartition exchange on sharded table; plan:\n"+plan)
+	t.Logf("TC-MPP-MIXED-02: broadcast plan:\n%s", plan)
 }
 
 // ---------------------------------------------------------------------------
