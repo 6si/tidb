@@ -1729,6 +1729,141 @@ func TestBRCDCShowCreateRoundtrip(t *testing.T) {
 	tk.MustExec("DROP TABLE t_spt_composite")
 }
 
+// TestTiKVCoprocessorJoins covers §24 — joins on sharded tables executed via TiKV
+// coprocessor (tidb_isolation_read_engines='tikv'). Validates correctness and basic
+// plan shapes for Hash Join, Index Lookup Join, FULL OUTER JOIN, and self-join.
+func TestTiKVCoprocessorJoins(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	// Setup: orders_sharded (SST, shard key company_id, 4 shards)
+	tk.MustExec(`CREATE TABLE orders_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		amount     DECIMAL(12,2),
+		PRIMARY KEY (id)
+	) SHARD BY (company_id) SHARDS 4`)
+	setShardKey(t, dom, "test", "orders_sharded", []string{"company_id"}, 4)
+
+	// customers_sharded (SST, shard key company_id, 4 shards)
+	tk.MustExec(`CREATE TABLE customers_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		name       VARCHAR(255),
+		PRIMARY KEY (id)
+	) SHARD BY (company_id) SHARDS 4`)
+	setShardKey(t, dom, "test", "customers_sharded", []string{"company_id"}, 4)
+
+	// orders_range_sharded (SPT-R)
+	tk.MustExec(`CREATE TABLE orders_range_sharded (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		created_at DATE NOT NULL,
+		PRIMARY KEY (id, created_at)
+	) SHARD BY (company_id) SHARDS 4
+	PARTITION BY RANGE COLUMNS (created_at) (
+		PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
+		PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+		PARTITION pmax  VALUES LESS THAN (MAXVALUE)
+	)`)
+
+	// companies: plain non-sharded table
+	tk.MustExec(`CREATE TABLE companies (
+		id   BIGINT PRIMARY KEY,
+		name VARCHAR(50)
+	)`)
+
+	// Seed data
+	tk.MustExec("INSERT INTO orders_sharded VALUES (1, 42, 10.00), (2, 42, 20.00), (3, 99, 30.00)")
+	tk.MustExec("INSERT INTO customers_sharded VALUES (1, 42, 'Acme'), (2, 99, 'Globex')")
+	tk.MustExec("INSERT INTO companies VALUES (42, 'Acme Corp'), (99, 'Globex Inc')")
+	tk.MustExec("INSERT INTO orders_range_sharded VALUES (1, 42, '2024-05-01'), (2, 99, '2023-11-01')")
+
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tikv'")
+
+	// TC-TIKV-JOIN-01: Hash Join between two SSTs on shard key.
+	// TiKV cop joins are always Hash Join — no co-located MPP optimization here.
+	plan := explainToStr(tk.MustQuery("EXPLAIN FORMAT='brief' SELECT o.id, o.amount, c.name FROM orders_sharded o JOIN customers_sharded c ON o.company_id = c.company_id").Rows())
+	require.Contains(t, plan, "HashJoin",
+		"TC-TIKV-JOIN-01: expected HashJoin in TiKV plan; plan:\n"+plan)
+	tk.MustQuery(`SELECT o.id, o.amount, c.name
+		FROM orders_sharded o
+		JOIN customers_sharded c ON o.company_id = c.company_id
+		ORDER BY o.id`).Check(testkit.Rows(
+		"1 10.00 Acme",
+		"2 20.00 Acme",
+		"3 30.00 Globex",
+	))
+
+	// TC-TIKV-JOIN-02: IndexLookUpJoin hint on customers_sharded with shard-key predicate.
+	// With company_id=42 predicate, orders_sharded prunes to one shard.
+	// INL_JOIN hint may be ignored if the optimizer determines HashJoin is cheaper on
+	// small in-memory tables; assert result correctness regardless of plan shape.
+	tk.MustExec("ALTER TABLE customers_sharded ADD INDEX idx_company(company_id)")
+	rows := tk.MustQuery(`SELECT /*+ INL_JOIN(c) */ o.id, c.name
+		FROM orders_sharded o
+		JOIN customers_sharded c ON o.company_id = c.company_id
+		WHERE o.company_id = 42
+		ORDER BY o.id`).Rows()
+	require.Equal(t, 2, len(rows), "TC-TIKV-JOIN-02: expected 2 rows for company_id=42")
+	require.Equal(t, "1", rows[0][0], "TC-TIKV-JOIN-02: row 0 id should be 1")
+	require.Equal(t, "Acme", rows[0][1], "TC-TIKV-JOIN-02: row 0 name should be Acme")
+	require.Equal(t, "2", rows[1][0], "TC-TIKV-JOIN-02: row 1 id should be 2")
+	// Log plan so we can observe whether INL_JOIN hint was honoured
+	inlPlan := explainToStr(tk.MustQuery("EXPLAIN FORMAT='brief' SELECT /*+ INL_JOIN(c) */ o.id, c.name FROM orders_sharded o JOIN customers_sharded c ON o.company_id = c.company_id WHERE o.company_id = 42").Rows())
+	t.Logf("TC-TIKV-JOIN-02 plan (INL_JOIN hint): %s", inlPlan)
+
+	// TC-TIKV-JOIN-03: Hash Join between SST and non-sharded table.
+	// No pruning on orders_sharded (no shard key predicate); companies is build side.
+	plan = explainToStr(tk.MustQuery("EXPLAIN FORMAT='brief' SELECT o.id, o.amount, co.name FROM orders_sharded o JOIN companies co ON o.company_id = co.id").Rows())
+	require.Contains(t, plan, "HashJoin",
+		"TC-TIKV-JOIN-03: expected HashJoin; plan:\n"+plan)
+	tk.MustQuery(`SELECT o.id, o.amount, co.name
+		FROM orders_sharded o
+		JOIN companies co ON o.company_id = co.id
+		ORDER BY o.id`).Check(testkit.Rows(
+		"1 10.00 Acme Corp",
+		"2 20.00 Acme Corp",
+		"3 30.00 Globex Inc",
+	))
+
+	// TC-TIKV-JOIN-04: SPT-R joined to SST on shard key with pruning predicate.
+	// Both sides prune to company_id=42 shard. orders_range_sharded has no amount col.
+	tk.MustQuery(`SELECT o.id, r.id AS r_id
+		FROM orders_sharded o
+		JOIN orders_range_sharded r ON o.company_id = r.company_id
+		WHERE o.company_id = 42
+		ORDER BY o.id, r_id`).Check(testkit.Rows(
+		"1 1",
+		"2 1",
+	))
+	plan = explainToStr(tk.MustQuery("EXPLAIN FORMAT='brief' SELECT o.id, r.id FROM orders_sharded o JOIN orders_range_sharded r ON o.company_id = r.company_id WHERE o.company_id = 42").Rows())
+	t.Logf("TC-TIKV-JOIN-04 plan (shard pruning on both sides): %s", plan)
+
+	// TC-TIKV-JOIN-05: FULL OUTER JOIN is not supported by TiDB's parser.
+	// Both TiFlash MPP (TC-MPP-JOIN-03) and TiKV reject this syntax at parse time.
+	// The test documents the behavior: parser returns a syntax error, no fallback path exists.
+	err := tk.ExecToErr(`SELECT o.id, c.name
+		FROM orders_sharded o
+		FULL OUTER JOIN customers_sharded c ON o.company_id = c.company_id
+		ORDER BY o.id, c.name`)
+	require.Error(t, err, "TC-TIKV-JOIN-05: FULL OUTER JOIN must be rejected by parser")
+	require.Contains(t, err.Error(), "You have an error in your SQL syntax",
+		"TC-TIKV-JOIN-05: expected syntax error for FULL OUTER JOIN; got: %v", err)
+
+	// TC-TIKV-JOIN-06: Self-join on sharded table with shard key predicate.
+	// Pruning applies to both sides (same shard); result is pairs within company_id=42.
+	tk.MustQuery(`SELECT a.id, b.id AS b_id
+		FROM orders_sharded a
+		JOIN orders_sharded b ON a.company_id = b.company_id AND a.id < b.id
+		WHERE a.company_id = 42
+		ORDER BY a.id, b_id`).Check(testkit.Rows("1 2"))
+
+	// Reset
+	tk.MustExec("set @@session.tidb_isolation_read_engines = 'tikv,tiflash'")
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
