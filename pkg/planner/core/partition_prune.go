@@ -46,14 +46,10 @@ func PartitionPruning(ctx base.PlanContext, tbl table.PartitionedTable, conds []
 				if origPI.Type == model.PartitionTypeList {
 					return pruneShardedListPartitionDynamic(ctx, s, tbl, flatPI, origPI, tblInfo, conds, partitionNames, columns)
 				}
-				// RANGE/HASH partitioned+sharded: shard-slot pruning over the flat PI.
-				// We cannot do logical RANGE/HASH pruning without a proper PartitionExpr bound
-				// to the original PI, so conservatively scan all shards within the matched slots.
-				rangeOr, err := s.pruneShardKeyPartition(ctx, flatPI, tblInfo, conds, columns)
-				if err != nil {
-					return nil, err
-				}
-				return s.convertToIntSlice(rangeOr, flatPI, partitionNames), nil
+				// RANGE/HASH/KEY partitioned+sharded: shard-slot pruning over all logical partitions.
+				// RANGE pruning by partition boundary is not possible here (needs PartitionExpr over
+				// original RANGE bounds), so we scan all logical partitions but restrict to matching shards.
+				return pruneShardedRangeOrHashDynamic(ctx, s, flatPI, tblInfo, conds, partitionNames, columns)
 			}
 		}
 		rangeOr, err := s.pruneShardKeyPartition(ctx, pi, tblInfo, conds, columns)

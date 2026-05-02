@@ -319,7 +319,15 @@ func (p *PointGetPlan) AccessObject() base.AccessObject {
 			res.Partitions = []string{"dual"}
 		} else {
 			if pi := p.TblInfo.GetPartitionInfo(); pi != nil {
-				res.Partitions = []string{pi.Definitions[idx].Name.O}
+				// For partitioned+sharded tables, PartitionIdx is a flat shard index
+				// (partIdx*shardCnt + shardSlot). Map back to the logical partition.
+				logicalIdx := idx
+				if ski := p.TblInfo.ShardKeyInfo; ski != nil && ski.ShardCnt > 0 && idx >= len(pi.Definitions) {
+					logicalIdx = idx / ski.ShardCnt
+				}
+				if logicalIdx >= 0 && logicalIdx < len(pi.Definitions) {
+					res.Partitions = []string{pi.Definitions[logicalIdx].Name.O}
+				}
 			}
 		}
 	}

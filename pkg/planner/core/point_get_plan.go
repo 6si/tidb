@@ -344,7 +344,15 @@ func (p *PointGetPlan) LoadTableStats(ctx sessionctx.Context) {
 			return
 		}
 		if pi := p.TblInfo.GetPartitionInfo(); pi != nil {
-			tableID = pi.Definitions[*idx].ID
+			logicalIdx := *idx
+			// For partitioned+sharded tables, PartitionIdx is a flat shard index
+			// (partIdx*shardCnt + shardSlot). Map back to the logical partition.
+			if ski := p.TblInfo.ShardKeyInfo; ski != nil && ski.ShardCnt > 0 && logicalIdx >= len(pi.Definitions) {
+				logicalIdx = logicalIdx / ski.ShardCnt
+			}
+			if logicalIdx >= 0 && logicalIdx < len(pi.Definitions) {
+				tableID = pi.Definitions[logicalIdx].ID
+			}
 		}
 	}
 	loadTableStats(ctx, p.TblInfo, tableID)
@@ -1501,6 +1509,12 @@ func tryPointGetPlan(ctx base.PlanContext, selStmt *ast.SelectStmt, resolveCtx *
 			selStmt.TableHints,
 			tblName.IndexHints,
 		) {
+		// For sharded tables the shard key must be present in the predicate so we can
+		// route to the correct physical shard. Without it we cannot do a PointGet —
+		// fall back to a table scan that covers all shards.
+		if ski := tbl.ShardKeyInfo; ski != nil && !shardKeyInPairs(ski.Columns, pairs) {
+			return nil
+		}
 		if isTableDual {
 			p := newPointGetPlan(ctx, tblName.Schema.O, schema, tbl, names)
 			p.IsTableDual = true
@@ -1595,6 +1609,10 @@ func checkTblIndexForPointPlan(ctx base.PlanContext, tblName *resolve.TableNameW
 				continue
 			}
 		}
+		// For sharded tables, skip PointGet if the shard key is not in the predicate.
+		if ski := tbl.ShardKeyInfo; ski != nil && !shardKeyInPairs(ski.Columns, pairs) {
+			continue
+		}
 		p := newPointGetPlan(ctx, dbName, schema, tbl, names)
 		p.IndexInfo = idxInfo
 		p.IndexValues = idxValues
@@ -1604,6 +1622,23 @@ func checkTblIndexForPointPlan(ctx base.PlanContext, tblName *resolve.TableNameW
 		return p
 	}
 	return nil
+}
+
+// shardKeyInPairs returns true if all shard key columns appear in the name-value pairs.
+func shardKeyInPairs(shardCols []string, pairs []nameValuePair) bool {
+	for _, col := range shardCols {
+		found := false
+		for _, p := range pairs {
+			if p.colName == col {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // indexIsAvailableByHints checks whether this index is filtered by these specified index hints.
