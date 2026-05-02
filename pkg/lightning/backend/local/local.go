@@ -959,13 +959,20 @@ func splitRangeBySizeProps(fullRange common.Range, sizeProps *sizeProperties, si
 	return ranges
 }
 
-// shardBoundarySplitKeys returns a record-prefix split key for each shard
+// shardBoundarySplitKeys returns a table-prefix split key for each shard
 // physical table ID in ski.ShardIDs. These are mandatory split points so each
 // shard gets its own TiKV region regardless of data size.
+//
+// We use GenTablePrefix (not GenTableRecordPrefix) so that the split boundary
+// is at the very start of the physical shard's key space. Using
+// GenTableRecordPrefix would create a tiny "gap" region covering only the
+// table-header area [GenTablePrefix(id), GenTableRecordPrefix(id)), which has
+// a non-record start_key. Older TiFlash proxy builds call FATAL on such
+// regions during PreHandleSnapshot. GenTablePrefix avoids the gap entirely.
 func shardBoundarySplitKeys(ski *model.ShardKeyInfo) [][]byte {
 	keys := make([][]byte, 0, len(ski.ShardIDs))
 	for _, physID := range ski.ShardIDs {
-		keys = append(keys, tablecodec.GenTableRecordPrefix(physID))
+		keys = append(keys, tablecodec.GenTablePrefix(physID))
 	}
 	return keys
 }
