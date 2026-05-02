@@ -543,6 +543,12 @@ func (w *worker) onTruncateTable(jobCtx *jobContext, job *model.Job) (ver int64,
 				job.State = model.JobStateCancelled
 				return ver, errors.Trace(e)
 			}
+		} else if ski := tblInfo.ShardKeyInfo; ski != nil && len(ski.ShardIDs) > 0 {
+			if e := infosync.ConfigureTiFlashPDForShardedTable(ski.ShardIDs, tblInfo.TiFlashReplica.Count, &tblInfo.TiFlashReplica.LocationLabels); e != nil {
+				logutil.DDLLogger().Error("ConfigureTiFlashPDForShardedTable fails", zap.Error(err))
+				job.State = model.JobStateCancelled
+				return ver, errors.Trace(e)
+			}
 		} else {
 			if e := infosync.ConfigureTiFlashPDForTable(args.NewTableID, tblInfo.TiFlashReplica.Count, &tblInfo.TiFlashReplica.LocationLabels); e != nil {
 				logutil.DDLLogger().Error("ConfigureTiFlashPDForTable fails", zap.Error(err))
@@ -1128,6 +1134,13 @@ func (w *worker) onSetTableFlashReplica(jobCtx *jobContext, job *model.Job) (ver
 		}
 		// Partitions that in adding mid-state. They have high priorities, so we should set accordingly pd rules.
 		if e := infosync.ConfigureTiFlashPDForPartitions(true, &pi.AddingDefinitions, replicaInfo.Count, &replicaInfo.Labels, tblInfo.ID); e != nil {
+			job.State = model.JobStateCancelled
+			return ver, errors.Trace(e)
+		}
+	} else if ski := tblInfo.ShardKeyInfo; ski != nil && len(ski.ShardIDs) > 0 {
+		// SST: tblInfo.Partition is nil in meta — physical shard IDs live in ShardKeyInfo.ShardIDs.
+		logutil.DDLLogger().Info("Set TiFlash replica pd rule for sharded table", zap.Int64("tableID", tblInfo.ID), zap.Int64s("shardIDs", ski.ShardIDs))
+		if e := infosync.ConfigureTiFlashPDForShardedTable(ski.ShardIDs, replicaInfo.Count, &replicaInfo.Labels); e != nil {
 			job.State = model.JobStateCancelled
 			return ver, errors.Trace(e)
 		}
