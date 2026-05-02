@@ -41,6 +41,7 @@ import (
 	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/stretchr/testify/require"
+	pdhttp "github.com/tikv/pd/client/http"
 )
 
 // ---------------------------------------------------------------------------
@@ -1788,6 +1789,54 @@ func TestTiFlashPlacementRulesShardedTable(t *testing.T) {
 	_, baseHasRule := rules[baseRuleID]
 	require.False(t, baseHasRule,
 		"base table rule %q should not be emitted for SST — shards cover all data", baseRuleID)
+
+	// --- SPT case ---
+	// Specifically assert shardIDs[1]..[3] get rules (the ones the original bug was missing).
+	tiflash.Lock()
+	tiflash.GlobalTiFlashPlacementRules = make(map[string]*pdhttp.Rule)
+	tiflash.Unlock()
+
+	tk.MustExec(`CREATE TABLE orders_spt (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		created_at DATE NOT NULL,
+		PRIMARY KEY (id, created_at)
+	) SHARD BY (company_id) SHARDS 4
+	PARTITION BY RANGE COLUMNS (created_at) (
+		PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
+		PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+		PARTITION pmax  VALUES LESS THAN (MAXVALUE)
+	)`)
+
+	tblSPT, err2 := dom.InfoSchema().TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("orders_spt"))
+	require.NoError(t, err2)
+	pi := tblSPT.Meta().GetPartitionInfo()
+	require.NotNil(t, pi, "SPT must have a PartitionInfo")
+	require.Len(t, pi.Definitions, 3, "expected 3 range partitions")
+	for i, def := range pi.Definitions {
+		require.Len(t, def.ShardIDs, 4, "partition %d must have 4 shard IDs", i)
+	}
+
+	tk.MustExec("ALTER TABLE orders_spt SET TIFLASH REPLICA 1")
+
+	tiflash.Lock()
+	sptRules := tiflash.GlobalTiFlashPlacementRules
+	tiflash.Unlock()
+
+	// Every per-partition shard sub-ID must have a rule — 3 partitions × 4 shards = 12 rules.
+	for i, def := range pi.Definitions {
+		for j, shardID := range def.ShardIDs {
+			ruleID := infosync.MakeRuleID(shardID)
+			_, ok := sptRules[ruleID]
+			require.True(t, ok,
+				"SPT: placement rule %q missing for partition %d shard[%d]=%d", ruleID, i, j, shardID)
+		}
+		// Logical partition ID must NOT have a rule — data lives in sub-shards.
+		logicRuleID := infosync.MakeRuleID(def.ID)
+		_, logicHasRule := sptRules[logicRuleID]
+		require.False(t, logicHasRule,
+			"SPT: logical partition rule %q should not be emitted when ShardIDs are set", logicRuleID)
+	}
 }
 
 // TestTiKVCoprocessorJoins covers §24 — joins on sharded tables executed via TiKV
