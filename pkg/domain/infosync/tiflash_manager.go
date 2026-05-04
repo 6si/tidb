@@ -66,6 +66,9 @@ type TiFlashReplicaManager interface {
 	GetStoresStat(ctx context.Context) (*pd.StoresInfo, error)
 	// CalculateTiFlashProgress calculates TiFlash replica progress
 	CalculateTiFlashProgress(tableID int64, replicaCount uint64, TiFlashStores map[int64]pd.StoreInfo) (float64, error)
+	// CalculateTiFlashProgressForShards calculates TiFlash replica progress for a set of shard sub-IDs.
+	// Used for SHARD BY + PARTITION BY tables where data regions live under shard sub-IDs, not the logical partition ID.
+	CalculateTiFlashProgressForShards(shardIDs []int64, replicaCount uint64, TiFlashStores map[int64]pd.StoreInfo) (float64, error)
 	// UpdateTiFlashProgressCache updates tiflashProgressCache
 	UpdateTiFlashProgressCache(tableID int64, progress float64)
 	// GetTiFlashProgressFromCache gets tiflash replica progress from tiflashProgressCache
@@ -150,6 +153,40 @@ func calculateTiFlashProgress(keyspaceID tikv.KeyspaceID, tableID int64, replica
 	return progress, nil
 }
 
+// calculateTiFlashProgressForShards aggregates region and peer counts across a list of shard sub-IDs.
+// Required for SHARD BY + PARTITION BY tables: PD placement rules and data regions are registered
+// under physical shard sub-IDs (p.ShardIDs), not the logical partition ID, so querying the logical
+// partition ID returns 0 regions and stalls progress at 0.
+func calculateTiFlashProgressForShards(keyspaceID tikv.KeyspaceID, shardIDs []int64, replicaCount uint64, tiFlashStores map[int64]pd.StoreInfo) (float64, error) {
+	var totalRegionCount int
+	for _, shardID := range shardIDs {
+		var cnt int
+		if err := GetTiFlashRegionCountFromPD(context.Background(), shardID, &cnt); err != nil {
+			logutil.BgLogger().Warn("Fail to get regionCount from PD for shard.", zap.Int64("shardID", shardID))
+			return 0, errors.Trace(err)
+		}
+		totalRegionCount += cnt
+	}
+	if totalRegionCount == 0 {
+		logutil.BgLogger().Warn("region count from PD is 0 across all shard IDs.", zap.Int("shardCount", len(shardIDs)))
+		return 0, fmt.Errorf("region count getting from PD is 0")
+	}
+	var totalPeerCount int
+	for _, shardID := range shardIDs {
+		cnt, err := getTiFlashPeerWithoutLagCount(tiFlashStores, keyspaceID, shardID)
+		if err != nil {
+			logutil.BgLogger().Error("Fail to get peer count from TiFlash for shard.", zap.Int64("shardID", shardID))
+			return 0, errors.Trace(err)
+		}
+		totalPeerCount += cnt
+	}
+	progress := float64(totalPeerCount) / float64(totalRegionCount*int(replicaCount))
+	if progress > 1 {
+		progress = 1
+	}
+	return progress, nil
+}
+
 func encodeRule(c tikv.Codec, rule *pd.Rule) {
 	rule.StartKey, rule.EndKey = c.EncodeRange(rule.StartKey, rule.EndKey)
 	rule.ID = encodeRuleID(c, rule.ID)
@@ -169,6 +206,12 @@ func encodeRuleID(c tikv.Codec, ruleID string) string {
 // CalculateTiFlashProgress calculates TiFlash replica progress.
 func (m *TiFlashReplicaManagerCtx) CalculateTiFlashProgress(tableID int64, replicaCount uint64, tiFlashStores map[int64]pd.StoreInfo) (float64, error) {
 	return calculateTiFlashProgress(m.codec.GetKeyspaceID(), tableID, replicaCount, tiFlashStores)
+}
+
+// CalculateTiFlashProgressForShards aggregates region count and peer count across all shard sub-IDs
+// to produce a single progress value for SHARD BY + PARTITION BY tables.
+func (m *TiFlashReplicaManagerCtx) CalculateTiFlashProgressForShards(shardIDs []int64, replicaCount uint64, tiFlashStores map[int64]pd.StoreInfo) (float64, error) {
+	return calculateTiFlashProgressForShards(m.codec.GetKeyspaceID(), shardIDs, replicaCount, tiFlashStores)
 }
 
 // SyncTiFlashTableSchema syncs the table's schema to TiFlash.
@@ -762,6 +805,11 @@ func (*mockTiFlashReplicaManagerCtx) SyncTiFlashTableSchema(_ int64, _ []pd.Stor
 // CalculateTiFlashProgress return truncated string to avoid float64 comparison.
 func (*mockTiFlashReplicaManagerCtx) CalculateTiFlashProgress(tableID int64, replicaCount uint64, tiFlashStores map[int64]pd.StoreInfo) (float64, error) {
 	return calculateTiFlashProgress(tikv.NullspaceID, tableID, replicaCount, tiFlashStores)
+}
+
+// CalculateTiFlashProgressForShards aggregates progress across shard sub-IDs.
+func (*mockTiFlashReplicaManagerCtx) CalculateTiFlashProgressForShards(shardIDs []int64, replicaCount uint64, tiFlashStores map[int64]pd.StoreInfo) (float64, error) {
+	return calculateTiFlashProgressForShards(tikv.NullspaceID, shardIDs, replicaCount, tiFlashStores)
 }
 
 // UpdateTiFlashProgressCache updates tiflashProgressCache
