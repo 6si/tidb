@@ -131,9 +131,9 @@ func preSplitPhysicalTableByShardRowID(ctx context.Context, store kv.SplittableS
 	return regionIDs
 }
 
-// SplitRecordRegion is to split region in store by table prefix.
+// SplitRecordRegion is to split region in store at the record prefix boundary of the table.
 func SplitRecordRegion(ctx context.Context, store kv.SplittableStore, physicalTableID, tableID int64, scatterScope string) uint64 {
-	tableStartKey := tablecodec.GenTablePrefix(physicalTableID)
+	tableStartKey := tablecodec.GenTableRecordPrefix(physicalTableID)
 	scatter, tID := getScatterConfig(scatterScope, tableID)
 	regionIDs, err := store.SplitRegions(ctx, [][]byte{tableStartKey}, scatter, &tID)
 	if err != nil {
