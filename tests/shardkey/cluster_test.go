@@ -24,27 +24,45 @@ const (
 // is unreachable the test is skipped.
 func clusterDB(t *testing.T) *sql.DB {
 	t.Helper()
-	dsn := fmt.Sprintf("%s?timeout=%s&parseTime=true", clusterDSN, dialTimeout)
-	db, err := sql.Open("mysql", dsn)
+	// Use a root connection (no db selected) to create/drop the test database.
+	rootDSN := fmt.Sprintf("%s?timeout=%s&parseTime=true", clusterDSN, dialTimeout)
+	rootDB, err := sql.Open("mysql", rootDSN)
 	if err != nil {
 		t.Skipf("cluster unreachable: %v", err)
+	}
+	if err := rootDB.Ping(); err != nil {
+		rootDB.Close()
+		t.Skipf("cluster unreachable: %v", err)
+	}
+	if _, err = rootDB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s", clusterTestDB)); err != nil {
+		rootDB.Close()
+		t.Fatalf("drop db: %v", err)
+	}
+	if _, err = rootDB.Exec(fmt.Sprintf("CREATE DATABASE %s", clusterTestDB)); err != nil {
+		rootDB.Close()
+		t.Fatalf("create db: %v", err)
+	}
+	rootDB.Close()
+
+	// Re-open with the test database in the DSN so every connection in the pool
+	// targets the right database regardless of which connection is picked.
+	dbDSN := fmt.Sprintf("%s%s?timeout=%s&parseTime=true", clusterDSN, clusterTestDB, dialTimeout)
+	db, err := sql.Open("mysql", dbDSN)
+	if err != nil {
+		t.Fatalf("open db connection: %v", err)
 	}
 	db.SetConnMaxLifetime(30 * time.Second)
 	if err := db.Ping(); err != nil {
 		db.Close()
-		t.Skipf("cluster unreachable: %v", err)
+		t.Fatalf("ping db: %v", err)
 	}
 
-	_, err = db.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s", clusterTestDB))
-	require.NoError(t, err)
-	_, err = db.Exec(fmt.Sprintf("CREATE DATABASE %s", clusterTestDB))
-	require.NoError(t, err)
-	_, err = db.Exec(fmt.Sprintf("USE %s", clusterTestDB))
-	require.NoError(t, err)
-
 	t.Cleanup(func() {
-		db.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s", clusterTestDB))
 		db.Close()
+		if cleanupDB, err2 := sql.Open("mysql", rootDSN); err2 == nil {
+			cleanupDB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s", clusterTestDB))
+			cleanupDB.Close()
+		}
 	})
 	return db
 }
