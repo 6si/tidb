@@ -474,6 +474,16 @@ const (
 	// TiFlashQuerySpillRatio is the threshold that TiFlash will trigger auto spill when the memory usage is above this percentage
 	TiFlashQuerySpillRatio = "tiflash_query_spill_ratio"
 
+	// TiDBTiFlashEncodedOperations enables dictionary-encoded operations in TiFlash.
+	// When enabled, TiFlash can use dictionary encoding for low-cardinality columns
+	// and operate directly on encoded data for filter, group-by, and join operations.
+	TiDBTiFlashEncodedOperations = "tidb_tiflash_encoded_operations"
+
+	// TiDBTiFlashDictEncodingMaxCardinality sets the max cardinality threshold for
+	// dictionary encoding in TiFlash. Columns with more distinct values than this
+	// threshold will not use dictionary encoding.
+	TiDBTiFlashDictEncodingMaxCardinality = "tidb_tiflash_dict_encoding_max_cardinality"
+
 	// TiDBMPPStoreFailTTL is the unavailable time when a store is detected failed. During that time, tidb will not send any task to
 	// TiFlash even though the failed TiFlash node has been recovered.
 	TiDBMPPStoreFailTTL = "tidb_mpp_store_fail_ttl"
@@ -1391,10 +1401,12 @@ const (
 	DefTiDBAllowTiFlashCop                  = false
 	DefTiDBHashExchangeWithNewCollation     = true
 	DefTiDBEnforceMPPExecution              = false
-	DefTiFlashMaxThreads                    = -1
-	DefTiFlashMaxBytesBeforeExternalJoin    = -1
-	DefTiFlashMaxBytesBeforeExternalGroupBy = -1
-	DefTiFlashMaxBytesBeforeExternalSort    = -1
+	DefTiFlashMaxThreads                        = -1
+	DefTiFlashMaxBytesBeforeExternalJoin        = -1
+	DefTiFlashMaxBytesBeforeExternalGroupBy     = -1
+	DefTiFlashMaxBytesBeforeExternalSort        = -1
+	DefTiFlashEncodedOperations                 = false
+	DefTiFlashDictEncodingMaxCardinality        = 4096
 	DefTiFlashMemQuotaQueryPerNode          = 0
 	DefTiFlashQuerySpillRatio               = 0.7
 	DefTiDBEnableTiFlashPipelineMode        = true

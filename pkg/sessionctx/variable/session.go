@@ -989,6 +989,14 @@ type SessionVars struct {
 	// TiFlashQuerySpillRatio is the percentage threshold to trigger auto spill in TiFlash if TiFlashMaxQueryMemoryPerNode is set
 	TiFlashQuerySpillRatio float64
 
+	// TiFlashEncodedOperations enables dictionary-encoded operations in TiFlash.
+	// When enabled, TiFlash will use dictionary encoding for low-cardinality columns
+	// and can operate directly on encoded data.
+	TiFlashEncodedOperations bool
+
+	// TiFlashDictEncodingMaxCardinality sets the max distinct values threshold for dictionary encoding.
+	TiFlashDictEncodingMaxCardinality int64
+
 	// TiDBAllowAutoRandExplicitInsert indicates whether explicit insertion on auto_random column is allowed.
 	AllowAutoRandExplicitInsert bool
 
