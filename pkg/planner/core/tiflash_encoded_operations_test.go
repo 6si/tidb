@@ -69,3 +69,145 @@ func TestEncodedOperationHintStruct(t *testing.T) {
 	require.Contains(t, hint.DictEligibleColumnIDs, int64(2))
 	require.Contains(t, hint.DictEligibleColumnIDs, int64(3))
 }
+
+func TestBuildEncodedGroupByHintDisabled(t *testing.T) {
+	vars := &variable.SessionVars{
+		TiFlashEncodedOperations: false,
+	}
+	result := BuildEncodedGroupByHint(vars, []int64{1}, []string{"sum"}, []int64{2}, map[int64]int64{1: 50})
+	require.Nil(t, result)
+}
+
+func TestBuildEncodedGroupByHintLowCardinality(t *testing.T) {
+	vars := &variable.SessionVars{
+		TiFlashEncodedOperations:          true,
+		TiFlashDictEncodingMaxCardinality: 4096,
+	}
+	columnNDVs := map[int64]int64{1: 50, 2: 100}
+	result := BuildEncodedGroupByHint(vars, []int64{1}, []string{"sum", "count"}, []int64{2, 0}, columnNDVs)
+	require.NotNil(t, result)
+	require.True(t, result.CanUseEncodedPath)
+	require.Equal(t, int64(50), result.EstimatedGroups)
+	require.Equal(t, []int64{1}, result.GroupByColumnIDs)
+}
+
+func TestBuildEncodedGroupByHintHighCardinality(t *testing.T) {
+	vars := &variable.SessionVars{
+		TiFlashEncodedOperations:          true,
+		TiFlashDictEncodingMaxCardinality: 4096,
+	}
+	columnNDVs := map[int64]int64{1: 10000} // Too many groups
+	result := BuildEncodedGroupByHint(vars, []int64{1}, []string{"sum"}, []int64{2}, columnNDVs)
+	require.Nil(t, result)
+}
+
+func TestBuildEncodedGroupByHintCompositeKey(t *testing.T) {
+	vars := &variable.SessionVars{
+		TiFlashEncodedOperations:          true,
+		TiFlashDictEncodingMaxCardinality: 4096,
+	}
+	// Two columns: NDV 50 * 80 = 4000 < 4096 → feasible
+	columnNDVs := map[int64]int64{1: 50, 2: 80}
+	result := BuildEncodedGroupByHint(vars, []int64{1, 2}, []string{"sum"}, []int64{3}, columnNDVs)
+	require.NotNil(t, result)
+	require.True(t, result.CanUseEncodedPath)
+	require.Equal(t, int64(4000), result.EstimatedGroups)
+}
+
+func TestBuildEncodedGroupByHintCompositeKeyTooLarge(t *testing.T) {
+	vars := &variable.SessionVars{
+		TiFlashEncodedOperations:          true,
+		TiFlashDictEncodingMaxCardinality: 4096,
+	}
+	// Two columns: NDV 100 * 100 = 10000 > 4096 → not feasible
+	columnNDVs := map[int64]int64{1: 100, 2: 100}
+	result := BuildEncodedGroupByHint(vars, []int64{1, 2}, []string{"sum"}, []int64{3}, columnNDVs)
+	require.Nil(t, result)
+}
+
+func TestBuildEncodedStarJoinHintDisabled(t *testing.T) {
+	vars := &variable.SessionVars{
+		TiFlashEncodedOperations: false,
+	}
+	dims := []DimensionJoinInfo{{IsManyToOne: true, EstimatedDimSize: 100}}
+	result := BuildEncodedStarJoinHint(vars, 1, dims, true)
+	require.Nil(t, result)
+}
+
+func TestBuildEncodedStarJoinHintValid(t *testing.T) {
+	vars := &variable.SessionVars{
+		TiFlashEncodedOperations:          true,
+		TiFlashDictEncodingMaxCardinality: 4096,
+	}
+	dims := []DimensionJoinInfo{
+		{DimensionTableID: 2, FactJoinColumnID: 10, DimJoinColumnID: 1, IsManyToOne: true, EstimatedDimSize: 500},
+		{DimensionTableID: 3, FactJoinColumnID: 11, DimJoinColumnID: 1, IsManyToOne: true, EstimatedDimSize: 100},
+	}
+	result := BuildEncodedStarJoinHint(vars, 1, dims, true)
+	require.NotNil(t, result)
+	require.True(t, result.CanUseFusedPath)
+	require.True(t, result.HasGroupByAbove)
+	require.Len(t, result.DimensionJoins, 2)
+}
+
+func TestBuildEncodedStarJoinHintNoGroupBy(t *testing.T) {
+	vars := &variable.SessionVars{
+		TiFlashEncodedOperations:          true,
+		TiFlashDictEncodingMaxCardinality: 4096,
+	}
+	dims := []DimensionJoinInfo{
+		{IsManyToOne: true, EstimatedDimSize: 100},
+	}
+	// No GROUP BY above → not suitable for fused path
+	result := BuildEncodedStarJoinHint(vars, 1, dims, false)
+	require.Nil(t, result)
+}
+
+func TestBuildEncodedStarJoinHintLargeDimension(t *testing.T) {
+	vars := &variable.SessionVars{
+		TiFlashEncodedOperations:          true,
+		TiFlashDictEncodingMaxCardinality: 4096,
+	}
+	dims := []DimensionJoinInfo{
+		{IsManyToOne: true, EstimatedDimSize: 200000}, // Too large
+	}
+	result := BuildEncodedStarJoinHint(vars, 1, dims, true)
+	require.Nil(t, result)
+}
+
+func TestBuildEncodedStarJoinHintNotManyToOne(t *testing.T) {
+	vars := &variable.SessionVars{
+		TiFlashEncodedOperations:          true,
+		TiFlashDictEncodingMaxCardinality: 4096,
+	}
+	dims := []DimensionJoinInfo{
+		{IsManyToOne: false, EstimatedDimSize: 100}, // Not many-to-one
+	}
+	result := BuildEncodedStarJoinHint(vars, 1, dims, true)
+	require.Nil(t, result)
+}
+
+func TestEncodedFilterHintStruct(t *testing.T) {
+	hint := &EncodedFilterHint{
+		ColumnID:          5,
+		FilterType:        "eq",
+		CanUseEncodedPath: true,
+	}
+	require.Equal(t, int64(5), hint.ColumnID)
+	require.Equal(t, "eq", hint.FilterType)
+	require.True(t, hint.CanUseEncodedPath)
+}
+
+func TestDimensionJoinInfoStruct(t *testing.T) {
+	info := DimensionJoinInfo{
+		DimensionTableID: 10,
+		FactJoinColumnID: 20,
+		DimJoinColumnID:  1,
+		DimGroupColumnID: 2,
+		EstimatedDimSize: 5000,
+		IsManyToOne:      true,
+	}
+	require.Equal(t, int64(10), info.DimensionTableID)
+	require.Equal(t, int64(20), info.FactJoinColumnID)
+	require.True(t, info.IsManyToOne)
+}
