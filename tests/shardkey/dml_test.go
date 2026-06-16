@@ -27,14 +27,14 @@ func TestDML_ST_InsertAndSelect(t *testing.T) {
 
 func TestDML_SST_InsertAndCount(t *testing.T) {
 	tk, _ := setup(t)
-	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT, amount DECIMAL(12,2), PRIMARY KEY (id)) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2), PRIMARY KEY (company_id, id)) SHARD BY (company_id) SHARDS 4`)
 	tk.MustExec(`INSERT INTO orders_sharded VALUES (1, 42, 10.00), (2, 42, 20.00), (3, 99, 30.00)`)
 	tk.MustQuery(`SELECT COUNT(*) FROM orders_sharded`).Check([][]any{{"3"}})
 }
 
 func TestDML_SST_ShardPruningEquality(t *testing.T) {
 	tk, _ := setup(t)
-	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2), PRIMARY KEY (id)) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2), PRIMARY KEY (company_id, id)) SHARD BY (company_id) SHARDS 4`)
 	tk.MustExec(`INSERT INTO orders_sharded VALUES (1, 42, 10.00), (2, 42, 20.00), (3, 99, 30.00)`)
 
 	// Shard-key equality filter must prune to a single shard (not all)
@@ -46,7 +46,7 @@ func TestDML_SST_ShardPruningEquality(t *testing.T) {
 
 func TestDML_SST_FullScanTouchesAllShards(t *testing.T) {
 	tk, _ := setup(t)
-	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT, amount DECIMAL(12,2), PRIMARY KEY (id)) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2), PRIMARY KEY (company_id, id)) SHARD BY (company_id) SHARDS 4`)
 	tk.MustExec(`INSERT INTO orders_sharded VALUES (1, 42, 10.00), (2, 99, 20.00)`)
 
 	rows := tk.MustQuery(`EXPLAIN SELECT COUNT(*) FROM orders_sharded`).Rows()
@@ -55,15 +55,17 @@ func TestDML_SST_FullScanTouchesAllShards(t *testing.T) {
 }
 
 func TestDML_SST_NullShardKey(t *testing.T) {
+	// With the shard-key-must-be-in-PK constraint, shard key columns are always
+	// NOT NULL (PK columns cannot be NULL). Inserting NULL for the shard key
+	// should be rejected.
 	tk, _ := setup(t)
-	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT, amount DECIMAL(12,2), PRIMARY KEY (id)) SHARD BY (company_id) SHARDS 4`)
-	tk.MustExec(`INSERT INTO orders_sharded VALUES (10, NULL, 1.00)`)
-	tk.MustQuery(`SELECT id FROM orders_sharded WHERE company_id IS NULL`).Check([][]any{{"10"}})
+	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2), PRIMARY KEY (company_id, id)) SHARD BY (company_id) SHARDS 4`)
+	tk.MustContainErrMsg(`INSERT INTO orders_sharded VALUES (10, NULL, 1.00)`, "Column 'company_id' cannot be null")
 }
 
 func TestDML_SST_UpdateNonShardColumn(t *testing.T) {
 	tk, _ := setup(t)
-	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2), PRIMARY KEY (id)) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2), PRIMARY KEY (company_id, id)) SHARD BY (company_id) SHARDS 4`)
 	tk.MustExec(`INSERT INTO orders_sharded VALUES (1, 42, 10.00)`)
 	tk.MustQuery(`SELECT COUNT(*) FROM orders_sharded`).Check([][]any{{"1"}})
 	// Filter by shard key only — point lookups by non-shard-key columns use a different plan path
@@ -73,7 +75,7 @@ func TestDML_SST_UpdateNonShardColumn(t *testing.T) {
 
 func TestDML_SST_UpdateShardKeyCrossShardAtomic(t *testing.T) {
 	tk, _ := setup(t)
-	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2), PRIMARY KEY (id)) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2), PRIMARY KEY (company_id, id)) SHARD BY (company_id) SHARDS 4`)
 	tk.MustExec(`INSERT INTO orders_sharded VALUES (100, 1, 50.00)`)
 
 	// Update company_id to a value that may hash to a different shard
@@ -91,7 +93,7 @@ func TestDML_SST_UpdateShardKeyCrossShardAtomic(t *testing.T) {
 
 func TestDML_SST_UpdateShardKeyRollback(t *testing.T) {
 	tk, _ := setup(t)
-	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2), PRIMARY KEY (id)) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2), PRIMARY KEY (company_id, id)) SHARD BY (company_id) SHARDS 4`)
 	tk.MustExec(`INSERT INTO orders_sharded VALUES (100, 1, 50.00)`)
 
 	tk.MustExec(`BEGIN`)
@@ -105,7 +107,7 @@ func TestDML_SST_UpdateShardKeyRollback(t *testing.T) {
 
 func TestDML_SST_Delete(t *testing.T) {
 	tk, _ := setup(t)
-	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT, amount DECIMAL(12,2), PRIMARY KEY (id)) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2), PRIMARY KEY (company_id, id)) SHARD BY (company_id) SHARDS 4`)
 	tk.MustExec(`INSERT INTO orders_sharded VALUES (1, 42, 10.00), (2, 42, 20.00), (3, 99, 30.00)`)
 	tk.MustExec(`DELETE FROM orders_sharded WHERE id = 3`)
 	tk.MustQuery(`SELECT COUNT(*) FROM orders_sharded WHERE company_id = 99`).Check([][]any{{"0"}})
@@ -117,7 +119,7 @@ func TestDML_SST_Delete(t *testing.T) {
 
 func TestDML_SST_RowCountInvariant(t *testing.T) {
 	tk, _ := setup(t)
-	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT, val INT, PRIMARY KEY (id)) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL, company_id BIGINT NOT NULL, val INT, PRIMARY KEY (company_id, id)) SHARD BY (company_id) SHARDS 4`)
 
 	// Insert 1000 rows: 50 company_ids × 20 rows each
 	for i := 0; i < 50; i++ {
@@ -166,7 +168,7 @@ func TestDML_SPT_Range_InsertAndCount(t *testing.T) {
 	tk, _ := setup(t)
 	tk.MustExec(`CREATE TABLE orders_range_sharded (
 		id BIGINT NOT NULL, company_id BIGINT NOT NULL, created_at DATE NOT NULL,
-		PRIMARY KEY (id, created_at)
+		PRIMARY KEY (company_id, id, created_at)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY RANGE COLUMNS (created_at) (
 		PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
@@ -189,7 +191,7 @@ func TestDML_SPT_Range_PartitionFilter_CorrectResults(t *testing.T) {
 	tk, _ := setup(t)
 	tk.MustExec(`CREATE TABLE orders_range_sharded (
 		id BIGINT NOT NULL, company_id BIGINT NOT NULL, created_at DATE NOT NULL,
-		PRIMARY KEY (id, created_at)
+		PRIMARY KEY (company_id, id, created_at)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY RANGE COLUMNS (created_at) (
 		PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
@@ -209,7 +211,7 @@ func TestDML_SPT_Range_ShardOnlyFilter(t *testing.T) {
 	tk, _ := setup(t)
 	tk.MustExec(`CREATE TABLE orders_range_sharded (
 		id BIGINT NOT NULL, company_id BIGINT NOT NULL, created_at DATE NOT NULL,
-		PRIMARY KEY (id, created_at)
+		PRIMARY KEY (company_id, id, created_at)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY RANGE COLUMNS (created_at) (
 		PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
@@ -231,7 +233,7 @@ func TestDML_SPT_List_InsertAndBothPruning(t *testing.T) {
 	tk, _ := setup(t)
 	tk.MustExec(`CREATE TABLE orders_list_sharded (
 		id BIGINT NOT NULL, company_id BIGINT NOT NULL, region_id INT NOT NULL,
-		PRIMARY KEY (id, region_id)
+		PRIMARY KEY (company_id, id, region_id)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY LIST (region_id) (
 		PARTITION p_us   VALUES IN (1, 2, 3),
@@ -255,7 +257,7 @@ func TestDML_SPT_Hash_InsertAndShardPruning(t *testing.T) {
 	tk, _ := setup(t)
 	tk.MustExec(`CREATE TABLE orders_hash_sharded (
 		id BIGINT NOT NULL, company_id BIGINT NOT NULL, bucket_id BIGINT NOT NULL,
-		PRIMARY KEY (id, bucket_id)
+		PRIMARY KEY (company_id, id, bucket_id)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY HASH (bucket_id) PARTITIONS 4`)
 	tk.MustExec(`INSERT INTO orders_hash_sharded VALUES (1, 42, 10), (2, 42, 11), (3, 99, 10)`)
