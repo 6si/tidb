@@ -166,7 +166,7 @@ func TestDDL_SST_BasicCreate(t *testing.T) {
 		id         BIGINT NOT NULL AUTO_INCREMENT,
 		company_id BIGINT NOT NULL,
 		amount     DECIMAL(12,2),
-		PRIMARY KEY (id)
+		PRIMARY KEY (company_id, id)
 	) SHARD BY (company_id) SHARDS 4`)
 	mi := tableInfo(t, dom, "orders_sharded")
 	require.NotNil(t, mi.ShardKeyInfo)
@@ -191,7 +191,7 @@ func TestDDL_SST_MultiColumnShardKey(t *testing.T) {
 		company_id BIGINT NOT NULL,
 		user_id    BIGINT NOT NULL,
 		event_type VARCHAR(64),
-		PRIMARY KEY (id)
+		PRIMARY KEY (company_id, user_id, id)
 	) SHARD BY (company_id, user_id) SHARDS 8`)
 	mi := tableInfo(t, dom, "events_sharded")
 	require.NotNil(t, mi.ShardKeyInfo)
@@ -206,7 +206,7 @@ func TestDDL_SST_VarcharShardKey(t *testing.T) {
 		id          BIGINT NOT NULL,
 		tenant_code VARCHAR(32) NOT NULL,
 		data        TEXT,
-		PRIMARY KEY (id)
+		PRIMARY KEY (tenant_code, id)
 	) SHARD BY (tenant_code) SHARDS 4`)
 }
 
@@ -216,13 +216,13 @@ func TestDDL_SST_CharShardKey(t *testing.T) {
 		id   BIGINT NOT NULL,
 		code CHAR(3) NOT NULL,
 		name VARCHAR(128),
-		PRIMARY KEY (id)
+		PRIMARY KEY (code, id)
 	) SHARD BY (code) SHARDS 4`)
 }
 
 func TestDDL_SST_MinShards(t *testing.T) {
 	tk, dom := setup(t)
-	tk.MustExec(`CREATE TABLE t_shard_min (id BIGINT PRIMARY KEY, k BIGINT NOT NULL) SHARD BY (k) SHARDS 2`)
+	tk.MustExec(`CREATE TABLE t_shard_min (id BIGINT NOT NULL, k BIGINT NOT NULL, PRIMARY KEY (k, id)) SHARD BY (k) SHARDS 2`)
 	mi := tableInfo(t, dom, "t_shard_min")
 	require.Equal(t, 2, mi.ShardKeyInfo.ShardCnt)
 	require.Len(t, mi.Partition.Definitions, 2)
@@ -230,7 +230,7 @@ func TestDDL_SST_MinShards(t *testing.T) {
 
 func TestDDL_SST_MaxShards(t *testing.T) {
 	tk, dom := setup(t)
-	tk.MustExec(`CREATE TABLE t_shard_max (id BIGINT PRIMARY KEY, k BIGINT NOT NULL) SHARD BY (k) SHARDS 64`)
+	tk.MustExec(`CREATE TABLE t_shard_max (id BIGINT NOT NULL, k BIGINT NOT NULL, PRIMARY KEY (k, id)) SHARD BY (k) SHARDS 64`)
 	mi := tableInfo(t, dom, "t_shard_max")
 	require.Equal(t, 64, mi.ShardKeyInfo.ShardCnt)
 	require.Len(t, mi.Partition.Definitions, 64)
@@ -244,7 +244,7 @@ func TestDDL_SST_MaxShards(t *testing.T) {
 
 func TestDDL_SST_ShardNamesAreSequential(t *testing.T) {
 	tk, dom := setup(t)
-	tk.MustExec(`CREATE TABLE t_names (id BIGINT PRIMARY KEY, k BIGINT NOT NULL) SHARD BY (k) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE t_names (id BIGINT NOT NULL, k BIGINT NOT NULL, PRIMARY KEY (k, id)) SHARD BY (k) SHARDS 4`)
 	mi := tableInfo(t, dom, "t_names")
 	for i, def := range mi.Partition.Definitions {
 		require.Equal(t, pmodel.NewCIStr("shard_"+strings.TrimPrefix(def.Name.L, "shard_")), def.Name)
@@ -256,7 +256,7 @@ func TestDDL_SST_ShardNamesAreSequential(t *testing.T) {
 
 func TestDDL_SST_ShardIDsDoNotCollideWithTableID(t *testing.T) {
 	tk, dom := setup(t)
-	tk.MustExec(`CREATE TABLE t_ids (id BIGINT PRIMARY KEY, k BIGINT NOT NULL) SHARD BY (k) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE t_ids (id BIGINT NOT NULL, k BIGINT NOT NULL, PRIMARY KEY (k, id)) SHARD BY (k) SHARDS 4`)
 	mi := tableInfo(t, dom, "t_ids")
 	for _, def := range mi.Partition.Definitions {
 		require.NotEqual(t, mi.ID, def.ID, "shard ID must not equal table ID")
@@ -273,7 +273,7 @@ func TestDDL_SPT_Range(t *testing.T) {
 		id         BIGINT NOT NULL,
 		company_id BIGINT NOT NULL,
 		created_at DATE NOT NULL,
-		PRIMARY KEY (id, created_at)
+		PRIMARY KEY (company_id, id, created_at)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY RANGE COLUMNS (created_at) (
 		PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
@@ -303,7 +303,7 @@ func TestDDL_SPT_List(t *testing.T) {
 		id         BIGINT NOT NULL,
 		company_id BIGINT NOT NULL,
 		region_id  INT NOT NULL,
-		PRIMARY KEY (id, region_id)
+		PRIMARY KEY (company_id, id, region_id)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY LIST (region_id) (
 		PARTITION p_us   VALUES IN (1, 2, 3),
@@ -325,7 +325,7 @@ func TestDDL_SPT_ListColumns(t *testing.T) {
 		id         BIGINT NOT NULL,
 		company_id BIGINT NOT NULL,
 		country    VARCHAR(2) NOT NULL,
-		PRIMARY KEY (id, country)
+		PRIMARY KEY (company_id, id, country)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY LIST COLUMNS (country) (
 		PARTITION p_us VALUES IN ('US'),
@@ -347,7 +347,7 @@ func TestDDL_SPT_Hash(t *testing.T) {
 		id         BIGINT NOT NULL,
 		company_id BIGINT NOT NULL,
 		bucket_id  BIGINT NOT NULL,
-		PRIMARY KEY (id, bucket_id)
+		PRIMARY KEY (company_id, id, bucket_id)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY HASH (bucket_id) PARTITIONS 4`)
 	mi := tableInfo(t, dom, "orders_hash_sharded")
@@ -365,7 +365,7 @@ func TestDDL_SPT_Key(t *testing.T) {
 		id         BIGINT NOT NULL,
 		company_id BIGINT NOT NULL,
 		bucket_id  BIGINT NOT NULL,
-		PRIMARY KEY (id, bucket_id)
+		PRIMARY KEY (company_id, id, bucket_id)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY KEY (bucket_id) PARTITIONS 4`)
 	mi := tableInfo(t, dom, "orders_key_sharded")
@@ -556,7 +556,7 @@ func TestDDL_OK_DifferentPartitionAndShardColumns(t *testing.T) {
 		id         BIGINT NOT NULL,
 		company_id BIGINT NOT NULL,
 		ts         DATE NOT NULL,
-		PRIMARY KEY (id, ts)
+		PRIMARY KEY (company_id, id, ts)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY RANGE COLUMNS (ts) (
 		PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
@@ -578,7 +578,7 @@ func TestDDL_OK_DifferentPartitionAndShardColumns(t *testing.T) {
 func TestDDL_ALTER_NoAlterShardSyntax(t *testing.T) {
 	// TC-ALTER-01, TC-ALTER-02, TC-ALTER-03 — all should fail at parse level
 	tk, _ := setup(t)
-	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, company_id BIGINT) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE orders_sharded (id BIGINT NOT NULL AUTO_INCREMENT, company_id BIGINT NOT NULL, PRIMARY KEY (company_id, id)) SHARD BY (company_id) SHARDS 4`)
 	tk.MustContainErrMsg(`ALTER TABLE orders_sharded MODIFY SHARDS INTO 8 SHARDS`, "")
 	tk.MustContainErrMsg(`ALTER TABLE orders_sharded DROP SHARD_KEY`, "")
 	tk.MustContainErrMsg(`ALTER TABLE orders ADD SHARD BY (company_id) SHARDS 4`, "")
@@ -603,15 +603,19 @@ func TestDDL_EDGE_AllowedIntegerTypes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tk.MustExec("DROP TABLE IF EXISTS t_type_test")
-			tk.MustExec("CREATE TABLE t_type_test (id BIGINT PRIMARY KEY, k " + tc.colType + ") SHARD BY (k) SHARDS 4")
+			tk.MustExec("CREATE TABLE t_type_test (id BIGINT NOT NULL, k " + tc.colType + ", PRIMARY KEY (k, id)) SHARD BY (k) SHARDS 4")
 		})
 	}
 }
 
 func TestDDL_EDGE_TextShardKey(t *testing.T) {
-	// TC-EDGE-11: TEXT (non-binary) allowed
+	// TC-EDGE-11: TEXT columns cannot be part of the PK, so TEXT shard key
+	// is now rejected by the shard-key-must-be-in-PK constraint.
 	tk, _ := setup(t)
-	tk.MustExec(`CREATE TABLE t_text (id BIGINT PRIMARY KEY, k TEXT NOT NULL) SHARD BY (k) SHARDS 4`)
+	tk.MustGetDBError(
+		`CREATE TABLE t_text (id BIGINT PRIMARY KEY, k TEXT NOT NULL) SHARD BY (k) SHARDS 4`,
+		dbterror.ErrShardKeyNotInPrimaryKey,
+	)
 }
 
 // ---------------------------------------------------------------------------
@@ -652,7 +656,7 @@ func setupSPTListCols(t *testing.T) *testkit.TestKit {
 		id         BIGINT NOT NULL,
 		company_id BIGINT NOT NULL,
 		country    VARCHAR(2) NOT NULL,
-		PRIMARY KEY (id, country)
+		PRIMARY KEY (company_id, id, country)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY LIST COLUMNS (country) (
 		PARTITION p_us VALUES IN ('US'),
@@ -685,7 +689,7 @@ func TestDDL_ALTER_SPT_LC_AddPartitionPhysicalIDs(t *testing.T) {
 	// Re-create in this store to get dom access
 	tk2.MustExec(`CREATE TABLE orders_list_cols_sharded (
 		id BIGINT NOT NULL, company_id BIGINT NOT NULL, country VARCHAR(2) NOT NULL,
-		PRIMARY KEY (id, country)
+		PRIMARY KEY (company_id, id, country)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY LIST COLUMNS (country) (
 		PARTITION p_us VALUES IN ('US'), PARTITION p_au VALUES IN ('AU')
@@ -743,7 +747,7 @@ func TestDDL_ALTER_SPT_R_DropPartition(t *testing.T) {
 		id         BIGINT NOT NULL,
 		company_id BIGINT NOT NULL,
 		created_at DATE NOT NULL,
-		PRIMARY KEY (id, created_at)
+		PRIMARY KEY (company_id, id, created_at)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY RANGE COLUMNS (created_at) (
 		PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
@@ -871,4 +875,63 @@ func TestMeta_SPT_SelectPartitionReturnsCorrectRows(t *testing.T) {
 	for _, row := range rows {
 		require.Equal(t, "GB", row[0].(string))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// TC-DDL-PK: Shard key must be part of the primary key
+// ---------------------------------------------------------------------------
+
+func TestDDL_ERR_ShardKeyNotInPK(t *testing.T) {
+	// Shard key column not in PK → rejected at DDL time.
+	tk, _ := setup(t)
+	tk.MustGetDBError(
+		`CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, company_id BIGINT NOT NULL) SHARD BY (company_id) SHARDS 4`,
+		dbterror.ErrShardKeyNotInPrimaryKey,
+	)
+}
+
+func TestDDL_OK_ShardKeyInPK(t *testing.T) {
+	// Shard key column in PK → allowed.
+	tk, dom := setup(t)
+	tk.MustExec(`CREATE TABLE t (id BIGINT NOT NULL, company_id BIGINT NOT NULL, PRIMARY KEY (company_id, id)) SHARD BY (company_id) SHARDS 4`)
+	mi := tableInfo(t, dom, "t")
+	require.NotNil(t, mi.ShardKeyInfo)
+	require.Equal(t, []string{"company_id"}, mi.ShardKeyInfo.Columns)
+}
+
+func TestDDL_OK_MultiColumnShardKeyAllInPK(t *testing.T) {
+	// Multi-column shard key — all columns in PK → allowed.
+	tk, dom := setup(t)
+	tk.MustExec(`CREATE TABLE t (
+		id         BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		user_id    BIGINT NOT NULL,
+		PRIMARY KEY (company_id, user_id, id)
+	) SHARD BY (company_id, user_id) SHARDS 4`)
+	mi := tableInfo(t, dom, "t")
+	require.NotNil(t, mi.ShardKeyInfo)
+	require.Equal(t, []string{"company_id", "user_id"}, mi.ShardKeyInfo.Columns)
+}
+
+func TestDDL_ERR_MultiColumnShardKeyPartialPK(t *testing.T) {
+	// Multi-column shard key — only some columns in PK → rejected.
+	tk, _ := setup(t)
+	tk.MustGetDBError(
+		`CREATE TABLE t (
+			id         BIGINT NOT NULL,
+			company_id BIGINT NOT NULL,
+			user_id    BIGINT NOT NULL,
+			PRIMARY KEY (company_id, id)
+		) SHARD BY (company_id, user_id) SHARDS 4`,
+		dbterror.ErrShardKeyNotInPrimaryKey,
+	)
+}
+
+func TestDDL_ERR_NoPKWithShardKey(t *testing.T) {
+	// No explicit PK (implicit rowid) + SHARD BY → rejected.
+	tk, _ := setup(t)
+	tk.MustGetDBError(
+		`CREATE TABLE t (id BIGINT NOT NULL, company_id BIGINT NOT NULL) SHARD BY (company_id) SHARDS 4`,
+		dbterror.ErrShardKeyNotInPrimaryKey,
+	)
 }
