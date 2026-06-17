@@ -1418,7 +1418,9 @@ func TestCrossComponent_ShardedTable_WithTiFlash_EncodedJoin(t *testing.T) {
 
 	for i := 1; i <= 1000; i++ {
 		companyID := (i % 20) + 1
-		status := []string{"active", "inactive"}[i%2]
+		// Use (i-1)/20 as batch index to avoid correlation between i%20 (company) and i%2 (status).
+		// Each batch of 20 rows covers all companies; alternating batches flip status.
+		status := []string{"active", "inactive"}[((i-1)/20)%2]
 		mustExec(t, "INSERT INTO sharded_fact VALUES (?, ?, ?, ?)",
 			i, companyID, status, i*5)
 	}
