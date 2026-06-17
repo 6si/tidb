@@ -724,6 +724,8 @@ func NeedEnforceExchanger(mtp MPPPartitionType, mHashCols []*MPPPartitionColumn,
 	case SinglePartitionType:
 		return mtp != SinglePartitionType
 	default:
+		// Shard key optimization is checked at the caller (EnforceExchanger)
+		// since it requires access to the plan tree for table info.
 		if mtp != HashType {
 			return true
 		}

@@ -2849,6 +2849,15 @@ func convertToPointGet(ds *logicalop.DataSource, prop *property.PhysicalProperty
 		return base.InvalidTask
 	}
 
+	// For sharded tables, a PointGet can only be used if the shard key columns appear in
+	// the access conditions. Without the shard key we cannot determine the correct physical
+	// shard, so we must fall back to a full scan.
+	if ski := ds.TableInfo.ShardKeyInfo; ski != nil {
+		if !shardKeyInAccessConds(ski.Columns, candidate.path.AccessConds) {
+			return base.InvalidTask
+		}
+	}
+
 	accessCnt := math.Min(candidate.path.CountAfterAccess, float64(1))
 	pointGetPlan := &physicalop.PointGetPlan{
 		AccessConditions: candidate.path.AccessConds,
@@ -2911,6 +2920,29 @@ func convertToPointGet(ds *logicalop.DataSource, prop *property.PhysicalProperty
 	}
 
 	return rTsk
+}
+
+// shardKeyInAccessConds returns true if all shard key columns appear in the access
+// conditions. Used to block PointGet on sharded tables when the shard key is absent
+// from the predicate (would route to wrong shard).
+func shardKeyInAccessConds(shardCols []string, accessConds []expression.Expression) bool {
+	coveredCols := make(map[string]struct{}, len(shardCols))
+	for _, cond := range accessConds {
+		for _, col := range expression.ExtractColumns(cond) {
+			lowerName := strings.ToLower(col.OrigName)
+			// OrigName may be "db.tbl.col" — take the last component.
+			if idx := strings.LastIndex(lowerName, "."); idx >= 0 {
+				lowerName = lowerName[idx+1:]
+			}
+			coveredCols[lowerName] = struct{}{}
+		}
+	}
+	for _, col := range shardCols {
+		if _, ok := coveredCols[strings.ToLower(col)]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func convertToBatchPointGet(ds *logicalop.DataSource, prop *property.PhysicalProperty, candidate *candidatePath) base.Task {

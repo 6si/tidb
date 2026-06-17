@@ -5986,7 +5986,15 @@ func partitionPruning(ctx sessionctx.Context, tbl table.PartitionedTable, planPa
 		return nil, err
 	}
 
+	// For partitioned+sharded tables, use the flat synthetic PI (one entry per physical shard)
+	// so that pi.Definitions[idx].ID resolves to a physical shard ID. For all other tables,
+	// tbl.Meta().Partition is already the correct PI to use.
 	pi := tbl.Meta().GetPartitionInfo()
+	if spt, ok := tbl.(table.ShardedPartitionedTable); ok {
+		if fpi := spt.FlatPartitionInfo(); fpi != nil {
+			pi = fpi
+		}
+	}
 	var ret []table.PhysicalTable
 	if fullRangePartition(idxArr) {
 		ret = make([]table.PhysicalTable, 0, len(pi.Definitions))
@@ -6017,6 +6025,11 @@ func getPartitionIDsAfterPruning(ctx sessionctx.Context, tbl table.PartitionedTa
 	var ret map[int64]struct{}
 
 	pi := tbl.Meta().GetPartitionInfo()
+	if spt, ok := tbl.(table.ShardedPartitionedTable); ok {
+		if fpi := spt.FlatPartitionInfo(); fpi != nil {
+			pi = fpi
+		}
+	}
 	if fullRangePartition(idxArr) {
 		ret = make(map[int64]struct{}, len(pi.Definitions))
 		for _, def := range pi.Definitions {

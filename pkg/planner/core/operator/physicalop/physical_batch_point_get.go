@@ -340,7 +340,15 @@ func (p *PointGetPlan) LoadTableStats(ctx sessionctx.Context) {
 			return
 		}
 		if pi := p.TblInfo.GetPartitionInfo(); pi != nil {
-			tableID = pi.Definitions[*idx].ID
+			logicalIdx := *idx
+			// For partitioned+sharded tables, PartitionIdx is a flat shard index
+			// (partIdx*shardCnt + shardSlot). Map back to the logical partition.
+			if ski := p.TblInfo.ShardKeyInfo; ski != nil && ski.ShardCnt > 0 && logicalIdx >= len(pi.Definitions) {
+				logicalIdx = logicalIdx / ski.ShardCnt
+			}
+			if logicalIdx >= 0 && logicalIdx < len(pi.Definitions) {
+				tableID = pi.Definitions[logicalIdx].ID
+			}
 		}
 	}
 	stats.LoadTableStats(ctx, p.TblInfo, tableID)

@@ -1553,8 +1553,22 @@ func constructResultOfShowCreateTable(ctx sessionctx.Context, dbName *ast.CIStr,
 		fmt.Fprintf(buf, " /*T![%s] AFFINITY='%s' */", tidb.FeatureIDAffinity, tableInfo.Affinity.Level)
 	}
 
+	// Emit SHARD BY clause after all table options, immediately before PARTITION BY.
+	if ski := tableInfo.ShardKeyInfo; ski != nil {
+		cols := make([]string, len(ski.Columns))
+		for i, c := range ski.Columns {
+			cols[i] = stringutil.Escape(c, sqlMode)
+		}
+		fmt.Fprintf(buf, "\nSHARD BY (%s) SHARDS %d", strings.Join(cols, ", "), ski.ShardCnt)
+	}
+
 	// add partition info here.
-	ddl.AppendPartitionInfo(tableInfo.Partition, buf, sqlMode)
+	// For sharded+partitioned tables, emit the real partition clause.
+	if tableInfo.ShardKeyInfo == nil {
+		ddl.AppendPartitionInfo(tableInfo.Partition, buf, sqlMode)
+	} else if tableInfo.Partition != nil && tableInfo.Partition.Type != pmodel.PartitionTypeNone {
+		ddl.AppendPartitionInfo(tableInfo.Partition, buf, sqlMode)
+	}
 	return nil
 }
 

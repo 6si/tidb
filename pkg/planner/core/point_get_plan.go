@@ -572,6 +572,11 @@ func tryPointGetPlan(ctx base.PlanContext, selStmt *ast.SelectStmt, resolveCtx *
 			selStmt.TableHints,
 			tblName.IndexHints,
 		) {
+		// For sharded tables the shard key must be present in the predicate so we can
+		// route to the correct physical shard.
+		if ski := tbl.ShardKeyInfo; ski != nil && !shardKeyInPairs(ski.Columns, pairs) {
+			return nil
+		}
 		if isTableDual {
 			p := newPointGetPlan(ctx, dbName, schema, tbl, names)
 			p.IsTableDual = true
@@ -656,6 +661,10 @@ func checkTblIndexForPointPlan(ctx base.PlanContext, tblName *resolve.TableNameW
 				continue
 			}
 		}
+		// For sharded tables, skip PointGet if the shard key is not in the predicate.
+		if ski := tbl.ShardKeyInfo; ski != nil && !shardKeyInPairs(ski.Columns, pairs) {
+			continue
+		}
 		p := newPointGetPlan(ctx, dbName, schema, tbl, names)
 		p.IndexInfo = idxInfo
 		p.IndexValues = idxValues
@@ -665,6 +674,23 @@ func checkTblIndexForPointPlan(ctx base.PlanContext, tblName *resolve.TableNameW
 		return p
 	}
 	return nil
+}
+
+// shardKeyInPairs returns true if all shard key columns appear in the name-value pairs.
+func shardKeyInPairs(shardCols []string, pairs []nameValuePair) bool {
+	for _, col := range shardCols {
+		found := false
+		for _, p := range pairs {
+			if p.colName == col {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // indexIsAvailableByHints checks whether this index is filtered by these specified index hints.

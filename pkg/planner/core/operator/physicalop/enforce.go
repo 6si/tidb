@@ -61,6 +61,18 @@ func EnforceProperty(p *property.PhysicalProperty, tsk base.Task, ctx base.PlanC
 // EnforceExchanger enforces an exchange operator on the top of the mpp task if necessary.
 func (t *MppTask) EnforceExchanger(prop *property.PhysicalProperty, fd *funcdep.FDSet) *MppTask {
 	if !property.NeedEnforceExchanger(t.partTp, t.HashCols, prop, fd) {
+		// If the task is skipping the exchanger due to the shard key optimization,
+		// still advertise the correct partition type for the join planner.
+		if prop.MPPPartitionTp == property.HashType && t.partTp != property.HashType &&
+			len(prop.MPPPartitionCols) > 0 {
+			if tbl := ExtractTableInfoFromPlan(t.p); tbl != nil && tbl.ShardKeyInfo != nil &&
+				ShardKeyColumnsMatch(tbl.ShardKeyInfo, prop.MPPPartitionCols) {
+				newTask := t.Copy().(*MppTask)
+				newTask.partTp = property.HashType
+				newTask.HashCols = prop.MPPPartitionCols
+				return newTask
+			}
+		}
 		return t
 	}
 	return t.Copy().(*MppTask).EnforceExchangerImpl(prop)

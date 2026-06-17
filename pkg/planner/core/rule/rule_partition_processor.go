@@ -18,6 +18,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"slices"
 	"sort"
@@ -895,6 +896,12 @@ func (s *PartitionProcessor) prune(ds *logicalop.DataSource) (base.LogicalPlan, 
 	// apply for some partitions like:
 	// a = 1 OR a = 2 => for p1 only "a = 1" and for p2 only "a = 2"
 	// since a cannot be 2 in p1 and a cannot be 1 in p2
+	// Shard-key tables use Type=PartitionTypeNone (0) in their synthetic PartitionInfo
+	// but still carry ShardKeyInfo on the TableInfo. Dispatch to the CRC32-based pruner.
+	if ds.TableInfo.ShardKeyInfo != nil {
+		return s.processShardKeyPartition(ds, pi)
+	}
+
 	switch pi.Type {
 	case ast.PartitionTypeRange:
 		return s.processRangePartition(ds, pi)
@@ -905,6 +912,363 @@ func (s *PartitionProcessor) prune(ds *logicalop.DataSource) (base.LogicalPlan, 
 	}
 
 	return s.makeUnionAllChildren(ds, pi, GetFullRange(len(pi.Definitions)))
+}
+
+// processShardKeyPartition handles partition pruning for shard-key tables.
+// These tables use CRC32/IEEE hashing over the shard key columns, not a SQL expression.
+// For equality predicates on all shard key columns we compute the exact shard slot;
+// for range / inequality predicates we fall back to a full scan of all shards.
+//
+// For SHARD BY + LIST COLUMNS tables we do two-stage pruning:
+//  1. Run LIST COLUMNS pruning on the logical partitions → get surviving partition indices
+//  2. Run shard slot pruning for those surviving partitions
+//  3. Return the combined flat physical indices: partIdx*shardCnt + shardSlot
+func (s *PartitionProcessor) processShardKeyPartition(ds *logicalop.DataSource, pi *model.PartitionInfo) (base.LogicalPlan, error) {
+	// Check for partitioned+sharded tables (SHARD BY on top of LIST/RANGE/HASH).
+	// ds.Table is a shardedTable; pi (= ds.TableInfo.GetPartitionInfo()) is the original
+	// logical PI, not the flat synthetic PI. We must use the flat PI for physical shard scans.
+	if spt, ok := ds.Table.(table.ShardedPartitionedTable); ok {
+		if origPI := spt.OrigPartitionInfo(); origPI != nil {
+			flatPI := pi
+			if fpi := spt.FlatPartitionInfo(); fpi != nil {
+				flatPI = fpi
+			}
+			if origPI.Type == ast.PartitionTypeList {
+				return s.processShardedListPartition(ds, origPI, flatPI)
+			}
+			if origPI.Type == ast.PartitionTypeRange {
+				// Two-stage: RANGE pruning on logical partitions + shard-slot pruning.
+				return s.processShardedRangePartition(ds, origPI, flatPI)
+			}
+			// HASH/KEY partitioned+sharded: shard-slot pruning only (no prunable partition boundary).
+			return s.processShardedPartitionBySlot(ds, flatPI)
+		}
+	}
+	rangeOr, err := s.pruneShardKeyPartition(ds.SCtx(), pi, ds.TableInfo, ds.AllConds, ds.TblCols)
+	if err != nil {
+		return nil, err
+	}
+	return s.makeUnionAllChildren(ds, pi, rangeOr)
+}
+
+// processShardedPartitionBySlot handles RANGE/HASH partitioned+sharded tables in static pruning.
+// For these tables, all logical partitions survive (partition key is unrelated to shard key),
+// but the CRC32 shard slot is prunable when an equality predicate on all shard key columns is present.
+// flatPI has partCnt*shardCnt entries laid out as flatIdx = partIdx*shardCnt + slot.
+func (s *PartitionProcessor) processShardedPartitionBySlot(ds *logicalop.DataSource, flatPI *model.PartitionInfo) (base.LogicalPlan, error) {
+	ski := ds.TableInfo.ShardKeyInfo
+	shardCnt := ski.ShardCnt
+	flatLen := len(flatPI.Definitions)
+	partCnt := flatLen / shardCnt
+	if partCnt == 0 || shardCnt == 0 {
+		return s.makeUnionAllChildren(ds, flatPI, GetFullRange(flatLen))
+	}
+
+	// Prune shard slots using a single-shard-slot PI.
+	slotRangeOr, err := s.pruneShardKeyPartition(ds.SCtx(), flatPI, ds.TableInfo, ds.AllConds, ds.TblCols)
+	if err != nil {
+		return nil, err
+	}
+
+	// If full range, return all flat indices.
+	if len(slotRangeOr) == 1 && slotRangeOr[0].start == 0 && slotRangeOr[0].end == flatLen {
+		return s.makeUnionAllChildren(ds, flatPI, GetFullRange(flatLen))
+	}
+
+	// Build the set of surviving shard slots (0..shardCnt-1).
+	slotSet := make(map[int]struct{}, shardCnt)
+	for _, r := range slotRangeOr {
+		for idx := r.start; idx < r.end; idx++ {
+			slotSet[idx%shardCnt] = struct{}{}
+		}
+	}
+
+	// Expand: each surviving slot applies to every logical partition.
+	surviving := make([]int, 0, partCnt*len(slotSet))
+	for partIdx := 0; partIdx < partCnt; partIdx++ {
+		for slot := range slotSet {
+			if idx := partIdx*shardCnt + slot; idx < flatLen {
+				surviving = append(surviving, idx)
+			}
+		}
+	}
+	slices.Sort(surviving)
+
+	if len(surviving) == flatLen {
+		return s.makeUnionAllChildren(ds, flatPI, GetFullRange(flatLen))
+	}
+	return s.makeUnionAllChildren(ds, flatPI, convertToRangeOr(surviving, flatPI))
+}
+
+// processShardedListPartition implements two-stage pruning for SHARD BY + LIST COLUMNS tables.
+// origPI is the real LIST COLUMNS PartitionInfo; flatPI is the synthetic flat PartitionInfo
+// (one entry per physical shard, i.e. len = logicalPartCnt * shardCnt).
+func (s *PartitionProcessor) processShardedListPartition(ds *logicalop.DataSource, origPI, flatPI *model.PartitionInfo) (base.LogicalPlan, error) {
+	ski := ds.TableInfo.ShardKeyInfo
+	shardCnt := ski.ShardCnt
+
+	// Stage 1: LIST COLUMNS pruning on the logical partitions.
+	// Note: pruneListPartition reads tbl.Meta().Partition internally, which is the flat
+	// synthetic PI (logicalPartCnt*shardCnt entries). Its FullRange fallback iterates over
+	// flat indices, not logical ones. We clamp any returned index >= len(origPI.Definitions)
+	// back to FullRange so that flat indices are never mistaken for logical indices.
+	logicalUsed, err := s.pruneListPartition(ds.SCtx(), ds.Table, ds.PartitionNames, ds.AllConds, ds.TblCols)
+	if err != nil {
+		return nil, err
+	}
+	if len(logicalUsed) != 1 || logicalUsed[0] != FullRange {
+		for _, idx := range logicalUsed {
+			if idx >= len(origPI.Definitions) {
+				logicalUsed = []int{FullRange}
+				break
+			}
+		}
+	}
+
+	// Expand FullRange to all logical partition indices.
+	if len(logicalUsed) == 1 && logicalUsed[0] == FullRange {
+		logicalUsed = make([]int, len(origPI.Definitions))
+		for i := range origPI.Definitions {
+			logicalUsed[i] = i
+		}
+	}
+
+	// Stage 2: shard slot pruning.
+	shardSlots, err := s.pruneShardKeyPartition(ds.SCtx(), flatPI, ds.TableInfo, ds.AllConds, ds.TblCols)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build the set of surviving shard slots.
+	slotSet := make(map[int]struct{}, shardCnt)
+	if len(shardSlots) == 1 && shardSlots[0].start == 0 && shardSlots[0].end == len(flatPI.Definitions) {
+		// fullRange — all slots survive
+		for i := 0; i < shardCnt; i++ {
+			slotSet[i] = struct{}{}
+		}
+	} else {
+		for _, r := range shardSlots {
+			for idx := r.start; idx < r.end; idx++ {
+				slotSet[idx%shardCnt] = struct{}{}
+			}
+		}
+	}
+
+	// Combine: surviving flat indices are partIdx*shardCnt + slot for each
+	// (logicalPartIdx, slotIdx) pair that passes both filters.
+	// Bounds-check guards against stale origPartInfo after concurrent DDL.
+	flatLen := len(flatPI.Definitions)
+	surviving := make([]int, 0, len(logicalUsed)*len(slotSet))
+	for _, partIdx := range logicalUsed {
+		for slot := range slotSet {
+			if idx := partIdx*shardCnt + slot; idx < flatLen {
+				surviving = append(surviving, idx)
+			}
+		}
+	}
+	slices.Sort(surviving)
+
+	if len(surviving) == flatLen {
+		return s.makeUnionAllChildren(ds, flatPI, GetFullRange(flatLen))
+	}
+	return s.makeUnionAllChildren(ds, flatPI, convertToRangeOr(surviving, flatPI))
+}
+
+// processShardedRangePartition implements two-stage pruning for SHARD BY + RANGE tables.
+// origPI is the real RANGE PartitionInfo; flatPI is the synthetic flat PartitionInfo.
+func (s *PartitionProcessor) processShardedRangePartition(ds *logicalop.DataSource, origPI, flatPI *model.PartitionInfo) (base.LogicalPlan, error) {
+	ski := ds.TableInfo.ShardKeyInfo
+	shardCnt := ski.ShardCnt
+	flatLen := len(flatPI.Definitions)
+
+	// Stage 1: RANGE pruning on logical partitions using the original PI.
+	rangeOr, err := s.pruneRangePartition(ds.SCtx(), origPI, ds.Table.(table.PartitionedTable), ds.AllConds, ds.TblCols, ds.OutputNames())
+	if err != nil {
+		// On error, fall back to full scan.
+		return s.makeUnionAllChildren(ds, flatPI, GetFullRange(flatLen))
+	}
+	logicalUsed := s.convertToIntSlice(rangeOr, origPI, ds.PartitionNames)
+	if len(logicalUsed) == 1 && logicalUsed[0] == FullRange {
+		logicalUsed = make([]int, len(origPI.Definitions))
+		for i := range origPI.Definitions {
+			logicalUsed[i] = i
+		}
+	}
+
+	// Stage 2: shard-slot pruning.
+	shardSlots, err := s.pruneShardKeyPartition(ds.SCtx(), flatPI, ds.TableInfo, ds.AllConds, ds.TblCols)
+	if err != nil {
+		return nil, err
+	}
+	slotSet := make(map[int]struct{}, shardCnt)
+	if len(shardSlots) == 1 && shardSlots[0].start == 0 && shardSlots[0].end == flatLen {
+		for i := 0; i < shardCnt; i++ {
+			slotSet[i] = struct{}{}
+		}
+	} else {
+		for _, r := range shardSlots {
+			for idx := r.start; idx < r.end; idx++ {
+				slotSet[idx%shardCnt] = struct{}{}
+			}
+		}
+	}
+
+	surviving := make([]int, 0, len(logicalUsed)*len(slotSet))
+	for _, partIdx := range logicalUsed {
+		for slot := range slotSet {
+			if idx := partIdx*shardCnt + slot; idx < flatLen {
+				surviving = append(surviving, idx)
+			}
+		}
+	}
+	slices.Sort(surviving)
+
+	if len(surviving) == flatLen {
+		return s.makeUnionAllChildren(ds, flatPI, GetFullRange(flatLen))
+	}
+	return s.makeUnionAllChildren(ds, flatPI, convertToRangeOr(surviving, flatPI))
+}
+
+// pruneShardKeyPartition computes which shard slots to scan given equality predicates.
+// It is called from both the static partition processor (processShardKeyPartition) and
+// the dynamic pruning path (PartitionPruning in partition_prune.go).
+// Returns fullRange if no equality constraint covers all shard-key columns.
+func (s *PartitionProcessor) pruneShardKeyPartition(_ base.PlanContext, pi *model.PartitionInfo, tblInfo *model.TableInfo, conds []expression.Expression, columns []*expression.Column) (partitionRangeOR, error) {
+	ski := tblInfo.ShardKeyInfo
+	if ski == nil {
+		return fullRange(len(pi.Definitions)), nil
+	}
+	// For shard-only tables, pi.Definitions contains one entry per shard slot and
+	// ShardCnt == len(pi.Definitions). For partitioned+sharded tables, pi is the
+	// flat synthetic PI with len(Definitions) == logicalPartCnt * ShardCnt; use
+	// ShardCnt directly to compute the CRC32 modulus.
+	shardCnt := ski.ShardCnt
+	if shardCnt == 0 || len(pi.Definitions) == 0 {
+		return fullRange(len(pi.Definitions)), nil
+	}
+
+	// Build a map from shard key column ID to its position in the shard key.
+	// The expression columns carry the ColInfo which has the table-level column ID.
+	shardColIDs := make(map[int64]int, len(ski.Columns)) // colID → position in ski.Columns
+	for i, colName := range ski.Columns {
+		for _, col := range tblInfo.Columns {
+			if col.Name.L == colName {
+				shardColIDs[col.ID] = i
+				break
+			}
+		}
+	}
+	if len(shardColIDs) != len(ski.Columns) {
+		return fullRange(len(pi.Definitions)), nil
+	}
+
+	// Match expression columns to shard positions via column.ID (the table-level column ID).
+	exprColToShardPos := make(map[int64]int) // expression UniqueID → shard position
+	for _, exprCol := range columns {
+		if pos, ok := shardColIDs[exprCol.ID]; ok {
+			exprColToShardPos[exprCol.UniqueID] = pos
+		}
+	}
+	if len(exprColToShardPos) < len(ski.Columns) {
+		return fullRange(len(pi.Definitions)), nil
+	}
+
+	// Try to find equality conditions covering every shard key column.
+	// colVals[i] holds the set of constant values for ski.Columns[i].
+	colVals := make([][]types.Datum, len(ski.Columns))
+	for _, cond := range conds {
+		sf, ok := cond.(*expression.ScalarFunction)
+		if !ok || sf.FuncName.L != ast.EQ {
+			continue
+		}
+		args := sf.GetArgs()
+		if len(args) != 2 {
+			continue
+		}
+		col, cnst := extractColAndConst(args[0], args[1])
+		if col == nil {
+			col, cnst = extractColAndConst(args[1], args[0])
+		}
+		if col == nil || cnst == nil {
+			continue
+		}
+		pos, isShardCol := exprColToShardPos[col.UniqueID]
+		if !isShardCol {
+			continue
+		}
+		colVals[pos] = appendDistinct(colVals[pos], cnst.Value)
+	}
+
+	// If any shard key column has no equality constraint, we cannot prune.
+	for _, vals := range colVals {
+		if len(vals) == 0 {
+			return fullRange(len(pi.Definitions)), nil
+		}
+	}
+
+	// Compute the set of shard slots by hashing every combination of column values.
+	slotSet := make(map[int]struct{})
+	var enumerate func(col int, datums []types.Datum)
+	enumerate = func(col int, datums []types.Datum) {
+		if col == len(ski.Columns) {
+			h := crc32.NewIEEE()
+			for _, d := range datums {
+				if d.Kind() == types.KindNull {
+					h.Write([]byte{0})
+				} else {
+					data, err := d.ToHashKey()
+					if err == nil {
+						h.Write(data)
+					}
+				}
+			}
+			slotSet[int(h.Sum32()%uint32(shardCnt))] = struct{}{}
+			return
+		}
+		for _, v := range colVals[col] {
+			enumerate(col+1, append(datums, v))
+		}
+	}
+	enumerate(0, make([]types.Datum, 0, len(ski.Columns)))
+
+	if len(slotSet) == 0 || len(slotSet) == shardCnt {
+		return fullRange(len(pi.Definitions)), nil
+	}
+
+	used := make([]int, 0, len(slotSet))
+	for slot := range slotSet {
+		used = append(used, slot)
+	}
+	slices.Sort(used)
+	return convertToRangeOr(used, pi), nil
+}
+
+// extractColAndConst returns (col, constant) if left is a Column and right is foldable to a Constant.
+func extractColAndConst(left, right expression.Expression) (*expression.Column, *expression.Constant) {
+	col, ok := left.(*expression.Column)
+	if !ok {
+		return nil, nil
+	}
+	if cnst, ok := right.(*expression.Constant); ok {
+		return col, cnst
+	}
+	return nil, nil
+}
+
+// appendDistinct appends d to vals only if no existing entry compares equal.
+func appendDistinct(vals []types.Datum, d types.Datum) []types.Datum {
+	for _, v := range vals {
+		if v.Kind() == d.Kind() {
+			if key1, err1 := v.ToHashKey(); err1 == nil {
+				if key2, err2 := d.ToHashKey(); err2 == nil {
+					if bytes.Equal(key1, key2) {
+						return vals
+					}
+				}
+			}
+		}
+	}
+	return append(vals, d)
 }
 
 // FindByName checks whether object name exists in list.

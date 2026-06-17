@@ -458,6 +458,35 @@ func attach2TaskForMpp4PhysicalHashJoin(pp base.PhysicalPlan, tasks ...base.Task
 			}
 		}
 		lTask, rTask = convertPartitionKeysIfNeed4PhysicalHashJoin(p, lTask, rTask)
+		// If either side used the shard key shortcut to skip its exchanger, verify both sides
+		// are truly compatible (same shard key columns and same shard count). If not, force
+		// exchangers on any side that used the shard key shortcut.
+		lTbl := extractTableFromPlan(lTask.Plan())
+		rTbl := extractTableFromPlan(rTask.Plan())
+		lHasShardKey := lTbl != nil && lTbl.ShardKeyInfo != nil
+		rHasShardKey := rTbl != nil && rTbl.ShardKeyInfo != nil
+		if (lHasShardKey || rHasShardKey) && !bothCoLocated(lTask, rTask, lTask.HashCols, rTask.HashCols) {
+			if lHasShardKey {
+				if _, alreadyExchanged := lTask.Plan().(*physicalop.PhysicalExchangeReceiver); !alreadyExchanged {
+					lProp := &property.PhysicalProperty{
+						TaskTp:           property.MppTaskType,
+						MPPPartitionTp:   property.HashType,
+						MPPPartitionCols: lTask.HashCols,
+					}
+					lTask = lTask.Copy().(*physicalop.MppTask).EnforceExchangerImpl(lProp)
+				}
+			}
+			if rHasShardKey {
+				if _, alreadyExchanged := rTask.Plan().(*physicalop.PhysicalExchangeReceiver); !alreadyExchanged {
+					rProp := &property.PhysicalProperty{
+						TaskTp:           property.MppTaskType,
+						MPPPartitionTp:   property.HashType,
+						MPPPartitionCols: rTask.HashCols,
+					}
+					rTask = rTask.Copy().(*physicalop.MppTask).EnforceExchangerImpl(rProp)
+				}
+			}
+		}
 	}
 	p.SetChildren(lTask.Plan(), rTask.Plan())
 	// outer task is the task that will pass its MPPPartitionType to the join result
