@@ -228,6 +228,14 @@ var defaultSysVars = []*SysVar{
 			return nil
 		},
 	},
+	{Scope: vardef.ScopeGlobal | vardef.ScopeSession, Name: vardef.TiDBTiFlashEncodedOperations, Type: vardef.TypeBool, Value: BoolToOnOff(vardef.DefTiFlashEncodedOperations), SetSession: func(s *SessionVars, val string) error {
+		s.TiFlashEncodedOperations = TiDBOptOn(val)
+		return nil
+	}},
+	{Scope: vardef.ScopeGlobal | vardef.ScopeSession, Name: vardef.TiDBTiFlashDictEncodingMaxCardinality, Type: vardef.TypeInt, Value: strconv.Itoa(vardef.DefTiFlashDictEncodingMaxCardinality), MinValue: 1, MaxValue: 65536, SetSession: func(s *SessionVars, val string) error {
+		s.TiFlashDictEncodingMaxCardinality = TidbOptInt64(val, int64(vardef.DefTiFlashDictEncodingMaxCardinality))
+		return nil
+	}},
 	{Scope: vardef.ScopeGlobal, Name: vardef.TiDBEnableTiFlashPipelineMode, Type: vardef.TypeBool, Value: BoolToOnOff(vardef.DefTiDBEnableTiFlashPipelineMode), SetGlobal: func(ctx context.Context, vars *SessionVars, s string) error {
 		vardef.TiFlashEnablePipelineMode.Store(TiDBOptOn(s))
 		return nil

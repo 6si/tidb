@@ -525,6 +525,12 @@ const (
 	// TiFlashHashJoinVersion indicates whether to use hash join implementation v2 in TiFlash.
 	TiFlashHashJoinVersion = "tiflash_hash_join_version"
 
+	// TiDBTiFlashEncodedOperations enables dictionary-encoded operations in TiFlash.
+	TiDBTiFlashEncodedOperations = "tidb_tiflash_encoded_operations"
+
+	// TiDBTiFlashDictEncodingMaxCardinality sets the max distinct values threshold for dictionary encoding.
+	TiDBTiFlashDictEncodingMaxCardinality = "tidb_tiflash_dict_encoding_max_cardinality"
+
 	// TiDBMPPStoreFailTTL is the unavailable time when a store is detected failed. During that time, tidb will not send any task to
 	// TiFlash even though the failed TiFlash node has been recovered.
 	TiDBMPPStoreFailTTL = "tidb_mpp_store_fail_ttl"
@@ -1521,6 +1527,8 @@ const (
 	DefTiFlashQuerySpillRatio               = 0.7
 	DefTiFlashHashJoinVersion               = joinversion.TiFlashHashJoinVersionDefVal
 	DefTiDBEnableTiFlashPipelineMode        = true
+	DefTiFlashEncodedOperations             = false
+	DefTiFlashDictEncodingMaxCardinality    = 4096
 	DefTiDBMPPStoreFailTTL                  = "0s"
 	DefTiDBTxnMode                          = PessimisticTxnMode
 	DefTiDBRowFormatV1                      = 1

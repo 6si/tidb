@@ -1044,6 +1044,12 @@ type SessionVars struct {
 	// "optimized" enables hash join v2, while "legacy" uses the original version.
 	TiFlashHashJoinVersion string
 
+	// TiFlashEncodedOperations enables dictionary-encoded operations in TiFlash.
+	TiFlashEncodedOperations bool
+
+	// TiFlashDictEncodingMaxCardinality sets the max distinct values threshold for dictionary encoding.
+	TiFlashDictEncodingMaxCardinality int64
+
 	// TiDBAllowAutoRandExplicitInsert indicates whether explicit insertion on auto_random column is allowed.
 	AllowAutoRandExplicitInsert bool
 
