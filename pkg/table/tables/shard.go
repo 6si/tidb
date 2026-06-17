@@ -22,7 +22,7 @@ import (
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/model"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/types"
 )
@@ -203,17 +203,17 @@ func (t *shardedTable) locateOrigPartition(evalCtx expression.EvalContext, r []t
 		return 0, errors.New("shardedTable: PartitionExpr is nil for partitioned+sharded table")
 	}
 	switch t.origPartInfo.Type {
-	case pmodel.PartitionTypeList:
+	case ast.PartitionTypeList:
 		return pe.locateListPartition(evalCtx, r)
-	case pmodel.PartitionTypeRange:
+	case ast.PartitionTypeRange:
 		if len(t.origPartInfo.Columns) > 0 {
 			// RANGE COLUMNS partitioning
 			return locateRangeColumnPartitionByExpr(evalCtx, pe, r)
 		}
 		return locateRangePartitionByExpr(evalCtx, pe, r)
-	case pmodel.PartitionTypeHash:
+	case ast.PartitionTypeHash:
 		return locateHashPartitionByExpr(evalCtx, pe, uint64(t.partCnt), r)
-	case pmodel.PartitionTypeKey:
+	case ast.PartitionTypeKey:
 		// KEY partitions use MySQL's internal column hashing, not a SQL expression.
 		// partExpr.Expr is nil for KEY — must use ForKeyPruning.LocateKeyPartition.
 		if pe.ForKeyPruning == nil {
@@ -402,11 +402,11 @@ func (t *shardedTable) GetPartitionColumnIDs() []int64 {
 }
 
 // GetPartitionColumnNames returns the CIStr names of the shard key columns.
-func (t *shardedTable) GetPartitionColumnNames() []pmodel.CIStr {
+func (t *shardedTable) GetPartitionColumnNames() []ast.CIStr {
 	ski := t.meta.ShardKeyInfo
-	names := make([]pmodel.CIStr, len(ski.Columns))
+	names := make([]ast.CIStr, len(ski.Columns))
 	for i, colName := range ski.Columns {
-		names[i] = pmodel.NewCIStr(colName)
+		names[i] = ast.NewCIStr(colName)
 	}
 	return names
 }
@@ -494,7 +494,7 @@ func (t *shardedTable) rebuildShards() {
 			for si, physID := range def.ShardIDs {
 				flatDefs = append(flatDefs, model.PartitionDefinition{
 					ID:   physID,
-					Name: pmodel.NewCIStr(fmt.Sprintf("%s_s%d", def.Name.L, si)),
+					Name: ast.NewCIStr(fmt.Sprintf("%s_s%d", def.Name.L, si)),
 				})
 			}
 		}

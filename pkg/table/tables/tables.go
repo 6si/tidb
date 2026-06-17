@@ -34,7 +34,6 @@ import (
 	"github.com/pingcap/tidb/pkg/meta/autoid"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/ast"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/statistics"
@@ -236,7 +235,7 @@ func TableFromMeta(allocs autoid.Allocators, tblInfo *model.TableInfo) (table.Ta
 			for i, physID := range ski.ShardIDs {
 				defs[i] = model.PartitionDefinition{
 					ID:   physID,
-					Name: pmodel.NewCIStr(fmt.Sprintf("shard_%d", i)),
+					Name: ast.NewCIStr(fmt.Sprintf("shard_%d", i)),
 				}
 			}
 			tblInfo.Partition = &model.PartitionInfo{
@@ -259,7 +258,7 @@ func TableFromMeta(allocs autoid.Allocators, tblInfo *model.TableInfo) (table.Ta
 				for si, physID := range def.ShardIDs {
 					flatDefs = append(flatDefs, model.PartitionDefinition{
 						ID:   physID,
-						Name: pmodel.NewCIStr(fmt.Sprintf("%s_s%d", def.Name.L, si)),
+						Name: ast.NewCIStr(fmt.Sprintf("%s_s%d", def.Name.L, si)),
 					})
 				}
 			}
