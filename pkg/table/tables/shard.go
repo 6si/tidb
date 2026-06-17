@@ -44,41 +44,31 @@ func (sp *shardPhysical) GetPhysicalID() int64 {
 	return sp.physicalTableID
 }
 
-// shardedTable is a logical table that routes writes to per-shard physical tables
-// and implements PartitionedTable so the query planner scans each shard's physical
-// key range rather than the logical table prefix (which contains no data).
-//
-// For a non-partitioned sharded table, shards is a flat slice of ShardCnt entries.
-// For a partitioned+sharded table, shards contains ShardCnt entries per partition,
-// laid out as shards[partitionIdx*ShardCnt + shardIdx]. physicalIDs mirrors this layout.
+// shardedTable routes writes to per-shard physical
+// tables and implements PartitionedTable so the planner
+// scans each shard's physical key range.
 type shardedTable struct {
 	TableCommon
 	shards           []*shardPhysical
-	shardColIdx      []int                // column Offset per shard-key column, resolved once at open time
-	shardCnt         int                  // number of shards per partition (== ShardKeyInfo.ShardCnt)
-	partCnt          int                  // number of partitions (1 for non-partitioned tables)
-	physicalIDs      []int64              // flat: physicalIDs[partIdx*shardCnt + shardIdx]
-	shardsDefCount   int                  // len(origPartInfo.Definitions) when shards/physicalIDs were last built
-	origPartInfo     *model.PartitionInfo // original LIST/RANGE PartitionInfo (nil for shard-only tables)
-	flatPI           *model.PartitionInfo // synthetic flat PI: one entry per physical shard (nil for shard-only)
-	partExpr         *PartitionExpr       // cached PartitionExpr for LIST pruning; rebuilt when def count changes
-	partExprDefCount int                  // len(origPartInfo.Definitions) when partExpr was last built
+	shardColIdx      []int
+	shardCnt         int
+	partCnt          int
+	physicalIDs      []int64
+	shardsDefCount   int
+	origPartInfo     *model.PartitionInfo
+	flatPI           *model.PartitionInfo
+	partExpr         *PartitionExpr
+	partExprDefCount int
 }
 
-// newShardedTable builds a shardedTable from a TableInfo that has ShardKeyInfo
-// populated. Handles both non-partitioned and partitioned+sharded tables.
-//
-// For non-partitioned sharded tables we inject a synthetic PartitionInfo into a
-// copy of tblInfo so that the planner's GetPartitionInfo() check succeeds and it
-// scans each shard's physical key range rather than the empty logical table prefix.
-//
-// For partitioned+sharded tables two optional parameters may be passed:
-//   - origListRangePI: the original LIST/RANGE PartitionInfo (stored as origPartInfo for
-//     two-stage pruning; tblInfo.Partition still holds the real LIST/RANGE PI).
-//   - flatPI: the synthetic flat PartitionInfo (one entry per physical shard); stored
-//     on the shardedTable so that Meta() can return a tblInfo copy with this substituted in,
-//     giving builder.go physical shard IDs while leaving t.meta unchanged for DDL.
-func newShardedTable(tbl *TableCommon, tblInfo *model.TableInfo, extras ...*model.PartitionInfo) (*shardedTable, error) {
+// newShardedTable builds a shardedTable from a
+// TableInfo that has ShardKeyInfo populated.
+// Optional extras: [0]=origPI, [1]=flatPI.
+func newShardedTable(
+	tbl *TableCommon,
+	tblInfo *model.TableInfo,
+	extras ...*model.PartitionInfo,
+) (*shardedTable, error) {
 	ski := tblInfo.ShardKeyInfo
 	if ski == nil {
 		return nil, errors.New("newShardedTable: ShardKeyInfo is nil")

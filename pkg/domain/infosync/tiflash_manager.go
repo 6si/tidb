@@ -69,8 +69,12 @@ type TiFlashReplicaManager interface {
 	GetStoresStat(ctx context.Context) (*pd.StoresInfo, error)
 	// CalculateTiFlashProgress calculates TiFlash replica progress
 	CalculateTiFlashProgress(tableID int64, replicaCount uint64, TiFlashStores map[int64]pd.StoreInfo) (fullReplicaProgress float64, oneReplicaProgress float64, err error)
-	// CalculateTiFlashProgressForShards calculates TiFlash replica progress for a set of shard sub-IDs.
-	CalculateTiFlashProgressForShards(shardIDs []int64, replicaCount uint64, TiFlashStores map[int64]pd.StoreInfo) (float64, float64, error)
+	// CalculateTiFlashProgressForShards calculates
+	// TiFlash replica progress for shard sub-IDs.
+	CalculateTiFlashProgressForShards(
+		shardIDs []int64, replicaCount uint64,
+		TiFlashStores map[int64]pd.StoreInfo,
+	) (float64, float64, error)
 	// UpdateTiFlashProgressCache updates tiflashProgressCache
 	UpdateTiFlashProgressCache(tableID int64, progress float64)
 	// GetTiFlashProgressFromCache gets tiflash replica progress from tiflashProgressCache
@@ -171,11 +175,14 @@ func calculateTiFlashProgress(keyspaceID tikv.KeyspaceID, tableID int64, replica
 	return fullReplicaProgress, oneReplicaProgress, nil
 }
 
-// calculateTiFlashProgressForShards aggregates region and peer counts across a list of shard sub-IDs.
-// Required for SHARD BY + PARTITION BY tables: PD placement rules and data regions are registered
-// under physical shard sub-IDs (p.ShardIDs), not the logical partition ID, so querying the logical
-// partition ID returns 0 regions and stalls progress at 0.
-func calculateTiFlashProgressForShards(keyspaceID tikv.KeyspaceID, shardIDs []int64, replicaCount uint64, tiFlashStores map[int64]pd.StoreInfo) (float64, float64, error) {
+// calculateTiFlashProgressForShards aggregates
+// region/peer counts across a list of shard sub-IDs.
+func calculateTiFlashProgressForShards(
+	keyspaceID tikv.KeyspaceID,
+	shardIDs []int64,
+	replicaCount uint64,
+	tiFlashStores map[int64]pd.StoreInfo,
+) (float64, float64, error) {
 	var totalRegionCount int
 	for _, shardID := range shardIDs {
 		var cnt int
@@ -226,9 +233,12 @@ func (m *TiFlashReplicaManagerCtx) CalculateTiFlashProgress(tableID int64, repli
 	return calculateTiFlashProgress(m.codec.GetKeyspaceID(), tableID, replicaCount, tiFlashStores)
 }
 
-// CalculateTiFlashProgressForShards aggregates region count and peer count across all shard sub-IDs
-// to produce a single progress value for SHARD BY + PARTITION BY tables.
-func (m *TiFlashReplicaManagerCtx) CalculateTiFlashProgressForShards(shardIDs []int64, replicaCount uint64, tiFlashStores map[int64]pd.StoreInfo) (float64, float64, error) {
+// CalculateTiFlashProgressForShards aggregates progress
+// across all shard sub-IDs for SHARD BY tables.
+func (m *TiFlashReplicaManagerCtx) CalculateTiFlashProgressForShards(
+	shardIDs []int64, replicaCount uint64,
+	tiFlashStores map[int64]pd.StoreInfo,
+) (float64, float64, error) {
 	return calculateTiFlashProgressForShards(m.codec.GetKeyspaceID(), shardIDs, replicaCount, tiFlashStores)
 }
 
@@ -829,8 +839,11 @@ func (*mockTiFlashReplicaManagerCtx) CalculateTiFlashProgress(tableID int64, rep
 	return calculateTiFlashProgress(tikv.NullspaceID, tableID, replicaCount, tiFlashStores)
 }
 
-// CalculateTiFlashProgressForShards aggregates progress across shard sub-IDs.
-func (*mockTiFlashReplicaManagerCtx) CalculateTiFlashProgressForShards(shardIDs []int64, replicaCount uint64, tiFlashStores map[int64]pd.StoreInfo) (float64, float64, error) {
+// CalculateTiFlashProgressForShards mock impl.
+func (*mockTiFlashReplicaManagerCtx) CalculateTiFlashProgressForShards(
+	shardIDs []int64, replicaCount uint64,
+	tiFlashStores map[int64]pd.StoreInfo,
+) (float64, float64, error) {
 	return calculateTiFlashProgressForShards(tikv.NullspaceID, shardIDs, replicaCount, tiFlashStores)
 }
 
