@@ -325,6 +325,247 @@ func TestDML_DYN_SST_InsertAndSelect(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// TC-DML-JOIN: KV-side JOIN tests with sharded tables
+// ---------------------------------------------------------------------------
+
+func TestDML_JOIN_TwoTableInner(t *testing.T) {
+	tk, _ := setup(t)
+	tk.MustExec(`CREATE TABLE orders (
+		id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2),
+		PRIMARY KEY (company_id, id)
+	) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE companies (
+		company_id BIGINT NOT NULL, name VARCHAR(64),
+		PRIMARY KEY (company_id)
+	) SHARD BY (company_id) SHARDS 4`)
+
+	tk.MustExec(`INSERT INTO companies VALUES (1, 'Acme'), (2, 'Beta'), (3, 'Gamma')`)
+	tk.MustExec(`INSERT INTO orders VALUES (1, 1, 100.00), (2, 1, 200.00), (3, 2, 50.00), (4, 3, 75.00)`)
+
+	// INNER JOIN on shard key — results must be correct
+	tk.MustQuery(`SELECT c.name, SUM(o.amount)
+		FROM orders o JOIN companies c ON o.company_id = c.company_id
+		GROUP BY c.name ORDER BY c.name`).Check(testkit.Rows(
+		"Acme 300.00", "Beta 50.00", "Gamma 75.00",
+	))
+}
+
+func TestDML_JOIN_TwoTableLeftJoin(t *testing.T) {
+	tk, _ := setup(t)
+	tk.MustExec(`CREATE TABLE orders (
+		id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2),
+		PRIMARY KEY (company_id, id)
+	) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE companies (
+		company_id BIGINT NOT NULL, name VARCHAR(64),
+		PRIMARY KEY (company_id)
+	) SHARD BY (company_id) SHARDS 4`)
+
+	tk.MustExec(`INSERT INTO companies VALUES (1, 'Acme'), (2, 'Beta'), (3, 'Gamma')`)
+	tk.MustExec(`INSERT INTO orders VALUES (1, 1, 100.00), (2, 1, 200.00)`)
+
+	// LEFT JOIN: companies without orders should show NULL amounts
+	tk.MustQuery(`SELECT c.name, o.amount
+		FROM companies c LEFT JOIN orders o ON c.company_id = o.company_id
+		ORDER BY c.name, o.amount`).Check(testkit.Rows(
+		"Acme 100.00", "Acme 200.00", "Beta <nil>", "Gamma <nil>",
+	))
+}
+
+func TestDML_JOIN_TwoTableRightJoin(t *testing.T) {
+	tk, _ := setup(t)
+	tk.MustExec(`CREATE TABLE orders (
+		id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2),
+		PRIMARY KEY (company_id, id)
+	) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE companies (
+		company_id BIGINT NOT NULL, name VARCHAR(64),
+		PRIMARY KEY (company_id)
+	) SHARD BY (company_id) SHARDS 4`)
+
+	// company_id=99 has orders but no matching company row
+	tk.MustExec(`INSERT INTO companies VALUES (1, 'Acme')`)
+	tk.MustExec(`INSERT INTO orders VALUES (1, 1, 100.00), (2, 99, 50.00)`)
+
+	// RIGHT JOIN: orders without matching company get NULL name
+	tk.MustQuery(`SELECT c.name, o.amount
+		FROM companies c RIGHT JOIN orders o ON c.company_id = o.company_id
+		ORDER BY o.amount`).Check(testkit.Rows(
+		"<nil> 50.00", "Acme 100.00",
+	))
+}
+
+func TestDML_JOIN_ThreeTableStarSchema(t *testing.T) {
+	tk, _ := setup(t)
+	// Fact table
+	tk.MustExec(`CREATE TABLE events (
+		id BIGINT NOT NULL, company_id BIGINT NOT NULL, event_type_id INT NOT NULL,
+		revenue DECIMAL(12,2),
+		PRIMARY KEY (company_id, id)
+	) SHARD BY (company_id) SHARDS 4`)
+	// Dimension 1
+	tk.MustExec(`CREATE TABLE companies (
+		company_id BIGINT NOT NULL, name VARCHAR(64),
+		PRIMARY KEY (company_id)
+	) SHARD BY (company_id) SHARDS 4`)
+	// Dimension 2 (not sharded by company_id — different key)
+	tk.MustExec(`CREATE TABLE event_types (
+		id INT NOT NULL PRIMARY KEY, label VARCHAR(32)
+	)`)
+
+	tk.MustExec(`INSERT INTO companies VALUES (1, 'Acme'), (2, 'Beta')`)
+	tk.MustExec(`INSERT INTO event_types VALUES (10, 'page_view'), (20, 'purchase')`)
+	tk.MustExec(`INSERT INTO events VALUES
+		(1, 1, 10, 0.00), (2, 1, 20, 100.00), (3, 1, 20, 200.00),
+		(4, 2, 10, 0.00), (5, 2, 20, 50.00)`)
+
+	// Three-table join: fact × dim1 (shard key) × dim2 (non-shard key)
+	tk.MustQuery(`SELECT c.name, et.label, COUNT(*) cnt, SUM(e.revenue) total
+		FROM events e
+		JOIN companies c ON e.company_id = c.company_id
+		JOIN event_types et ON e.event_type_id = et.id
+		GROUP BY c.name, et.label
+		ORDER BY c.name, et.label`).Check(testkit.Rows(
+		"Acme page_view 1 0.00",
+		"Acme purchase 2 300.00",
+		"Beta page_view 1 0.00",
+		"Beta purchase 1 50.00",
+	))
+}
+
+func TestDML_JOIN_FourTableStarSchema(t *testing.T) {
+	tk, _ := setup(t)
+	tk.MustExec(`CREATE TABLE fact_sales (
+		id BIGINT NOT NULL, company_id BIGINT NOT NULL, product_id INT NOT NULL,
+		region_id INT NOT NULL, amount DECIMAL(12,2),
+		PRIMARY KEY (company_id, id)
+	) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE dim_company (
+		company_id BIGINT NOT NULL, name VARCHAR(64),
+		PRIMARY KEY (company_id)
+	) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE dim_product (
+		id INT NOT NULL PRIMARY KEY, label VARCHAR(32)
+	)`)
+	tk.MustExec(`CREATE TABLE dim_region (
+		id INT NOT NULL PRIMARY KEY, label VARCHAR(32)
+	)`)
+
+	tk.MustExec(`INSERT INTO dim_company VALUES (1, 'Acme'), (2, 'Beta')`)
+	tk.MustExec(`INSERT INTO dim_product VALUES (100, 'Widget'), (200, 'Gadget')`)
+	tk.MustExec(`INSERT INTO dim_region VALUES (1, 'US'), (2, 'EU')`)
+	tk.MustExec(`INSERT INTO fact_sales VALUES
+		(1, 1, 100, 1, 10.00), (2, 1, 200, 1, 20.00),
+		(3, 1, 100, 2, 30.00), (4, 2, 200, 2, 40.00)`)
+
+	// Four-table star join
+	tk.MustQuery(`SELECT dc.name, dp.label, dr.label, SUM(fs.amount)
+		FROM fact_sales fs
+		JOIN dim_company dc ON fs.company_id = dc.company_id
+		JOIN dim_product dp ON fs.product_id = dp.id
+		JOIN dim_region dr ON fs.region_id = dr.id
+		GROUP BY dc.name, dp.label, dr.label
+		ORDER BY dc.name, dp.label, dr.label`).Check(testkit.Rows(
+		"Acme Gadget US 20.00",
+		"Acme Widget EU 30.00",
+		"Acme Widget US 10.00",
+		"Beta Gadget EU 40.00",
+	))
+}
+
+func TestDML_JOIN_LeftJoinWithAggregation(t *testing.T) {
+	tk, _ := setup(t)
+	tk.MustExec(`CREATE TABLE orders (
+		id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2),
+		PRIMARY KEY (company_id, id)
+	) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE companies (
+		company_id BIGINT NOT NULL, name VARCHAR(64),
+		PRIMARY KEY (company_id)
+	) SHARD BY (company_id) SHARDS 4`)
+
+	tk.MustExec(`INSERT INTO companies VALUES (1, 'Acme'), (2, 'Beta'), (3, 'Gamma')`)
+	tk.MustExec(`INSERT INTO orders VALUES (1, 1, 100.00), (2, 1, 200.00), (3, 2, 50.00)`)
+
+	// LEFT JOIN with aggregation: companies without orders → 0 count, NULL sum
+	tk.MustQuery(`SELECT c.name, COUNT(o.id) cnt, COALESCE(SUM(o.amount), 0) total
+		FROM companies c LEFT JOIN orders o ON c.company_id = o.company_id
+		GROUP BY c.name ORDER BY c.name`).Check(testkit.Rows(
+		"Acme 2 300.00", "Beta 1 50.00", "Gamma 0 0",
+	))
+}
+
+func TestDML_JOIN_ShardedWithNonSharded(t *testing.T) {
+	tk, _ := setup(t)
+	tk.MustExec(`CREATE TABLE orders (
+		id BIGINT NOT NULL, company_id BIGINT NOT NULL, status VARCHAR(16),
+		PRIMARY KEY (company_id, id)
+	) SHARD BY (company_id) SHARDS 4`)
+	// Non-sharded lookup table
+	tk.MustExec(`CREATE TABLE statuses (code VARCHAR(16) PRIMARY KEY, label VARCHAR(32))`)
+
+	tk.MustExec(`INSERT INTO statuses VALUES ('new', 'New Order'), ('done', 'Completed')`)
+	tk.MustExec(`INSERT INTO orders VALUES (1, 1, 'new'), (2, 1, 'done'), (3, 2, 'new')`)
+
+	// Join sharded table with non-sharded lookup
+	tk.MustQuery(`SELECT o.id, s.label
+		FROM orders o JOIN statuses s ON o.status = s.code
+		ORDER BY o.id`).Check(testkit.Rows(
+		"1 New Order", "2 Completed", "3 New Order",
+	))
+}
+
+func TestDML_JOIN_SubqueryWithShardKey(t *testing.T) {
+	tk, _ := setup(t)
+	tk.MustExec(`CREATE TABLE orders (
+		id BIGINT NOT NULL, company_id BIGINT NOT NULL, amount DECIMAL(12,2),
+		PRIMARY KEY (company_id, id)
+	) SHARD BY (company_id) SHARDS 4`)
+
+	tk.MustExec(`INSERT INTO orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50), (4, 3, 300)`)
+
+	// Subquery: find companies with total amount > 100
+	tk.MustQuery(`SELECT company_id, total FROM (
+		SELECT company_id, SUM(amount) total FROM orders GROUP BY company_id
+	) sub WHERE total > 100 ORDER BY company_id`).Check(testkit.Rows(
+		"1 300.00", "3 300.00",
+	))
+}
+
+func TestDML_JOIN_MultipleShardedLeftJoinChain(t *testing.T) {
+	tk, _ := setup(t)
+	tk.MustExec(`CREATE TABLE accounts (
+		company_id BIGINT NOT NULL, name VARCHAR(64),
+		PRIMARY KEY (company_id)
+	) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE orders (
+		id BIGINT NOT NULL, company_id BIGINT NOT NULL, product VARCHAR(32),
+		PRIMARY KEY (company_id, id)
+	) SHARD BY (company_id) SHARDS 4`)
+	tk.MustExec(`CREATE TABLE shipments (
+		id BIGINT NOT NULL, company_id BIGINT NOT NULL, order_id BIGINT NOT NULL,
+		status VARCHAR(16),
+		PRIMARY KEY (company_id, id)
+	) SHARD BY (company_id) SHARDS 4`)
+
+	tk.MustExec(`INSERT INTO accounts VALUES (1, 'Acme'), (2, 'Beta'), (3, 'Gamma')`)
+	tk.MustExec(`INSERT INTO orders VALUES (1, 1, 'Widget'), (2, 1, 'Gadget'), (3, 2, 'Widget')`)
+	tk.MustExec(`INSERT INTO shipments VALUES (1, 1, 1, 'shipped'), (2, 2, 3, 'pending')`)
+
+	// Triple LEFT JOIN chain: accounts → orders → shipments
+	tk.MustQuery(`SELECT a.name, o.product, sh.status
+		FROM accounts a
+		LEFT JOIN orders o ON a.company_id = o.company_id
+		LEFT JOIN shipments sh ON o.company_id = sh.company_id AND o.id = sh.order_id
+		ORDER BY a.name, o.product, sh.status`).Check(testkit.Rows(
+		"Acme Gadget <nil>",
+		"Acme Widget shipped",
+		"Beta Widget pending",
+		"Gamma <nil> <nil>",
+	))
+}
+
+// ---------------------------------------------------------------------------
 
 func joinPlan(rows [][]any) string {
 	parts := make([]string, 0, len(rows))
