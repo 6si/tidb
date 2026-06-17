@@ -224,6 +224,8 @@ const (
 	TableKeyspaceMeta = "KEYSPACE_META"
 	// TableSchemataExtensions is the table to show read only status of database.
 	TableSchemataExtensions = "SCHEMATA_EXTENSIONS"
+	// TableShardSkew shows per-shard row count distribution for sharded tables.
+	TableShardSkew = "SHARD_SKEW"
 )
 
 const (
@@ -354,6 +356,7 @@ var tableIDMap = map[string]int64{
 	ClusterTableTiDBStatementsStats:      autoid.InformationSchemaDBID + 99,
 	TableKeyspaceMeta:                    autoid.InformationSchemaDBID + 100,
 	TableSchemataExtensions:              autoid.InformationSchemaDBID + 101,
+	TableShardSkew:                       autoid.InformationSchemaDBID + 102,
 }
 
 // columnInfo represents the basic column information of all kinds of INFORMATION_SCHEMA tables
@@ -1227,6 +1230,21 @@ var tableTableTiFlashReplicaCols = []columnInfo{
 	{name: "LOCATION_LABELS", tp: mysql.TypeVarchar, size: 64},
 	{name: "AVAILABLE", tp: mysql.TypeTiny, size: 1},
 	{name: "PROGRESS", tp: mysql.TypeDouble, size: 22},
+}
+
+var tableShardSkewCols = []columnInfo{
+	{name: "TABLE_SCHEMA", tp: mysql.TypeVarchar, size: 64},
+	{name: "TABLE_NAME", tp: mysql.TypeVarchar, size: 64},
+	{name: "TABLE_ID", tp: mysql.TypeLonglong, size: 21},
+	{name: "SHARD_KEY", tp: mysql.TypeVarchar, size: 256},
+	{name: "SHARD_COUNT", tp: mysql.TypeLonglong, size: 21},
+	{name: "SHARD_ID", tp: mysql.TypeLonglong, size: 21},
+	{name: "PHYSICAL_TABLE_ID", tp: mysql.TypeLonglong, size: 21},
+	{name: "ROW_COUNT", tp: mysql.TypeLonglong, size: 21},
+	{name: "MIN_ROW_COUNT", tp: mysql.TypeLonglong, size: 21, comment: "minimum row count across all shards of this table"},
+	{name: "MAX_ROW_COUNT", tp: mysql.TypeLonglong, size: 21, comment: "maximum row count across all shards of this table"},
+	{name: "AVG_ROW_COUNT", tp: mysql.TypeDouble, size: 22, comment: "average row count across all shards of this table"},
+	{name: "SKEW_RATIO", tp: mysql.TypeDouble, size: 22, comment: "max_row_count / avg_row_count; 1.0 = perfectly balanced"},
 }
 
 var tableInspectionResultCols = []columnInfo{
@@ -2542,6 +2560,7 @@ var tableNameToColumns = map[string][]columnInfo{
 	TableTiDBIndexUsage:                     tableTiDBIndexUsage,
 	TableTiDBPlanCache:                      tablePlanCache,
 	TableKeyspaceMeta:                       tableKeyspaceMetaCols,
+	TableShardSkew:                          tableShardSkewCols,
 }
 
 func createInfoSchemaTable(_ autoid.Allocators, _ func() (pools.Resource, error), meta *model.TableInfo) (table.Table, error) {

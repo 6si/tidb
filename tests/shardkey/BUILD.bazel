@@ -4,10 +4,12 @@ go_test(
     name = "shardkey_test",
     timeout = "short",
     srcs = [
+        "ddl_lifecycle_test.go",
         "ddl_test.go",
         "dml_test.go",
         "encoding_test.go",
         "mpp_test.go",
+        "shard_skew_test.go",
     ],
     flaky = True,
     shard_count = 50,

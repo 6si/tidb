@@ -243,6 +243,8 @@ func (e *memtableRetriever) retrieve(ctx context.Context, sctx sessionctx.Contex
 			err = e.setDataFromPlanCache(ctx, sctx, true)
 		case infoschema.TableKeyspaceMeta:
 			err = e.setDataForKeyspaceMeta(sctx)
+		case infoschema.TableShardSkew:
+			err = e.dataForShardSkew(ctx, sctx)
 		}
 		if err != nil {
 			return nil, err
@@ -2833,6 +2835,81 @@ func (e *memtableRetriever) dataForTableTiFlashReplica(_ context.Context, sctx s
 			)
 			rows = append(rows, record)
 			e.recordMemoryConsume(record)
+		}
+	}
+	e.rows = rows
+	return nil
+}
+
+// dataForShardSkew returns per-shard row count distribution for sharded tables.
+// Similar to SingleStore's INFORMATION_SCHEMA.TABLE_STATISTICS for detecting data skew.
+func (e *memtableRetriever) dataForShardSkew(ctx context.Context, sctx sessionctx.Context) error {
+	checker := privilege.GetPrivilegeManager(sctx)
+	var rows [][]types.Datum
+
+	rs := e.is.ListTablesWithSpecialAttribute(infoschemacontext.ShardKeyAttribute)
+	for _, schema := range rs {
+		for _, tbl := range schema.TableInfos {
+			if checker != nil && !checker.RequestVerification(sctx.GetSessionVars().ActiveRoles, schema.DBName.L, tbl.Name.L, "", mysql.AllPrivMask) {
+				continue
+			}
+			ski := tbl.ShardKeyInfo
+			if ski == nil || len(ski.ShardIDs) == 0 {
+				continue
+			}
+
+			shardKey := strings.Join(ski.Columns, ",")
+
+			// Collect row counts per shard via stats_meta or PD region stats.
+			shardCounts := make([]int64, len(ski.ShardIDs))
+			for i, physID := range ski.ShardIDs {
+				cnt, _ := pdhelper.GlobalPDHelper.GetApproximateTableCountFromStorage(
+					ctx, sctx, physID, schema.DBName.O, tbl.Name.O, fmt.Sprintf("shard_%d", i),
+				)
+				shardCounts[i] = int64(cnt)
+			}
+
+			// Compute aggregate stats.
+			var minCnt, maxCnt, totalCnt int64
+			minCnt = math.MaxInt64
+			for _, c := range shardCounts {
+				totalCnt += c
+				if c < minCnt {
+					minCnt = c
+				}
+				if c > maxCnt {
+					maxCnt = c
+				}
+			}
+			if len(shardCounts) == 0 {
+				continue
+			}
+			avgCnt := float64(totalCnt) / float64(len(shardCounts))
+			var skewRatio float64
+			if avgCnt > 0 {
+				skewRatio = float64(maxCnt) / avgCnt
+			} else {
+				skewRatio = 1.0
+			}
+
+			for i, physID := range ski.ShardIDs {
+				record := types.MakeDatums(
+					schema.DBName.O,       // TABLE_SCHEMA
+					tbl.Name.O,            // TABLE_NAME
+					tbl.ID,                // TABLE_ID
+					shardKey,              // SHARD_KEY
+					int64(ski.ShardCnt),   // SHARD_COUNT
+					int64(i),              // SHARD_ID
+					physID,                // PHYSICAL_TABLE_ID
+					shardCounts[i],        // ROW_COUNT
+					minCnt,                // MIN_ROW_COUNT
+					maxCnt,                // MAX_ROW_COUNT
+					avgCnt,                // AVG_ROW_COUNT
+					skewRatio,             // SKEW_RATIO
+				)
+				rows = append(rows, record)
+				e.recordMemoryConsume(record)
+			}
 		}
 	}
 	e.rows = rows

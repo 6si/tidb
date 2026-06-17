@@ -81,9 +81,14 @@ var AffinityAttribute SpecialAttributeFilter = func(t *model.TableInfo) bool {
 	return t.Affinity != nil
 }
 
+// ShardKeyAttribute is the ShardKey attribute filter used by ListTablesWithSpecialAttribute.
+var ShardKeyAttribute SpecialAttributeFilter = func(t *model.TableInfo) bool {
+	return t.ShardKeyInfo != nil
+}
+
 // HasSpecialAttributes checks if a table has any special attributes.
 func HasSpecialAttributes(t *model.TableInfo) bool {
-	return TTLAttribute(t) || TiFlashAttribute(t) || PlacementPolicyAttribute(t) || PartitionAttribute(t) || TableLockAttribute(t) || AffinityAttribute(t)
+	return TTLAttribute(t) || TiFlashAttribute(t) || PlacementPolicyAttribute(t) || PartitionAttribute(t) || TableLockAttribute(t) || AffinityAttribute(t) || ShardKeyAttribute(t)
 }
 
 // AllSpecialAttribute marks a model.TableInfo with any special attributes.
