@@ -1178,6 +1178,49 @@ const (
 	TemporaryLocal
 )
 
+// ShardKeyClause represents SHARD BY (col1, col2) SHARDS N clause
+type ShardKeyClause struct {
+	node
+
+	Columns  []*ColumnName // Column names forming the shard key
+	ShardCnt int           // Number of shards from SHARDS N
+}
+
+// Restore implements Node interface.
+func (n *ShardKeyClause) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("SHARD BY")
+	ctx.WritePlain(" (")
+	for i, col := range n.Columns {
+		if i > 0 {
+			ctx.WritePlain(", ")
+		}
+		if err := col.Restore(ctx); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	ctx.WritePlain(")")
+	ctx.WriteKeyWord(" SHARDS ")
+	ctx.WritePlainf("%d", n.ShardCnt)
+	return nil
+}
+
+// Accept implements Node interface.
+func (n *ShardKeyClause) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*ShardKeyClause)
+	for i, val := range n.Columns {
+		node, ok := val.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Columns[i] = node.(*ColumnName)
+	}
+	return v.Leave(n)
+}
+
 // CreateTableStmt is a statement to create a table.
 // See https://dev.mysql.com/doc/refman/5.7/en/create-table.html
 type CreateTableStmt struct {
@@ -1198,6 +1241,9 @@ type CreateTableStmt struct {
 	Partition      *PartitionOptions
 	OnDuplicate    OnDuplicateKeyHandlingType
 	Select         ResultSetNode
+
+	// ShardKeyInfo contains shard key clause if present
+	ShardKeyInfo *ShardKeyClause `json:"shard_key_info,omitempty"`
 }
 
 // Restore implements Node interface.
@@ -1245,6 +1291,13 @@ func (n *CreateTableStmt) Restore(ctx *format.RestoreCtx) error {
 			}
 		}
 		ctx.WritePlain(")")
+	}
+
+	if n.ShardKeyInfo != nil {
+		ctx.WritePlain(" ")
+		if err := n.ShardKeyInfo.Restore(ctx); err != nil {
+			return errors.Annotate(err, "An error occurred while splicing CreateTableStmt ShardKeyInfo")
+		}
 	}
 
 	options := tableOptionsWithRestoreTTLFlag(ctx.Flags, n.Options)
@@ -1355,6 +1408,13 @@ func (n *CreateTableStmt) Accept(v Visitor) (Node, bool) {
 			return n, false
 		}
 		n.Options[i] = node.(*TableOption)
+	}
+	if n.ShardKeyInfo != nil {
+		node, ok := n.ShardKeyInfo.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.ShardKeyInfo = node.(*ShardKeyClause)
 	}
 
 	return v.Leave(n)
