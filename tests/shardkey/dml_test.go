@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/stretchr/testify/require"
 )
 
@@ -277,6 +278,52 @@ func TestDML_SPT_Hash_InsertAndShardPruning(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // Helpers
+// ---------------------------------------------------------------------------
+// TC-DML-DYN: Dynamic partition prune mode tests
+// ---------------------------------------------------------------------------
+
+func TestDML_DYN_SST_ShardPruningEquality(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("SET @@tidb_partition_prune_mode = 'dynamic'")
+	tk.MustExec(`CREATE TABLE t_dyn (id BIGINT NOT NULL, k BIGINT NOT NULL, v VARCHAR(64), PRIMARY KEY (k, id)) SHARD BY (k) SHARDS 4`)
+	tk.MustExec(`INSERT INTO t_dyn VALUES (1, 42, 'hello'), (2, 99, 'world')`)
+
+	// Equality on shard key should prune to a single shard in dynamic mode
+	rows := tk.MustQuery(`EXPLAIN SELECT * FROM t_dyn WHERE k = 42`).Rows()
+	plan := joinPlan(rows)
+	require.Contains(t, plan, "shard_", "dynamic mode equality filter must prune to a shard")
+}
+
+func TestDML_DYN_SST_FullScan(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("SET @@tidb_partition_prune_mode = 'dynamic'")
+	tk.MustExec(`CREATE TABLE t_dyn2 (id BIGINT NOT NULL, k BIGINT NOT NULL, v VARCHAR(64), PRIMARY KEY (k, id)) SHARD BY (k) SHARDS 4`)
+	tk.MustExec(`INSERT INTO t_dyn2 VALUES (1, 42, 'hello'), (2, 99, 'world')`)
+
+	// Full scan should touch all shards
+	rows := tk.MustQuery(`EXPLAIN SELECT COUNT(*) FROM t_dyn2`).Rows()
+	plan := joinPlan(rows)
+	require.Contains(t, plan, "partition:all", "dynamic mode full scan must touch all shards")
+}
+
+func TestDML_DYN_SST_InsertAndSelect(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("SET @@tidb_partition_prune_mode = 'dynamic'")
+	tk.MustExec(`CREATE TABLE t_dyn3 (id BIGINT NOT NULL, k BIGINT NOT NULL, v VARCHAR(64), PRIMARY KEY (k, id)) SHARD BY (k) SHARDS 4`)
+	for i := 0; i < 20; i++ {
+		tk.MustExec(fmt.Sprintf(`INSERT INTO t_dyn3 VALUES (%d, %d, 'val%d')`, i, i*7, i))
+	}
+	tk.MustQuery("SELECT COUNT(*) FROM t_dyn3").Check(testkit.Rows("20"))
+	// Point query by shard key should return correct result
+	tk.MustQuery("SELECT v FROM t_dyn3 WHERE k = 7").Check(testkit.Rows("val1"))
+}
+
 // ---------------------------------------------------------------------------
 
 func joinPlan(rows [][]any) string {

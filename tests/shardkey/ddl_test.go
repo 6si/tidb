@@ -858,17 +858,16 @@ func TestMeta_SPT_TableRowsAlwaysZeroInInfoSchema(t *testing.T) {
 
 func TestMeta_SPT_SelectPartitionSyntaxGivesCorrectCount(t *testing.T) {
 	// TC-META-SPT-05: SELECT COUNT(*) FROM t PARTITION (p_name) for SPT.
-	// TODO: In static prune mode, SELECT PARTITION with logical partition names on SPT
-	// tables requires FindPartitionByName to map logical names to their physical shard
-	// IDs. This needs the static partition pruner to expand logical partitions into
-	// their constituent shards. Skipping until dynamic mode support is added.
-	t.Skip("SELECT PARTITION on SPT tables requires dynamic prune mode or static-mode SPT partition name mapping")
+	// TODO: SELECT PARTITION on SPT tables requires FindPartitionByName to map
+	// logical partition names (p_us) to the constituent physical shard IDs.
+	// Currently FindPartitionByName returns the logical partition ID which has no
+	// matching physical table in the shardedTable's physicalIDs.
+	t.Skip("SELECT PARTITION on SPT tables needs FindPartitionByName to expand logical names to shard IDs")
 }
 
 func TestMeta_SPT_SelectPartitionReturnsCorrectRows(t *testing.T) {
-	// TC-META-SPT-06: SELECT ... PARTITION (p_name) returns only rows in that partition.
-	// TODO: Same limitation as TestMeta_SPT_SelectPartitionSyntaxGivesCorrectCount.
-	t.Skip("SELECT PARTITION on SPT tables requires dynamic prune mode or static-mode SPT partition name mapping")
+	// TC-META-SPT-06: Same limitation as TestMeta_SPT_SelectPartitionSyntaxGivesCorrectCount.
+	t.Skip("SELECT PARTITION on SPT tables needs FindPartitionByName to expand logical names to shard IDs")
 }
 
 // ---------------------------------------------------------------------------

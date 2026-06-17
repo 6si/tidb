@@ -945,7 +945,7 @@ func (s *PartitionProcessor) processShardKeyPartition(ds *logicalop.DataSource, 
 			return s.processShardedPartitionBySlot(ds, flatPI)
 		}
 	}
-	rangeOr, err := s.pruneShardKeyPartition(ds.SCtx(), pi, ds.TableInfo, ds.AllConds, ds.TblCols)
+	rangeOr, err := s.PruneShardKeyPartition(ds.SCtx(), pi, ds.TableInfo, ds.AllConds, ds.TblCols)
 	if err != nil {
 		return nil, err
 	}
@@ -966,7 +966,7 @@ func (s *PartitionProcessor) processShardedPartitionBySlot(ds *logicalop.DataSou
 	}
 
 	// Prune shard slots using a single-shard-slot PI.
-	slotRangeOr, err := s.pruneShardKeyPartition(ds.SCtx(), flatPI, ds.TableInfo, ds.AllConds, ds.TblCols)
+	slotRangeOr, err := s.PruneShardKeyPartition(ds.SCtx(), flatPI, ds.TableInfo, ds.AllConds, ds.TblCols)
 	if err != nil {
 		return nil, err
 	}
@@ -1035,7 +1035,7 @@ func (s *PartitionProcessor) processShardedListPartition(ds *logicalop.DataSourc
 	}
 
 	// Stage 2: shard slot pruning.
-	shardSlots, err := s.pruneShardKeyPartition(ds.SCtx(), flatPI, ds.TableInfo, ds.AllConds, ds.TblCols)
+	shardSlots, err := s.PruneShardKeyPartition(ds.SCtx(), flatPI, ds.TableInfo, ds.AllConds, ds.TblCols)
 	if err != nil {
 		return nil, err
 	}
@@ -1097,7 +1097,7 @@ func (s *PartitionProcessor) processShardedRangePartition(ds *logicalop.DataSour
 	}
 
 	// Stage 2: shard-slot pruning.
-	shardSlots, err := s.pruneShardKeyPartition(ds.SCtx(), flatPI, ds.TableInfo, ds.AllConds, ds.TblCols)
+	shardSlots, err := s.PruneShardKeyPartition(ds.SCtx(), flatPI, ds.TableInfo, ds.AllConds, ds.TblCols)
 	if err != nil {
 		return nil, err
 	}
@@ -1130,11 +1130,11 @@ func (s *PartitionProcessor) processShardedRangePartition(ds *logicalop.DataSour
 	return s.makeUnionAllChildren(ds, flatPI, convertToRangeOr(surviving, flatPI))
 }
 
-// pruneShardKeyPartition computes which shard slots to scan given equality predicates.
+// PruneShardKeyPartition computes which shard slots to scan given equality predicates.
 // It is called from both the static partition processor (processShardKeyPartition) and
 // the dynamic pruning path (PartitionPruning in partition_prune.go).
 // Returns GetFullRange if no equality constraint covers all shard-key columns.
-func (s *PartitionProcessor) pruneShardKeyPartition(_ base.PlanContext, pi *model.PartitionInfo, tblInfo *model.TableInfo, conds []expression.Expression, columns []*expression.Column) (PartitionRangeOR, error) {
+func (s *PartitionProcessor) PruneShardKeyPartition(_ base.PlanContext, pi *model.PartitionInfo, tblInfo *model.TableInfo, conds []expression.Expression, columns []*expression.Column) (PartitionRangeOR, error) {
 	ski := tblInfo.ShardKeyInfo
 	if ski == nil {
 		return GetFullRange(len(pi.Definitions)), nil
@@ -1812,6 +1812,7 @@ func (p *RangePruner) partitionRangeForExpr(sctx base.PlanContext, expr expressi
 	return start, end, true
 }
 
+// GetFullRange returns the full partition range for this pruner.
 func (p *RangePruner) GetFullRange() PartitionRangeOR {
 	return GetFullRange(p.LessThan.Length())
 }
@@ -2357,6 +2358,7 @@ func makeRangeColumnPruner(columns []*expression.Column, pi *model.PartitionInfo
 	return &RangeColumnsPruner{lessThan, partCols}, nil
 }
 
+// GetFullRange returns the full partition range for this pruner.
 func (p *RangeColumnsPruner) GetFullRange() PartitionRangeOR {
 	return GetFullRange(len(p.LessThan))
 }

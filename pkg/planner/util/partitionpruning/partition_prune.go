@@ -31,7 +31,20 @@ func PartitionPruning(ctx base.PlanContext, tbl table.PartitionedTable,
 	conds []expression.Expression, partitionNames []ast.CIStr,
 	columns []*expression.Column, names types.NameSlice) ([]int, error) {
 	s := rule.PartitionProcessor{}
-	pi := tbl.Meta().Partition
+	tblInfo := tbl.Meta()
+	pi := tblInfo.Partition
+
+	// Shard-key tables use PartitionTypeNone (0) in their synthetic PI but carry
+	// ShardKeyInfo on the TableInfo. Handle CRC32-based shard pruning before the
+	// standard partition type switch so it works in both static and dynamic modes.
+	if tblInfo.ShardKeyInfo != nil {
+		rangeOr, err := s.PruneShardKeyPartition(ctx, pi, tblInfo, conds, columns)
+		if err != nil {
+			return nil, err
+		}
+		return s.ConvertToIntSlice(rangeOr, pi, partitionNames), nil
+	}
+
 	switch pi.Type {
 	case ast.PartitionTypeHash, ast.PartitionTypeKey:
 		return s.PruneHashOrKeyPartition(ctx, tbl, partitionNames, conds, columns, names)
