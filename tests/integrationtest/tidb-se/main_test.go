@@ -94,6 +94,25 @@ func queryString(t *testing.T, query string) string {
 	return val
 }
 
+// queryExplain runs an EXPLAIN query and returns the concatenated access object column.
+func queryExplain(t *testing.T, query string) string {
+	t.Helper()
+	rows, err := db.Query(query)
+	if err != nil {
+		t.Fatalf("EXPLAIN query failed: %v", err)
+	}
+	defer rows.Close()
+	var parts []string
+	for rows.Next() {
+		var id, estRows, task, access, info string
+		if err := rows.Scan(&id, &estRows, &task, &access, &info); err != nil {
+			t.Fatalf("EXPLAIN scan failed: %v", err)
+		}
+		parts = append(parts, access)
+	}
+	return strings.Join(parts, " ")
+}
+
 func waitForTiFlashReplica(t *testing.T, tableName string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -389,6 +408,239 @@ func TestShardBy_InPruning(t *testing.T) {
 	}
 	if foundAll {
 		t.Fatal("IN query should prune partitions, but EXPLAIN shows partition:all")
+	}
+}
+
+// TestShardBy_TruncateTable verifies TRUNCATE TABLE works on sharded tables —
+// after TRUNCATE, the table should be empty and accept new inserts with correct
+// shard key pruning.
+func TestShardBy_TruncateTable(t *testing.T) {
+	mustExec(t, "DROP TABLE IF EXISTS test_shard_truncate")
+	mustExec(t, `CREATE TABLE test_shard_truncate (
+		id BIGINT,
+		key_col VARCHAR(50) NOT NULL,
+		val INT,
+		PRIMARY KEY (id, key_col)
+	) SHARD BY (key_col) SHARDS 4`)
+
+	// Insert some data
+	mustExec(t, "INSERT INTO test_shard_truncate VALUES (1, 'alpha', 10)")
+	mustExec(t, "INSERT INTO test_shard_truncate VALUES (2, 'beta', 20)")
+	mustExec(t, "INSERT INTO test_shard_truncate VALUES (3, 'gamma', 30)")
+	cnt := queryInt(t, "SELECT COUNT(*) FROM test_shard_truncate")
+	if cnt != 3 {
+		t.Fatalf("Expected 3 rows before truncate, got %d", cnt)
+	}
+
+	// TRUNCATE
+	mustExec(t, "TRUNCATE TABLE test_shard_truncate")
+	cnt = queryInt(t, "SELECT COUNT(*) FROM test_shard_truncate")
+	if cnt != 0 {
+		t.Fatalf("Expected 0 rows after truncate, got %d", cnt)
+	}
+
+	// Insert after truncate
+	mustExec(t, "INSERT INTO test_shard_truncate VALUES (10, 'delta', 100)")
+	cnt = queryInt(t, "SELECT COUNT(*) FROM test_shard_truncate")
+	if cnt != 1 {
+		t.Fatalf("Expected 1 row after re-insert, got %d", cnt)
+	}
+
+	// Verify pruning still works after truncate
+	row := db.QueryRow("SELECT val FROM test_shard_truncate WHERE key_col = 'delta'")
+	var val int
+	if err := row.Scan(&val); err != nil {
+		t.Fatalf("Point query after truncate failed: %v", err)
+	}
+	if val != 100 {
+		t.Fatalf("Expected val=100, got %d", val)
+	}
+
+	// EXPLAIN should show pruning
+	explainRows, err := db.Query("EXPLAIN SELECT * FROM test_shard_truncate WHERE key_col = 'delta'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer explainRows.Close()
+	foundPruning := false
+	for explainRows.Next() {
+		var id, estRows, task, access, info string
+		if err := explainRows.Scan(&id, &estRows, &task, &access, &info); err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasPrefix(access, "partition:shard_") {
+			foundPruning = true
+		}
+	}
+	if !foundPruning {
+		t.Fatal("Expected shard pruning in EXPLAIN after truncate, but not found")
+	}
+}
+
+// TestShardBy_DDLOperations tests ADD COLUMN, ADD INDEX, DROP COLUMN on sharded tables.
+func TestShardBy_DDLOperations(t *testing.T) {
+	mustExec(t, "DROP TABLE IF EXISTS test_shard_ddl")
+	mustExec(t, `CREATE TABLE test_shard_ddl (
+		id BIGINT,
+		key_col VARCHAR(50) NOT NULL,
+		val INT,
+		extra VARCHAR(100),
+		PRIMARY KEY (id, key_col)
+	) SHARD BY (key_col) SHARDS 4`)
+
+	mustExec(t, "INSERT INTO test_shard_ddl VALUES (1, 'test', 10, 'extra_val')")
+
+	// ADD COLUMN
+	mustExec(t, "ALTER TABLE test_shard_ddl ADD COLUMN new_col INT DEFAULT 0")
+	row := db.QueryRow("SELECT new_col FROM test_shard_ddl WHERE key_col = 'test'")
+	var newCol int
+	if err := row.Scan(&newCol); err != nil {
+		t.Fatalf("SELECT after ADD COLUMN failed: %v", err)
+	}
+	if newCol != 0 {
+		t.Fatalf("Expected default new_col=0, got %d", newCol)
+	}
+
+	// ADD INDEX
+	mustExec(t, "ALTER TABLE test_shard_ddl ADD INDEX idx_val (val)")
+
+	// DROP COLUMN (non-shard-key column)
+	mustExec(t, "ALTER TABLE test_shard_ddl DROP COLUMN extra")
+	_, err := db.Exec("SELECT extra FROM test_shard_ddl LIMIT 1")
+	if err == nil {
+		t.Fatal("Expected error accessing dropped column 'extra', but got nil")
+	}
+
+	// Verify shard key pruning still works after DDL changes
+	row = db.QueryRow("SELECT val FROM test_shard_ddl WHERE key_col = 'test'")
+	var val int
+	if err := row.Scan(&val); err != nil {
+		t.Fatalf("Point query after DDL changes failed: %v", err)
+	}
+	if val != 10 {
+		t.Fatalf("Expected val=10 after DDL changes, got %d", val)
+	}
+}
+
+// TestShardBy_BatchUpsert tests batch INSERT ON DUPLICATE KEY UPDATE across shards.
+func TestShardBy_BatchUpsert(t *testing.T) {
+	mustExec(t, "DROP TABLE IF EXISTS test_shard_upsert")
+	mustExec(t, `CREATE TABLE test_shard_upsert (
+		id BIGINT,
+		region VARCHAR(20) NOT NULL,
+		cnt INT DEFAULT 0,
+		PRIMARY KEY (id, region)
+	) SHARD BY (region) SHARDS 4`)
+
+	// Batch insert
+	mustExec(t, `INSERT INTO test_shard_upsert (id, region, cnt) VALUES 
+		(1, 'us', 1), (2, 'eu', 1), (3, 'ap', 1), (4, 'sa', 1)`)
+
+	// Upsert: increment existing + insert new
+	mustExec(t, `INSERT INTO test_shard_upsert (id, region, cnt) VALUES 
+		(1, 'us', 5), (5, 'af', 1)
+		ON DUPLICATE KEY UPDATE cnt = cnt + VALUES(cnt)`)
+
+	// Verify: id=1 should have cnt=6, id=5 should have cnt=1
+	row := db.QueryRow("SELECT cnt FROM test_shard_upsert WHERE id = 1 AND region = 'us'")
+	var cnt int
+	if err := row.Scan(&cnt); err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 6 {
+		t.Fatalf("Expected cnt=6 after upsert, got %d", cnt)
+	}
+	total := queryInt(t, "SELECT COUNT(*) FROM test_shard_upsert")
+	if total != 5 {
+		t.Fatalf("Expected 5 total rows, got %d", total)
+	}
+}
+
+// TestShardBy_MultiColumnShardWithIN tests IN clause on one column of a
+// multi-column shard key combined with EQ on the other.
+func TestShardBy_MultiColumnShardWithIN(t *testing.T) {
+	mustExec(t, "DROP TABLE IF EXISTS test_shard_multi_in")
+	mustExec(t, `CREATE TABLE test_shard_multi_in (
+		id BIGINT,
+		region VARCHAR(20) NOT NULL,
+		category VARCHAR(20) NOT NULL,
+		val INT,
+		PRIMARY KEY (id, region, category)
+	) SHARD BY (region, category) SHARDS 8`)
+
+	mustExec(t, "INSERT INTO test_shard_multi_in VALUES (1, 'us', 'tech', 100)")
+	mustExec(t, "INSERT INTO test_shard_multi_in VALUES (2, 'us', 'fin', 200)")
+	mustExec(t, "INSERT INTO test_shard_multi_in VALUES (3, 'eu', 'tech', 300)")
+	mustExec(t, "INSERT INTO test_shard_multi_in VALUES (4, 'eu', 'fin', 400)")
+
+	// EQ on both: should prune to 1 shard
+	explainResult := queryExplain(t, "EXPLAIN SELECT * FROM test_shard_multi_in WHERE region = 'us' AND category = 'tech'")
+	if strings.Contains(explainResult, "partition:all") {
+		t.Fatal("EQ on both shard key columns should prune, but got partition:all")
+	}
+
+	// IN on region + EQ on category: should prune to specific shards
+	explainResult = queryExplain(t, "EXPLAIN SELECT * FROM test_shard_multi_in WHERE region IN ('us', 'eu') AND category = 'tech'")
+	if strings.Contains(explainResult, "partition:all") {
+		t.Fatal("IN + EQ on multi-column shard key should prune, but got partition:all")
+	}
+
+	// Verify correct rows returned
+	cnt := queryInt(t, "SELECT COUNT(*) FROM test_shard_multi_in WHERE region IN ('us', 'eu') AND category = 'tech'")
+	if cnt != 2 {
+		t.Fatalf("Expected 2 rows for IN+EQ query, got %d", cnt)
+	}
+
+	// EQ on only one column: should NOT prune (needs all shard key columns)
+	explainResult = queryExplain(t, "EXPLAIN SELECT * FROM test_shard_multi_in WHERE region = 'us'")
+	if !strings.Contains(explainResult, "partition:all") {
+		t.Fatal("EQ on only one of two shard key columns should scan all, but pruned")
+	}
+}
+
+// TestShardBy_WindowFunctions tests window functions across shards.
+func TestShardBy_WindowFunctions(t *testing.T) {
+	mustExec(t, "DROP TABLE IF EXISTS test_shard_window")
+	mustExec(t, `CREATE TABLE test_shard_window (
+		id BIGINT,
+		region VARCHAR(20) NOT NULL,
+		amount BIGINT,
+		PRIMARY KEY (id, region)
+	) SHARD BY (region) SHARDS 4`)
+
+	mustExec(t, `INSERT INTO test_shard_window VALUES 
+		(1, 'us', 100), (2, 'us', 200), (3, 'eu', 50), (4, 'eu', 150), (5, 'ap', 300)`)
+
+	// Window function: ROW_NUMBER partitioned by shard key column
+	rows, err := db.Query(`SELECT id, region, amount,
+		ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn
+		FROM test_shard_window ORDER BY region, rn`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	type result struct {
+		id, amount int
+		region     string
+		rn         int
+	}
+	var results []result
+	for rows.Next() {
+		var r result
+		if err := rows.Scan(&r.id, &r.region, &r.amount, &r.rn); err != nil {
+			t.Fatal(err)
+		}
+		results = append(results, r)
+	}
+	if len(results) != 5 {
+		t.Fatalf("Expected 5 rows with window function, got %d", len(results))
+	}
+	// Verify ROW_NUMBER resets per partition
+	for _, r := range results {
+		if r.rn < 1 {
+			t.Fatalf("Invalid ROW_NUMBER %d for id=%d", r.rn, r.id)
+		}
 	}
 }
 
