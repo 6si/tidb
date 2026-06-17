@@ -51,7 +51,12 @@ func TestDML_SST_FullScanTouchesAllShards(t *testing.T) {
 
 	rows := tk.MustQuery(`EXPLAIN SELECT COUNT(*) FROM orders_sharded`).Rows()
 	plan := joinPlan(rows)
-	require.Contains(t, plan, "partition:all", "full scan must touch all shards")
+	// In static prune mode a full scan produces a PartitionUnion over all shards;
+	// in dynamic mode the plan shows partition:all. Accept either form.
+	touchesAll := strings.Contains(plan, "partition:all") ||
+		(strings.Contains(plan, "partition:shard_0") && strings.Contains(plan, "partition:shard_1") &&
+			strings.Contains(plan, "partition:shard_2") && strings.Contains(plan, "partition:shard_3"))
+	require.True(t, touchesAll, "full scan must touch all shards; plan:\n%s", plan)
 }
 
 func TestDML_SST_NullShardKey(t *testing.T) {

@@ -60,19 +60,19 @@ func EnforceProperty(p *property.PhysicalProperty, tsk base.Task, ctx base.PlanC
 
 // EnforceExchanger enforces an exchange operator on the top of the mpp task if necessary.
 func (t *MppTask) EnforceExchanger(prop *property.PhysicalProperty, fd *funcdep.FDSet) *MppTask {
-	if !property.NeedEnforceExchanger(t.partTp, t.HashCols, prop, fd) {
-		// If the task is skipping the exchanger due to the shard key optimization,
-		// still advertise the correct partition type for the join planner.
-		if prop.MPPPartitionTp == property.HashType && t.partTp != property.HashType &&
-			len(prop.MPPPartitionCols) > 0 {
-			if tbl := ExtractTableInfoFromPlan(t.p); tbl != nil && tbl.ShardKeyInfo != nil &&
-				ShardKeyColumnsMatch(tbl.ShardKeyInfo, prop.MPPPartitionCols) {
-				newTask := t.Copy().(*MppTask)
-				newTask.partTp = property.HashType
-				newTask.HashCols = prop.MPPPartitionCols
-				return newTask
-			}
+	// Shard key optimization: if the required property is HashType and the table has a
+	// matching shard key, the data is already physically partitioned by that key so no
+	// exchange is needed. Advertise HashType so downstream joins see it as hash-partitioned.
+	if prop.MPPPartitionTp == property.HashType && len(prop.MPPPartitionCols) > 0 {
+		if tbl := ExtractTableInfoFromPlan(t.p); tbl != nil && tbl.ShardKeyInfo != nil &&
+			ShardKeyColumnsMatch(tbl.ShardKeyInfo, prop.MPPPartitionCols) {
+			newTask := t.Copy().(*MppTask)
+			newTask.partTp = property.HashType
+			newTask.HashCols = prop.MPPPartitionCols
+			return newTask
 		}
+	}
+	if !property.NeedEnforceExchanger(t.partTp, t.HashCols, prop, fd) {
 		return t
 	}
 	return t.Copy().(*MppTask).EnforceExchangerImpl(prop)
