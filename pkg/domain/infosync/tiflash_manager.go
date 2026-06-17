@@ -155,7 +155,7 @@ func calculateTiFlashProgress(keyspaceID tikv.KeyspaceID, tableID int64, replica
 		return 0, 0, errors.Trace(err)
 	}
 	// fullReplicaProgress range is [0, 1], 1 means all regions have tiflash peers with `replicaCount` replicas.
-	fullReplicaProgress = float64(tiflashPeerCount) / float64(regionCount*int(replicaCount))
+	fullReplicaProgress = float64(tiflashPeerCount) / float64(regionCount*int(replicaCount)) //nolint:gosec
 	// oneReplicaProgress range is [0, 1], 1 means all regions have tiflash peers with at least 1 replicas.
 	oneReplicaProgress = float64(tiflashRegionCount) / float64(regionCount)
 	if fullReplicaProgress > 1 {
@@ -198,7 +198,7 @@ func calculateTiFlashProgressForShards(keyspaceID tikv.KeyspaceID, shardIDs []in
 		}
 		totalPeerCount += cnt
 	}
-	progress := float64(totalPeerCount) / float64(totalRegionCount*int(replicaCount))
+	progress := float64(totalPeerCount) / float64(totalRegionCount*int(replicaCount)) //nolint:gosec
 	if progress > 1 {
 		progress = 1
 	}

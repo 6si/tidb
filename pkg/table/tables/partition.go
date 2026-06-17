@@ -1584,8 +1584,9 @@ func (t *partitionedTable) locateRangePartition(ctx expression.EvalContext, part
 	return pos, nil
 }
 
-// locateRangeColumnPartitionByExpr locates the partition index for a row using RANGE COLUMNS
-// partition expression. This is a package-level helper callable without a partitionedTable receiver.
+// locateRangeColumnPartitionByExpr locates the
+// partition index for a row using RANGE COLUMNS
+// partition expression.
 func locateRangeColumnPartitionByExpr(ctx expression.EvalContext, partitionExpr *PartitionExpr, r []types.Datum) (int, error) {
 	upperBounds := partitionExpr.UpperBounds
 	var lastError error
@@ -1649,7 +1650,7 @@ func locateRangePartitionByExpr(ctx expression.EvalContext, partitionExpr *Parti
 	if pos < 0 || pos >= length {
 		var valueMsg string
 		if unsigned {
-			valueMsg = fmt.Sprintf("%d", uint64(ret))
+			valueMsg = fmt.Sprintf("%d", uint64(ret)) //nolint:gosec
 		} else {
 			valueMsg = fmt.Sprintf("%d", ret)
 		}
@@ -1674,7 +1675,7 @@ func locateHashPartitionByExpr(ctx expression.EvalContext, partExpr *PartitionEx
 			}
 		}
 		ret := data.GetInt64()
-		ret = ret % int64(numParts)
+		ret = ret % int64(numParts) //nolint:gosec
 		if ret < 0 {
 			ret = -ret
 		}
@@ -1689,7 +1690,7 @@ func locateHashPartitionByExpr(ctx expression.EvalContext, partExpr *PartitionEx
 	if isNull {
 		return 0, nil
 	}
-	ret = ret % int64(numParts)
+	ret = ret % int64(numParts) //nolint:gosec
 	if ret < 0 {
 		ret = -ret
 	}

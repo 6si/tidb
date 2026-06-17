@@ -527,15 +527,16 @@ type PartitionedTable interface {
 	CheckForExchangePartition(ctx expression.EvalContext, pi *model.PartitionInfo, r []types.Datum, partID, ntID int64) error
 }
 
-// ShardedPartitionedTable is implemented by sharded+partitioned tables that wrap a
-// real PartitionInfo with a synthetic one for planner purposes. The executor needs
-// the original PartitionInfo for ADD PARTITION operations.
+// ShardedPartitionedTable is implemented by
+// sharded+partitioned tables that wrap a real
+// PartitionInfo with a synthetic one for the planner.
 type ShardedPartitionedTable interface {
 	PartitionedTable
+	// OrigPartitionInfo returns the real PI.
 	OrigPartitionInfo() *model.PartitionInfo
-	// FlatPartitionInfo returns a synthetic flat PartitionInfo with one entry per
-	// physical shard, used by partitionPruning in builder.go to resolve pruner result
-	// indices to physical shard IDs. Returns nil for shard-only (non-partitioned) tables.
+	// FlatPartitionInfo returns a synthetic flat PI
+	// with one entry per physical shard. Returns nil
+	// for shard-only (non-partitioned) tables.
 	FlatPartitionInfo() *model.PartitionInfo
 }
 

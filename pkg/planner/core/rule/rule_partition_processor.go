@@ -537,7 +537,7 @@ type listPartitionPruner struct {
 	ctx            base.PlanContext
 	pi             *model.PartitionInfo
 	partitionNames []ast.CIStr
-	GetFullRange      map[int]struct{}
+	GetFullRange   map[int]struct{}
 	listPrune      *tables.ForListPruning
 }
 
@@ -566,7 +566,7 @@ func newListPartitionPruner(ctx base.PlanContext, tbl table.Table, partitionName
 		ctx:                ctx,
 		pi:                 tbl.Meta().Partition,
 		partitionNames:     partitionNames,
-		GetFullRange:          GetFullRange,
+		GetFullRange:       GetFullRange,
 		listPrune:          pruneList,
 	}
 }
@@ -986,7 +986,7 @@ func (s *PartitionProcessor) processShardedPartitionBySlot(ds *logicalop.DataSou
 
 	// Expand: each surviving slot applies to every logical partition.
 	surviving := make([]int, 0, partCnt*len(slotSet))
-	for partIdx := 0; partIdx < partCnt; partIdx++ {
+	for partIdx := range partCnt {
 		for slot := range slotSet {
 			if idx := partIdx*shardCnt + slot; idx < flatLen {
 				surviving = append(surviving, idx)
@@ -1044,7 +1044,7 @@ func (s *PartitionProcessor) processShardedListPartition(ds *logicalop.DataSourc
 	slotSet := make(map[int]struct{}, shardCnt)
 	if len(shardSlots) == 1 && shardSlots[0].Start == 0 && shardSlots[0].End == len(flatPI.Definitions) {
 		// GetFullRange — all slots survive
-		for i := 0; i < shardCnt; i++ {
+		for i := range shardCnt {
 			slotSet[i] = struct{}{}
 		}
 	} else {
@@ -1103,7 +1103,7 @@ func (s *PartitionProcessor) processShardedRangePartition(ds *logicalop.DataSour
 	}
 	slotSet := make(map[int]struct{}, shardCnt)
 	if len(shardSlots) == 1 && shardSlots[0].Start == 0 && shardSlots[0].End == flatLen {
-		for i := 0; i < shardCnt; i++ {
+		for i := range shardCnt {
 			slotSet[i] = struct{}{}
 		}
 	} else {
@@ -1223,7 +1223,7 @@ func (s *PartitionProcessor) pruneShardKeyPartition(_ base.PlanContext, pi *mode
 					}
 				}
 			}
-			slotSet[int(h.Sum32()%uint32(shardCnt))] = struct{}{}
+			slotSet[int(h.Sum32()%uint32(shardCnt)) //nolint:gosec] = struct{}{}
 			return
 		}
 		for _, v := range colVals[col] {
