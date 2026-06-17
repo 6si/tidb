@@ -839,10 +839,10 @@ func CalculateTiFlashProgress(tableID int64, replicaCount uint64, tiFlashStores 
 
 // CalculateTiFlashProgressForShards calculates TiFlash replica progress for SHARD BY + PARTITION BY tables,
 // aggregating across all physical shard sub-IDs in the partition.
-func CalculateTiFlashProgressForShards(shardIDs []int64, replicaCount uint64, tiFlashStores map[int64]pdhttp.StoreInfo) (float64, error) {
+func CalculateTiFlashProgressForShards(shardIDs []int64, replicaCount uint64, tiFlashStores map[int64]pdhttp.StoreInfo) (float64, float64, error) {
 	is, err := getGlobalInfoSyncer()
 	if err != nil {
-		return 0, errors.Trace(err)
+		return 0, 0, errors.Trace(err)
 	}
 	return is.tiflashReplicaManager.CalculateTiFlashProgressForShards(shardIDs, replicaCount, tiFlashStores)
 }

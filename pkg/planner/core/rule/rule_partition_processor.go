@@ -15,6 +15,7 @@
 package rule
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"fmt"
@@ -536,7 +537,7 @@ type listPartitionPruner struct {
 	ctx            base.PlanContext
 	pi             *model.PartitionInfo
 	partitionNames []ast.CIStr
-	fullRange      map[int]struct{}
+	GetFullRange      map[int]struct{}
 	listPrune      *tables.ForListPruning
 }
 
@@ -558,14 +559,14 @@ func newListPartitionPruner(ctx base.PlanContext, tbl table.Table, partitionName
 			}
 		}
 	}
-	fullRange := make(map[int]struct{})
-	fullRange[FullRange] = struct{}{}
+	GetFullRange := make(map[int]struct{})
+	GetFullRange[FullRange] = struct{}{}
 	return &listPartitionPruner{
 		PartitionProcessor: s,
 		ctx:                ctx,
 		pi:                 tbl.Meta().Partition,
 		partitionNames:     partitionNames,
-		fullRange:          fullRange,
+		GetFullRange:          GetFullRange,
 		listPrune:          pruneList,
 	}
 }
@@ -757,14 +758,14 @@ func (l *listPartitionPruner) detachCondAndBuildRange(conds []expression.Express
 
 func (l *listPartitionPruner) findUsedListColumnsPartitions(conds []expression.Expression) (map[int]struct{}, error) {
 	if len(conds) == 0 {
-		return l.fullRange, nil
+		return l.GetFullRange, nil
 	}
 	location, isFull, err := l.locatePartitionByCNFCondition(conds)
 	if err != nil {
 		return nil, err
 	}
 	if isFull {
-		return l.fullRange, nil
+		return l.GetFullRange, nil
 	}
 	used := make(map[int]struct{}, len(location))
 	for _, pg := range location {
@@ -775,7 +776,7 @@ func (l *listPartitionPruner) findUsedListColumnsPartitions(conds []expression.E
 
 func (l *listPartitionPruner) findUsedListPartitions(conds []expression.Expression) (map[int]struct{}, error) {
 	if len(conds) == 0 {
-		return l.fullRange, nil
+		return l.GetFullRange, nil
 	}
 	exprCols := l.listPrune.PruneExprCols
 	pruneExpr := l.listPrune.PruneExpr
@@ -787,13 +788,13 @@ func (l *listPartitionPruner) findUsedListPartitions(conds []expression.Expressi
 	tc := l.ctx.GetSessionVars().StmtCtx.TypeCtx()
 	for _, r := range ranges {
 		if len(r.HighVal) != len(exprCols) || r.IsFullRange(false) {
-			return l.fullRange, nil
+			return l.GetFullRange, nil
 		}
 		var idxs map[int]struct{}
 		if !r.IsPointNullable(tc) {
 			// Only support `pruneExpr` is a Column
 			if _, ok := pruneExpr.(*expression.Column); !ok {
-				return l.fullRange, nil
+				return l.GetFullRange, nil
 			}
 			idxs, err = l.listPrune.LocatePartitionByRange(l.ctx.GetExprCtx().GetEvalCtx(), r)
 			if err != nil {
@@ -971,14 +972,14 @@ func (s *PartitionProcessor) processShardedPartitionBySlot(ds *logicalop.DataSou
 	}
 
 	// If full range, return all flat indices.
-	if len(slotRangeOr) == 1 && slotRangeOr[0].start == 0 && slotRangeOr[0].end == flatLen {
+	if len(slotRangeOr) == 1 && slotRangeOr[0].Start == 0 && slotRangeOr[0].End == flatLen {
 		return s.makeUnionAllChildren(ds, flatPI, GetFullRange(flatLen))
 	}
 
 	// Build the set of surviving shard slots (0..shardCnt-1).
 	slotSet := make(map[int]struct{}, shardCnt)
 	for _, r := range slotRangeOr {
-		for idx := r.start; idx < r.end; idx++ {
+		for idx := r.Start; idx < r.End; idx++ {
 			slotSet[idx%shardCnt] = struct{}{}
 		}
 	}
@@ -1012,7 +1013,7 @@ func (s *PartitionProcessor) processShardedListPartition(ds *logicalop.DataSourc
 	// synthetic PI (logicalPartCnt*shardCnt entries). Its FullRange fallback iterates over
 	// flat indices, not logical ones. We clamp any returned index >= len(origPI.Definitions)
 	// back to FullRange so that flat indices are never mistaken for logical indices.
-	logicalUsed, err := s.pruneListPartition(ds.SCtx(), ds.Table, ds.PartitionNames, ds.AllConds, ds.TblCols)
+	logicalUsed, err := s.PruneListPartition(ds.SCtx(), ds.Table, ds.PartitionNames, ds.AllConds, ds.TblCols)
 	if err != nil {
 		return nil, err
 	}
@@ -1041,14 +1042,14 @@ func (s *PartitionProcessor) processShardedListPartition(ds *logicalop.DataSourc
 
 	// Build the set of surviving shard slots.
 	slotSet := make(map[int]struct{}, shardCnt)
-	if len(shardSlots) == 1 && shardSlots[0].start == 0 && shardSlots[0].end == len(flatPI.Definitions) {
-		// fullRange — all slots survive
+	if len(shardSlots) == 1 && shardSlots[0].Start == 0 && shardSlots[0].End == len(flatPI.Definitions) {
+		// GetFullRange — all slots survive
 		for i := 0; i < shardCnt; i++ {
 			slotSet[i] = struct{}{}
 		}
 	} else {
 		for _, r := range shardSlots {
-			for idx := r.start; idx < r.end; idx++ {
+			for idx := r.Start; idx < r.End; idx++ {
 				slotSet[idx%shardCnt] = struct{}{}
 			}
 		}
@@ -1082,12 +1083,12 @@ func (s *PartitionProcessor) processShardedRangePartition(ds *logicalop.DataSour
 	flatLen := len(flatPI.Definitions)
 
 	// Stage 1: RANGE pruning on logical partitions using the original PI.
-	rangeOr, err := s.pruneRangePartition(ds.SCtx(), origPI, ds.Table.(table.PartitionedTable), ds.AllConds, ds.TblCols, ds.OutputNames())
+	rangeOr, err := s.PruneRangePartition(ds.SCtx(), origPI, ds.Table.(table.PartitionedTable), ds.AllConds, ds.TblCols, ds.OutputNames())
 	if err != nil {
 		// On error, fall back to full scan.
 		return s.makeUnionAllChildren(ds, flatPI, GetFullRange(flatLen))
 	}
-	logicalUsed := s.convertToIntSlice(rangeOr, origPI, ds.PartitionNames)
+	logicalUsed := s.ConvertToIntSlice(rangeOr, origPI, ds.PartitionNames)
 	if len(logicalUsed) == 1 && logicalUsed[0] == FullRange {
 		logicalUsed = make([]int, len(origPI.Definitions))
 		for i := range origPI.Definitions {
@@ -1101,13 +1102,13 @@ func (s *PartitionProcessor) processShardedRangePartition(ds *logicalop.DataSour
 		return nil, err
 	}
 	slotSet := make(map[int]struct{}, shardCnt)
-	if len(shardSlots) == 1 && shardSlots[0].start == 0 && shardSlots[0].end == flatLen {
+	if len(shardSlots) == 1 && shardSlots[0].Start == 0 && shardSlots[0].End == flatLen {
 		for i := 0; i < shardCnt; i++ {
 			slotSet[i] = struct{}{}
 		}
 	} else {
 		for _, r := range shardSlots {
-			for idx := r.start; idx < r.end; idx++ {
+			for idx := r.Start; idx < r.End; idx++ {
 				slotSet[idx%shardCnt] = struct{}{}
 			}
 		}
@@ -1132,11 +1133,11 @@ func (s *PartitionProcessor) processShardedRangePartition(ds *logicalop.DataSour
 // pruneShardKeyPartition computes which shard slots to scan given equality predicates.
 // It is called from both the static partition processor (processShardKeyPartition) and
 // the dynamic pruning path (PartitionPruning in partition_prune.go).
-// Returns fullRange if no equality constraint covers all shard-key columns.
-func (s *PartitionProcessor) pruneShardKeyPartition(_ base.PlanContext, pi *model.PartitionInfo, tblInfo *model.TableInfo, conds []expression.Expression, columns []*expression.Column) (partitionRangeOR, error) {
+// Returns GetFullRange if no equality constraint covers all shard-key columns.
+func (s *PartitionProcessor) pruneShardKeyPartition(_ base.PlanContext, pi *model.PartitionInfo, tblInfo *model.TableInfo, conds []expression.Expression, columns []*expression.Column) (PartitionRangeOR, error) {
 	ski := tblInfo.ShardKeyInfo
 	if ski == nil {
-		return fullRange(len(pi.Definitions)), nil
+		return GetFullRange(len(pi.Definitions)), nil
 	}
 	// For shard-only tables, pi.Definitions contains one entry per shard slot and
 	// ShardCnt == len(pi.Definitions). For partitioned+sharded tables, pi is the
@@ -1144,7 +1145,7 @@ func (s *PartitionProcessor) pruneShardKeyPartition(_ base.PlanContext, pi *mode
 	// ShardCnt directly to compute the CRC32 modulus.
 	shardCnt := ski.ShardCnt
 	if shardCnt == 0 || len(pi.Definitions) == 0 {
-		return fullRange(len(pi.Definitions)), nil
+		return GetFullRange(len(pi.Definitions)), nil
 	}
 
 	// Build a map from shard key column ID to its position in the shard key.
@@ -1159,7 +1160,7 @@ func (s *PartitionProcessor) pruneShardKeyPartition(_ base.PlanContext, pi *mode
 		}
 	}
 	if len(shardColIDs) != len(ski.Columns) {
-		return fullRange(len(pi.Definitions)), nil
+		return GetFullRange(len(pi.Definitions)), nil
 	}
 
 	// Match expression columns to shard positions via column.ID (the table-level column ID).
@@ -1170,7 +1171,7 @@ func (s *PartitionProcessor) pruneShardKeyPartition(_ base.PlanContext, pi *mode
 		}
 	}
 	if len(exprColToShardPos) < len(ski.Columns) {
-		return fullRange(len(pi.Definitions)), nil
+		return GetFullRange(len(pi.Definitions)), nil
 	}
 
 	// Try to find equality conditions covering every shard key column.
@@ -1202,7 +1203,7 @@ func (s *PartitionProcessor) pruneShardKeyPartition(_ base.PlanContext, pi *mode
 	// If any shard key column has no equality constraint, we cannot prune.
 	for _, vals := range colVals {
 		if len(vals) == 0 {
-			return fullRange(len(pi.Definitions)), nil
+			return GetFullRange(len(pi.Definitions)), nil
 		}
 	}
 
@@ -1232,7 +1233,7 @@ func (s *PartitionProcessor) pruneShardKeyPartition(_ base.PlanContext, pi *mode
 	enumerate(0, make([]types.Datum, 0, len(ski.Columns)))
 
 	if len(slotSet) == 0 || len(slotSet) == shardCnt {
-		return fullRange(len(pi.Definitions)), nil
+		return GetFullRange(len(pi.Definitions)), nil
 	}
 
 	used := make([]int, 0, len(slotSet))
@@ -1780,7 +1781,7 @@ func PartitionRangeForExpr(sctx base.PlanContext, expr expression.Expression,
 
 type partitionRangePruner interface {
 	partitionRangeForExpr(base.PlanContext, expression.Expression) (start, end int, succ bool)
-	fullRange() PartitionRangeOR
+	GetFullRange() PartitionRangeOR
 }
 
 var _ partitionRangePruner = &RangePruner{}
@@ -1811,15 +1812,15 @@ func (p *RangePruner) partitionRangeForExpr(sctx base.PlanContext, expr expressi
 	return start, end, true
 }
 
-func (p *RangePruner) fullRange() PartitionRangeOR {
+func (p *RangePruner) GetFullRange() PartitionRangeOR {
 	return GetFullRange(p.LessThan.Length())
 }
 
 // partitionRangeForOrExpr calculate the partitions for or(expr1, expr2)
 func partitionRangeForOrExpr(sctx base.PlanContext, expr1, expr2 expression.Expression,
 	pruner partitionRangePruner) PartitionRangeOR {
-	tmp1 := PartitionRangeForExpr(sctx, expr1, pruner, pruner.fullRange())
-	tmp2 := PartitionRangeForExpr(sctx, expr2, pruner, pruner.fullRange())
+	tmp1 := PartitionRangeForExpr(sctx, expr1, pruner, pruner.GetFullRange())
+	tmp2 := PartitionRangeForExpr(sctx, expr2, pruner, pruner.GetFullRange())
 	return tmp1.Union(tmp2)
 }
 
@@ -1827,31 +1828,31 @@ func partitionRangeColumnForInExpr(sctx base.PlanContext, args []expression.Expr
 	pruner *RangeColumnsPruner) PartitionRangeOR {
 	col, ok := args[0].(*expression.Column)
 	if !ok || col.ID != pruner.PartCols[0].ID {
-		return pruner.fullRange()
+		return pruner.GetFullRange()
 	}
 
 	var result PartitionRangeOR
 	for i := 1; i < len(args); i++ {
 		constExpr, ok := args[i].(*expression.Constant)
 		if !ok {
-			return pruner.fullRange()
+			return pruner.GetFullRange()
 		}
 		switch constExpr.Value.Kind() {
 		case types.KindInt64, types.KindUint64, types.KindMysqlTime, types.KindString: // for safety, only support string,int and datetime now
 		case types.KindNull:
 			continue
 		default:
-			return pruner.fullRange()
+			return pruner.GetFullRange()
 		}
 
 		// convert all elements to EQ-exprs and prune them one by one
 		sf, err := expression.NewFunction(sctx.GetExprCtx(), ast.EQ, types.NewFieldType(types.KindInt64), []expression.Expression{col, args[i]}...)
 		if err != nil {
-			return pruner.fullRange()
+			return pruner.GetFullRange()
 		}
 		start, end, ok := pruner.partitionRangeForExpr(sctx, sf)
 		if !ok {
-			return pruner.fullRange()
+			return pruner.GetFullRange()
 		}
 		result = append(result, PartitionRange{start, end})
 	}
@@ -1863,14 +1864,14 @@ func partitionRangeForInExpr(sctx base.PlanContext, args []expression.Expression
 	pruner *RangePruner) PartitionRangeOR {
 	col, ok := args[0].(*expression.Column)
 	if !ok || col.ID != pruner.Col.ID {
-		return pruner.fullRange()
+		return pruner.GetFullRange()
 	}
 
 	var result PartitionRangeOR
 	for i := 1; i < len(args); i++ {
 		constExpr, ok := args[i].(*expression.Constant)
 		if !ok {
-			return pruner.fullRange()
+			return pruner.GetFullRange()
 		}
 		if constExpr.Value.Kind() == types.KindNull {
 			continue
@@ -1889,7 +1890,7 @@ func partitionRangeForInExpr(sctx base.PlanContext, args []expression.Expression
 			unsigned = mysql.HasUnsignedFlag(constExpr.GetType(sctx.GetExprCtx().GetEvalCtx()).GetFlag())
 		}
 		if err != nil {
-			return pruner.fullRange()
+			return pruner.GetFullRange()
 		}
 
 		start, end := PruneUseBinarySearch(pruner.LessThan, DataForPrune{Op: ast.EQ, C: val, Unsigned: unsigned})
@@ -2356,7 +2357,7 @@ func makeRangeColumnPruner(columns []*expression.Column, pi *model.PartitionInfo
 	return &RangeColumnsPruner{lessThan, partCols}, nil
 }
 
-func (p *RangeColumnsPruner) fullRange() PartitionRangeOR {
+func (p *RangeColumnsPruner) GetFullRange() PartitionRangeOR {
 	return GetFullRange(len(p.LessThan))
 }
 

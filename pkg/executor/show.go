@@ -1566,7 +1566,7 @@ func constructResultOfShowCreateTable(ctx sessionctx.Context, dbName *ast.CIStr,
 	// For sharded+partitioned tables, emit the real partition clause.
 	if tableInfo.ShardKeyInfo == nil {
 		ddl.AppendPartitionInfo(tableInfo.Partition, buf, sqlMode)
-	} else if tableInfo.Partition != nil && tableInfo.Partition.Type != pmodel.PartitionTypeNone {
+	} else if tableInfo.Partition != nil && tableInfo.Partition.Type != ast.PartitionTypeNone {
 		ddl.AppendPartitionInfo(tableInfo.Partition, buf, sqlMode)
 	}
 	return nil

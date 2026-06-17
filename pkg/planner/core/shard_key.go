@@ -28,9 +28,9 @@ import (
 func extractTableFromPlan(plan base.PhysicalPlan) *model.TableInfo {
 	for plan != nil {
 		switch p := plan.(type) {
-		case *PhysicalTableScan:
+		case *physicalop.PhysicalTableScan:
 			return p.Table
-		case *PhysicalIndexScan:
+		case *physicalop.PhysicalIndexScan:
 			return p.Table
 		case *physicalop.PhysicalExchangeReceiver:
 			if len(p.Children()) > 0 {
