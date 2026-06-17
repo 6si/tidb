@@ -4847,6 +4847,17 @@ func truncateTableByReassignPartitionIDs(t *meta.Mutator, tblInfo *model.TableIn
 		newDefs = append(newDefs, newDef)
 	}
 	tblInfo.Partition.Definitions = newDefs
+
+	// For shard-only tables, update ShardKeyInfo.ShardIDs to match the new
+	// partition definition IDs. Without this, GetPartition() after TRUNCATE
+	// would fail to find the new physical tables by their new IDs.
+	if ski := tblInfo.ShardKeyInfo; ski != nil && len(ski.ShardIDs) > 0 {
+		if len(pids) == len(ski.ShardIDs) {
+			ski.ShardIDs = make([]int64, len(pids))
+			copy(ski.ShardIDs, pids)
+		}
+	}
+
 	return pids, nil
 }
 
