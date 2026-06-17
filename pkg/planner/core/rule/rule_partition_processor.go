@@ -1223,7 +1223,7 @@ func (s *PartitionProcessor) pruneShardKeyPartition(_ base.PlanContext, pi *mode
 					}
 				}
 			}
-			slotSet[int(h.Sum32()%uint32(shardCnt)) //nolint:gosec] = struct{}{}
+			slotSet[int(h.Sum32()%uint32(shardCnt))] = struct{}{} //nolint:gosec
 			return
 		}
 		for _, v := range colVals[col] {
