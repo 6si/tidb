@@ -67,7 +67,7 @@ func BuildEncodedOperationHint(vars *variable.SessionVars, scan *physicalop.Phys
 	}
 
 	// Identify columns eligible for dictionary encoding based on NDV statistics
-	if scan.StatsInfo() != nil && scan.Table != nil {
+	if scan != nil && scan.StatsInfo() != nil && scan.Table != nil {
 		for _, col := range scan.Columns {
 			ndv := estimateColumnNDV(scan, col.ID)
 			if ndv > 0 && ndv <= hint.MaxCardinality {
@@ -92,7 +92,7 @@ func estimateColumnNDV(scan *physicalop.PhysicalTableScan, colID int64) int64 {
 
 // getColNDVFromStats extracts NDV for a column from StatsInfo.
 func getColNDVFromStats(stats *property.StatsInfo, colID int64) int64 {
-	if stats.ColNDVs == nil {
+	if stats == nil || stats.ColNDVs == nil {
 		return 0
 	}
 
@@ -119,9 +119,9 @@ func IsColumnDictEligible(
 		return false
 	}
 	switch tp.GetType() {
-	case 1, 2, 3, 4, 5, 8, 9: // TINYINT, SMALLINT, MEDIUMINT, INT, BIGINT, etc.
+	case 1, 2, 3, 8, 9: // TINYINT(1), SMALLINT(2), INT(3), BIGINT(8), MEDIUMINT(9)
 		return true
-	case 15, 253, 254: // VARCHAR, VARBINARY, CHAR
+	case 15, 253, 254: // VARCHAR(15), VARBINARY(253), CHAR(254)
 		return true
 	default:
 		return false

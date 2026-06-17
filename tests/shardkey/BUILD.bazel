@@ -1,0 +1,22 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_test")
+
+go_test(
+    name = "shardkey_test",
+    timeout = "short",
+    srcs = [
+        "ddl_test.go",
+        "dml_test.go",
+        "encoding_test.go",
+        "mpp_test.go",
+    ],
+    flaky = True,
+    shard_count = 50,
+    deps = [
+        "//pkg/domain",
+        "//pkg/meta/model",
+        "//pkg/parser/ast",
+        "//pkg/testkit",
+        "//pkg/util/dbterror",
+        "@com_github_stretchr_testify//require",
+    ],
+)
