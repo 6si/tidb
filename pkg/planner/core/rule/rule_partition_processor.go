@@ -1150,11 +1150,13 @@ func (s *PartitionProcessor) PruneShardKeyPartition(_ base.PlanContext, pi *mode
 
 	// Build a map from shard key column ID to its position in the shard key.
 	// The expression columns carry the ColInfo which has the table-level column ID.
-	shardColIDs := make(map[int64]int, len(ski.Columns)) // colID → position in ski.Columns
+	shardColIDs := make(map[int64]int, len(ski.Columns))    // colID → position in ski.Columns
+	shardColCollations := make(map[int]string, len(ski.Columns)) // shard position → collation
 	for i, colName := range ski.Columns {
 		for _, col := range tblInfo.Columns {
 			if col.Name.L == colName {
 				shardColIDs[col.ID] = i
+				shardColCollations[i] = col.GetCollate()
 				break
 			}
 		}
@@ -1179,25 +1181,49 @@ func (s *PartitionProcessor) PruneShardKeyPartition(_ base.PlanContext, pi *mode
 	colVals := make([][]types.Datum, len(ski.Columns))
 	for _, cond := range conds {
 		sf, ok := cond.(*expression.ScalarFunction)
-		if !ok || sf.FuncName.L != ast.EQ {
+		if !ok {
 			continue
 		}
-		args := sf.GetArgs()
-		if len(args) != 2 {
-			continue
+		switch sf.FuncName.L {
+		case ast.EQ:
+			args := sf.GetArgs()
+			if len(args) != 2 {
+				continue
+			}
+			col, cnst := extractColAndConst(args[0], args[1])
+			if col == nil {
+				col, cnst = extractColAndConst(args[1], args[0])
+			}
+			if col == nil || cnst == nil {
+				continue
+			}
+			pos, isShardCol := exprColToShardPos[col.UniqueID]
+			if !isShardCol {
+				continue
+			}
+			colVals[pos] = appendDistinct(colVals[pos], cnst.Value)
+		case ast.In:
+			// IN(col, val1, val2, ...) — first arg is column, rest are constants
+			args := sf.GetArgs()
+			if len(args) < 2 {
+				continue
+			}
+			col, ok := args[0].(*expression.Column)
+			if !ok {
+				continue
+			}
+			pos, isShardCol := exprColToShardPos[col.UniqueID]
+			if !isShardCol {
+				continue
+			}
+			for _, arg := range args[1:] {
+				cnst, ok := arg.(*expression.Constant)
+				if !ok {
+					continue
+				}
+				colVals[pos] = appendDistinct(colVals[pos], cnst.Value)
+			}
 		}
-		col, cnst := extractColAndConst(args[0], args[1])
-		if col == nil {
-			col, cnst = extractColAndConst(args[1], args[0])
-		}
-		if col == nil || cnst == nil {
-			continue
-		}
-		pos, isShardCol := exprColToShardPos[col.UniqueID]
-		if !isShardCol {
-			continue
-		}
-		colVals[pos] = appendDistinct(colVals[pos], cnst.Value)
 	}
 
 	// If any shard key column has no equality constraint, we cannot prune.
@@ -1208,15 +1234,22 @@ func (s *PartitionProcessor) PruneShardKeyPartition(_ base.PlanContext, pi *mode
 	}
 
 	// Compute the set of shard slots by hashing every combination of column values.
+	// IMPORTANT: Set the column's collation on each Datum before hashing so that
+	// ToHashKey() uses the same collation as the write path (which inherits it from
+	// the column definition). Without this, string constants may hash differently
+	// at prune time vs write time, causing reads to target the wrong shard.
 	slotSet := make(map[int]struct{})
 	var enumerate func(col int, datums []types.Datum)
 	enumerate = func(col int, datums []types.Datum) {
 		if col == len(ski.Columns) {
 			h := crc32.NewIEEE()
-			for _, d := range datums {
+			for i, d := range datums {
 				if d.Kind() == types.KindNull {
 					h.Write([]byte{0})
 				} else {
+					if coll, ok := shardColCollations[i]; ok && coll != "" {
+						d.SetCollation(coll)
+					}
 					data, err := d.ToHashKey()
 					if err == nil {
 						h.Write(data)
