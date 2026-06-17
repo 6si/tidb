@@ -2020,7 +2020,12 @@ func getRangeValue(ctx expression.BuildContext, str string, unsigned bool) (any,
 // CheckDropTablePartition checks if the partition exists and does not allow deleting the last existing partition in the table.
 func CheckDropTablePartition(meta *model.TableInfo, partLowerNames []string) error {
 	pi := meta.Partition
-	if pi.Type != ast.PartitionTypeRange && pi.Type != ast.PartitionTypeList {
+	// For SHARD BY + LIST/RANGE partitioned tables, pi.Type may be stored as PartitionTypeNone
+	// (because the shard sub-partitions use the NONE type) while the logical LIST/RANGE partition
+	// definitions are still valid. Allow DROP PARTITION if the table has shard key info and
+	// named definitions that match the requested partition names.
+	isShardedPartitioned := meta.ShardKeyInfo != nil && len(pi.Definitions) > 0
+	if pi.Type != ast.PartitionTypeRange && pi.Type != ast.PartitionTypeList && !isShardedPartitioned {
 		return dbterror.ErrOnlyOnRangeListPartition.GenWithStackByArgs("DROP")
 	}
 
@@ -2089,6 +2094,10 @@ func getPartitionIDsFromDefinitions(defs []model.PartitionDefinition) []int64 {
 	pids := make([]int64, 0, len(defs))
 	for _, def := range defs {
 		pids = append(pids, def.ID)
+		// For SHARD BY + partitioned tables, each partition has ShardIDs for
+		// its physical shard sub-ranges. Include them so the GC range delete
+		// cleans up the actual data.
+		pids = append(pids, def.ShardIDs...)
 	}
 	return pids
 }

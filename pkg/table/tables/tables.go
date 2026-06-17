@@ -34,6 +34,7 @@ import (
 	"github.com/pingcap/tidb/pkg/meta/autoid"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/ast"
+	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/statistics"
@@ -215,6 +216,70 @@ func TableFromMeta(allocs autoid.Allocators, tblInfo *model.TableInfo) (table.Ta
 	}
 	var t TableCommon
 	initTableCommon(&t, tblInfo, tblInfo.ID, columns, allocs, constraints)
+	if ski := tblInfo.ShardKeyInfo; ski != nil && shardIDsPopulated(ski, tblInfo.GetPartitionInfo()) {
+		// Route ALL fully-initialized sharded tables through newShardedTable so the planner
+		// sees a *shardedTable and the ShardedPartitionedTable interface check in
+		// PartitionPruning succeeds. Tables with unpopulated ShardIDs (e.g. during DDL
+		// validation before IDs are assigned) fall through to regular table construction.
+		//
+		// Inject a synthetic flat PartitionInfo into a copy of tblInfo so that
+		// tbl.Meta().Partition.Definitions has one entry per physical shard. This ensures
+		// that builder.go's pi.Definitions[idx].ID returns a physical shard ID and
+		// tbl.GetPartition(physID) resolves correctly.
+		//
+		// The original LIST/RANGE PartitionInfo is preserved as origPartInfo inside
+		// shardedTable for two-stage partition pruning.
+		origPI := tblInfo.GetPartitionInfo()
+		if origPI == nil && len(ski.ShardIDs) > 0 {
+			// Shard-only: build flat PI from ski.ShardIDs.
+			defs := make([]model.PartitionDefinition, len(ski.ShardIDs))
+			for i, physID := range ski.ShardIDs {
+				defs[i] = model.PartitionDefinition{
+					ID:   physID,
+					Name: pmodel.NewCIStr(fmt.Sprintf("shard_%d", i)),
+				}
+			}
+			tblInfo.Partition = &model.PartitionInfo{
+				// Type=0 (PartitionTypeNone) falls through the partition-processor switch to
+				// makeUnionAllChildren, which scans all shard physical IDs. Hash (Type=2) would
+				// try to parse pi.Expr as a SQL expression, but shard routing uses CRC32, not SQL.
+				Type:        0,
+				Enable:      true,
+				Num:         uint64(len(ski.ShardIDs)),
+				Definitions: defs,
+			}
+		} else if origPI != nil && len(origPI.Definitions) > 0 && len(origPI.Definitions[0].ShardIDs) > 0 {
+			// Partitioned+sharded: build flat PI with one entry per physical shard
+			// (logicalPartCnt * shardCnt entries), laid out as
+			// flatIdx = partIdx*shardCnt + shardSlot.
+			// The original LIST/RANGE PI is saved; tblInfo gets a mutated copy with the
+			// flat PI so that tbl.Meta().Partition reflects the physical layout.
+			flatDefs := make([]model.PartitionDefinition, 0, len(origPI.Definitions)*ski.ShardCnt)
+			for _, def := range origPI.Definitions {
+				for si, physID := range def.ShardIDs {
+					flatDefs = append(flatDefs, model.PartitionDefinition{
+						ID:   physID,
+						Name: pmodel.NewCIStr(fmt.Sprintf("%s_s%d", def.Name.L, si)),
+					})
+				}
+			}
+			// Build the flat PI. We pass it to newShardedTable which stores it as
+			// flatPI on the shardedTable. shardedTable.Meta() is overridden to return
+			// a copy of tblInfo with flatPI substituted in, so that:
+			//   - builder.go sees flat physical shard entries (correct for query execution)
+			//   - t.meta still has the original LIST/RANGE PI (correct for DDL)
+			flatPI := &model.PartitionInfo{
+				Type:        0,
+				Enable:      true,
+				Num:         uint64(len(flatDefs)),
+				Definitions: flatDefs,
+			}
+			// Pass origPI explicitly so newShardedTable can set origPartInfo for
+			// two-stage pruning, and flatPI so Meta() can return the physical layout.
+			return newShardedTable(&t, tblInfo, origPI, flatPI)
+		}
+		return newShardedTable(&t, tblInfo)
+	}
 	if tblInfo.GetPartitionInfo() == nil {
 		if err := initTableIndices(&t); err != nil {
 			return nil, err
@@ -225,6 +290,27 @@ func TableFromMeta(allocs autoid.Allocators, tblInfo *model.TableInfo) (table.Ta
 		return &t, nil
 	}
 	return newPartitionedTable(&t, tblInfo)
+}
+
+// shardIDsPopulated reports whether a sharded table's physical shard IDs have been
+// assigned by the DDL executor. Until they are, TableFromMeta is called for DDL
+// validation purposes and we must not route through newShardedTable.
+//
+//   - Shard-only tables: IDs are in ski.ShardIDs — non-empty means populated.
+//   - Partitioned+sharded tables: IDs are in partInfo.Definitions[i].ShardIDs —
+//     we check the first definition that has any ShardIDs.
+func shardIDsPopulated(ski *model.ShardKeyInfo, partInfo *model.PartitionInfo) bool {
+	if len(ski.ShardIDs) > 0 {
+		return true
+	}
+	if partInfo != nil {
+		for i := range partInfo.Definitions {
+			if len(partInfo.Definitions[i].ShardIDs) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func buildGeneratedExpr(tblInfo *model.TableInfo, genExpr string) (ast.ExprNode, error) {

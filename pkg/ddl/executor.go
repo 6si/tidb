@@ -2230,6 +2230,16 @@ func (e *executor) AddTablePartitions(ctx sessionctx.Context, ident ast.Ident, s
 	}
 
 	meta := t.Meta()
+	// For combined shard+partitioned tables, Meta() returns the synthetic flat shard
+	// PartitionInfo (Type=0, no Columns). We must use the real PartitionInfo for ADD
+	// PARTITION so that BuildAddedPartitionInfo uses the correct type (e.g. LIST COLUMNS).
+	if spt, ok := t.(table.ShardedPartitionedTable); ok {
+		if orig := spt.OrigPartitionInfo(); orig != nil {
+			metaCopy := *meta
+			metaCopy.Partition = orig
+			meta = &metaCopy
+		}
+	}
 	pi := meta.GetPartitionInfo()
 	if pi == nil {
 		return errors.Trace(dbterror.ErrPartitionMgmtOnNonpartitioned)
@@ -2297,6 +2307,9 @@ func (e *executor) AddTablePartitions(ctx sessionctx.Context, ident ast.Ident, s
 	job.AddSystemVars(vardef.TiDBScatterRegion, getScatterScopeFromSessionctx(ctx))
 	args := &model.TablePartitionArgs{
 		PartInfo: partInfo,
+	}
+	if ski := meta.ShardKeyInfo; ski != nil && ski.ShardCnt > 0 {
+		args.ShardCnt = ski.ShardCnt
 	}
 
 	if spec.Tp == ast.AlterTableAddLastPartition && spec.Partition != nil {
@@ -2852,6 +2865,16 @@ func (e *executor) DropTablePartition(ctx sessionctx.Context, ident ast.Ident, s
 		return errors.Trace(infoschema.ErrTableNotExists.GenWithStackByArgs(ident.Schema, ident.Name))
 	}
 	meta := t.Meta()
+	// For partitioned+sharded tables, Meta() returns a tblInfo with a flat synthetic PI
+	// (one entry per physical shard). DDL operations must see the original LIST/RANGE PI
+	// for correct partition name lookups. Use a local copy with origPartInfo substituted in.
+	if spt, ok := t.(table.ShardedPartitionedTable); ok {
+		if origPI := spt.OrigPartitionInfo(); origPI != nil {
+			cloned := *meta
+			cloned.Partition = origPI
+			meta = &cloned
+		}
+	}
 	if meta.GetPartitionInfo() == nil {
 		return errors.Trace(dbterror.ErrPartitionMgmtOnNonpartitioned)
 	}
@@ -7062,6 +7085,12 @@ var (
 	fastDDLIntervalPolicy = []time.Duration{
 		500 * time.Millisecond,
 	}
+	// fastPartitionDDLIntervalPolicy is used for ADD/DROP PARTITION operations
+	// which complete in ~150ms but were previously stuck on the 500ms normalDDLIntervalPolicy
+	// floor. 100ms polling drops end-to-end latency from ~700ms to ~200ms.
+	fastPartitionDDLIntervalPolicy = []time.Duration{
+		100 * time.Millisecond,
+	}
 	normalDDLIntervalPolicy = []time.Duration{
 		500 * time.Millisecond,
 		500 * time.Millisecond,
@@ -7093,6 +7122,8 @@ func getJobCheckInterval(action model.ActionType, i int) (time.Duration, bool) {
 		return getIntervalFromPolicy(slowDDLIntervalPolicy, i)
 	case model.ActionCreateTable, model.ActionCreateSchema:
 		return getIntervalFromPolicy(fastDDLIntervalPolicy, i)
+	case model.ActionAddTablePartition, model.ActionDropTablePartition:
+		return getIntervalFromPolicy(fastPartitionDDLIntervalPolicy, i)
 	default:
 		return getIntervalFromPolicy(normalDDLIntervalPolicy, i)
 	}

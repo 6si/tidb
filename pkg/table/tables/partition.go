@@ -1584,6 +1584,118 @@ func (t *partitionedTable) locateRangePartition(ctx expression.EvalContext, part
 	return pos, nil
 }
 
+// locateRangeColumnPartitionByExpr locates the partition index for a row using RANGE COLUMNS
+// partition expression. This is a package-level helper callable without a partitionedTable receiver.
+func locateRangeColumnPartitionByExpr(ctx expression.EvalContext, partitionExpr *PartitionExpr, r []types.Datum) (int, error) {
+	upperBounds := partitionExpr.UpperBounds
+	var lastError error
+	evalBuffer := chunk.MutRowFromDatums(r)
+	idx := sort.Search(len(upperBounds), func(i int) bool {
+		evalBuffer.SetDatums(r...)
+		ret, isNull, err := upperBounds[i].EvalInt(ctx, evalBuffer.ToRow())
+		if err != nil {
+			lastError = err
+			return true
+		}
+		if isNull {
+			return true
+		}
+		return ret > 0
+	})
+	if lastError != nil {
+		return 0, errors.Trace(lastError)
+	}
+	if idx >= len(upperBounds) {
+		return 0, table.ErrNoPartitionForGivenValue.GenWithStackByArgs("from column_list")
+	}
+	return idx, nil
+}
+
+// locateRangePartitionByExpr locates the partition index for a row using RANGE partition expression.
+// This is a package-level helper callable without a partitionedTable receiver.
+func locateRangePartitionByExpr(ctx expression.EvalContext, partitionExpr *PartitionExpr, r []types.Datum) (int, error) {
+	var (
+		ret    int64
+		val    int64
+		isNull bool
+		err    error
+	)
+	if col, ok := partitionExpr.Expr.(*expression.Column); ok {
+		if r[col.Index].IsNull() {
+			isNull = true
+		}
+		ret = r[col.Index].GetInt64()
+	} else {
+		evalBuffer := chunk.MutRowFromDatums(r)
+		evalBuffer.SetDatums(r...)
+		val, isNull, err = partitionExpr.Expr.EvalInt(ctx, evalBuffer.ToRow())
+		if err != nil {
+			return 0, err
+		}
+		ret = val
+	}
+	unsigned := mysql.HasUnsignedFlag(partitionExpr.Expr.GetType(ctx).GetFlag())
+	ranges := partitionExpr.ForRangePruning
+	length := len(ranges.LessThan)
+	pos := sort.Search(length, func(i int) bool {
+		if isNull {
+			return true
+		}
+		return ranges.Compare(i, ret, unsigned) > 0
+	})
+	if isNull {
+		pos = 0
+	}
+	if pos < 0 || pos >= length {
+		var valueMsg string
+		if unsigned {
+			valueMsg = fmt.Sprintf("%d", uint64(ret))
+		} else {
+			valueMsg = fmt.Sprintf("%d", ret)
+		}
+		return 0, table.ErrNoPartitionForGivenValue.GenWithStackByArgs(valueMsg)
+	}
+	return pos, nil
+}
+
+// locateHashPartitionByExpr locates the hash partition index for a row using the HASH partition
+// expression. This is a package-level helper callable without a partitionedTable receiver.
+func locateHashPartitionByExpr(ctx expression.EvalContext, partExpr *PartitionExpr, numParts uint64, r []types.Datum) (int, error) {
+	if col, ok := partExpr.Expr.(*expression.Column); ok {
+		var data types.Datum
+		switch r[col.Index].Kind() {
+		case types.KindInt64, types.KindUint64:
+			data = r[col.Index]
+		default:
+			var err error
+			data, err = r[col.Index].ConvertTo(ctx.TypeCtx(), types.NewFieldType(mysql.TypeLong))
+			if err != nil {
+				return 0, err
+			}
+		}
+		ret := data.GetInt64()
+		ret = ret % int64(numParts)
+		if ret < 0 {
+			ret = -ret
+		}
+		return int(ret), nil
+	}
+	evalBuffer := chunk.MutRowFromDatums(r)
+	evalBuffer.SetDatums(r...)
+	ret, isNull, err := partExpr.Expr.EvalInt(ctx, evalBuffer.ToRow())
+	if err != nil {
+		return 0, err
+	}
+	if isNull {
+		return 0, nil
+	}
+	ret = ret % int64(numParts)
+	if ret < 0 {
+		ret = -ret
+	}
+	return int(ret), nil
+}
+
 // TODO: supports linear hashing
 func (t *partitionedTable) locateHashPartition(ctx expression.EvalContext, partExpr *PartitionExpr, numParts uint64, r []types.Datum) (int, error) {
 	if col, ok := partExpr.Expr.(*expression.Column); ok {

@@ -837,6 +837,16 @@ func CalculateTiFlashProgress(tableID int64, replicaCount uint64, tiFlashStores 
 	return is.tiflashReplicaManager.CalculateTiFlashProgress(tableID, replicaCount, tiFlashStores)
 }
 
+// CalculateTiFlashProgressForShards calculates TiFlash replica progress for SHARD BY + PARTITION BY tables,
+// aggregating across all physical shard sub-IDs in the partition.
+func CalculateTiFlashProgressForShards(shardIDs []int64, replicaCount uint64, tiFlashStores map[int64]pdhttp.StoreInfo) (float64, error) {
+	is, err := getGlobalInfoSyncer()
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+	return is.tiflashReplicaManager.CalculateTiFlashProgressForShards(shardIDs, replicaCount, tiFlashStores)
+}
+
 // UpdateTiFlashProgressCache updates tiflashProgressCache
 func UpdateTiFlashProgressCache(tableID int64, progress float64) error {
 	is, err := getGlobalInfoSyncer()
@@ -966,6 +976,8 @@ func ConfigureTiFlashPDForTable(id int64, count uint64, locationLabels *[]string
 }
 
 // ConfigureTiFlashPDForPartitions configures pd rule for all partition in partitioned tables.
+// For sharded-partitioned tables (SPT), each PartitionDefinition carries ShardIDs — the physical
+// shard sub-partition IDs. Rules must be emitted for every physical shard ID, not just p.ID.
 func ConfigureTiFlashPDForPartitions(accel bool, definitions *[]model.PartitionDefinition, count uint64, locationLabels *[]string, tableID int64) error {
 	is, err := getGlobalInfoSyncer()
 	if err != nil {
@@ -975,10 +987,21 @@ func ConfigureTiFlashPDForPartitions(accel bool, definitions *[]model.PartitionD
 	rules := make([]*pdhttp.Rule, 0, len(*definitions))
 	pids := make([]int64, 0, len(*definitions))
 	for _, p := range *definitions {
-		logutil.BgLogger().Info("ConfigureTiFlashPDForPartitions", zap.Int64("tableID", tableID), zap.Int64("partID", p.ID), zap.Bool("accel", accel), zap.Uint64("count", count))
-		ruleNew := MakeNewRule(p.ID, count, *locationLabels)
-		rules = append(rules, &ruleNew)
-		pids = append(pids, p.ID)
+		if len(p.ShardIDs) > 0 {
+			// SPT: emit one rule per physical shard sub-partition; skip the logical partition ID
+			// (p.ID) — data lives in shard IDs, not the logical partition region.
+			for _, shardID := range p.ShardIDs {
+				logutil.BgLogger().Info("ConfigureTiFlashPDForPartitions (shard)", zap.Int64("tableID", tableID), zap.Int64("partID", p.ID), zap.Int64("shardID", shardID), zap.Bool("accel", accel), zap.Uint64("count", count))
+				ruleNew := MakeNewRule(shardID, count, *locationLabels)
+				rules = append(rules, &ruleNew)
+				pids = append(pids, shardID)
+			}
+		} else {
+			logutil.BgLogger().Info("ConfigureTiFlashPDForPartitions", zap.Int64("tableID", tableID), zap.Int64("partID", p.ID), zap.Bool("accel", accel), zap.Uint64("count", count))
+			ruleNew := MakeNewRule(p.ID, count, *locationLabels)
+			rules = append(rules, &ruleNew)
+			pids = append(pids, p.ID)
+		}
 	}
 	if e := is.tiflashReplicaManager.SetPlacementRuleBatch(ctx, rules); e != nil {
 		return errors.Trace(e)
@@ -989,6 +1012,22 @@ func ConfigureTiFlashPDForPartitions(accel bool, definitions *[]model.PartitionD
 		}
 	}
 	return nil
+}
+
+// ConfigureTiFlashPDForShardedTable configures pd rules for a shard-only (SST) table.
+func ConfigureTiFlashPDForShardedTable(shardIDs []int64, count uint64, locationLabels *[]string) error {
+	is, err := getGlobalInfoSyncer()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	ctx := context.Background()
+	rules := make([]*pdhttp.Rule, 0, len(shardIDs))
+	for _, id := range shardIDs {
+		logutil.BgLogger().Info("ConfigureTiFlashPDForShardedTable", zap.Int64("shardID", id), zap.Uint64("count", count))
+		ruleNew := MakeNewRule(id, count, *locationLabels)
+		rules = append(rules, &ruleNew)
+	}
+	return errors.Trace(is.tiflashReplicaManager.SetPlacementRuleBatch(ctx, rules))
 }
 
 // StoreInternalSession is the entry function for store an internal session to Manager.

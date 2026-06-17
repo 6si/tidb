@@ -51,6 +51,9 @@ type TiFlashReplicaStatus struct {
 	LogicalTableAvailable bool
 	HighPriority          bool
 	IsPartition           bool
+	// ShardIDs holds the physical shard sub-IDs for SHARD BY + PARTITION BY partitions.
+	// When non-empty, progress must be calculated across all shard IDs rather than using ID.
+	ShardIDs []int64
 }
 
 // TiFlashTick is type for backoff threshold.
@@ -121,6 +124,9 @@ type TiFlashManagementContext struct {
 type AvailableTableID struct {
 	ID          int64
 	IsPartition bool
+	// ShardIDs holds shard sub-IDs for SHARD BY + PARTITION BY partitions (SPT). Non-nil means
+	// progress must be computed across these IDs rather than using ID alone.
+	ShardIDs []int64
 }
 
 // Tick will first check increase Counter.
@@ -241,17 +247,35 @@ func LoadTiFlashReplicaInfo(tblInfo *model.TableInfo, tableList *[]TiFlashReplic
 	if pi := tblInfo.GetPartitionInfo(); pi != nil {
 		for _, p := range pi.Definitions {
 			logutil.DDLLogger().Debug(fmt.Sprintf("Table %v has partition %v\n", tblInfo.ID, p.ID))
-			*tableList = append(*tableList, TiFlashReplicaStatus{p.ID,
-				tblInfo.TiFlashReplica.Count, tblInfo.TiFlashReplica.LocationLabels, tblInfo.TiFlashReplica.IsPartitionAvailable(p.ID), tblInfo.TiFlashReplica.Available, false, true})
+			status := TiFlashReplicaStatus{ID: p.ID,
+				Count: tblInfo.TiFlashReplica.Count, LocationLabels: tblInfo.TiFlashReplica.LocationLabels,
+				Available: tblInfo.TiFlashReplica.IsPartitionAvailable(p.ID), LogicalTableAvailable: tblInfo.TiFlashReplica.Available,
+				HighPriority: false, IsPartition: true}
+			if len(p.ShardIDs) > 0 {
+				// SPT: progress must be computed across shard sub-IDs; stash them so the
+				// poll loop can call CalculateTiFlashProgressForShards instead of using p.ID.
+				status.ShardIDs = append([]int64(nil), p.ShardIDs...)
+			}
+			*tableList = append(*tableList, status)
 		}
 		// partitions that in adding mid-state
 		for _, p := range pi.AddingDefinitions {
 			logutil.DDLLogger().Debug(fmt.Sprintf("Table %v has partition adding %v\n", tblInfo.ID, p.ID))
-			*tableList = append(*tableList, TiFlashReplicaStatus{p.ID, tblInfo.TiFlashReplica.Count, tblInfo.TiFlashReplica.LocationLabels, tblInfo.TiFlashReplica.IsPartitionAvailable(p.ID), tblInfo.TiFlashReplica.Available, true, true})
+			status := TiFlashReplicaStatus{ID: p.ID,
+				Count: tblInfo.TiFlashReplica.Count, LocationLabels: tblInfo.TiFlashReplica.LocationLabels,
+				Available: tblInfo.TiFlashReplica.IsPartitionAvailable(p.ID), LogicalTableAvailable: tblInfo.TiFlashReplica.Available,
+				HighPriority: true, IsPartition: true}
+			if len(p.ShardIDs) > 0 {
+				status.ShardIDs = append([]int64(nil), p.ShardIDs...)
+			}
+			*tableList = append(*tableList, status)
 		}
 	} else {
 		logutil.DDLLogger().Debug(fmt.Sprintf("Table %v has no partition\n", tblInfo.ID))
-		*tableList = append(*tableList, TiFlashReplicaStatus{tblInfo.ID, tblInfo.TiFlashReplica.Count, tblInfo.TiFlashReplica.LocationLabels, tblInfo.TiFlashReplica.Available, tblInfo.TiFlashReplica.Available, false, false})
+		*tableList = append(*tableList, TiFlashReplicaStatus{ID: tblInfo.ID,
+			Count: tblInfo.TiFlashReplica.Count, LocationLabels: tblInfo.TiFlashReplica.LocationLabels,
+			Available: tblInfo.TiFlashReplica.Available, LogicalTableAvailable: tblInfo.TiFlashReplica.Available,
+			HighPriority: false, IsPartition: false})
 	}
 }
 
@@ -318,7 +342,13 @@ func PollAvailableTableProgress(schemas infoschema.InfoSchema, _ sessionctx.Cont
 			continue
 		}
 
-		progress, _, err := infosync.CalculateTiFlashProgress(availableTableID.ID, tableInfo.TiFlashReplica.Count, pollTiFlashContext.TiFlashStores)
+		var progress float64
+		var err error
+		if len(availableTableID.ShardIDs) > 0 {
+			progress, _, err = infosync.CalculateTiFlashProgressForShards(availableTableID.ShardIDs, tableInfo.TiFlashReplica.Count, pollTiFlashContext.TiFlashStores)
+		} else {
+			progress, _, err = infosync.CalculateTiFlashProgress(availableTableID.ID, tableInfo.TiFlashReplica.Count, pollTiFlashContext.TiFlashStores)
+		}
 		if err != nil {
 			if intest.EnableInternalCheck && err.Error() != "EOF" {
 				// In the test, the server cannot start up because the port is occupied.
@@ -421,9 +451,16 @@ func (d *ddl) refreshTiFlashTicker(ctx sessionctx.Context, pollTiFlashContext *T
 				continue
 			}
 
-			// Collect the replica progress for this table from all TiFlash stores.
-			// fullReplicasProgress is the progress of all TiFlash replicas is setup, while oneReplicaProgress is the progress of at least 1 replicas.
-			fullReplicasProgress, oneReplicaProgress, err := infosync.CalculateTiFlashProgress(tb.ID, tb.Count, pollTiFlashContext.TiFlashStores)
+			var (
+				fullReplicasProgress float64
+				oneReplicaProgress   float64
+				err                  error
+			)
+			if len(tb.ShardIDs) > 0 {
+				fullReplicasProgress, oneReplicaProgress, err = infosync.CalculateTiFlashProgressForShards(tb.ShardIDs, tb.Count, pollTiFlashContext.TiFlashStores)
+			} else {
+				fullReplicasProgress, oneReplicaProgress, err = infosync.CalculateTiFlashProgress(tb.ID, tb.Count, pollTiFlashContext.TiFlashStores)
+			}
 			if err != nil {
 				logutil.DDLLogger().Error("get tiflash sync progress failed",
 					zap.Error(err),
@@ -477,7 +514,7 @@ func (d *ddl) refreshTiFlashTicker(ctx sessionctx.Context, pollTiFlashContext *T
 			}
 		} else {
 			if needPushPending {
-				pollTiFlashContext.UpdatingProgressTables.PushFront(AvailableTableID{tb.ID, tb.IsPartition})
+				pollTiFlashContext.UpdatingProgressTables.PushFront(AvailableTableID{ID: tb.ID, IsPartition: tb.IsPartition, ShardIDs: tb.ShardIDs})
 			}
 		}
 	}
