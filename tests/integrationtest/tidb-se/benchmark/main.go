@@ -44,11 +44,13 @@ var (
 	password   = flag.String("password", "", "TiDB password")
 	database   = flag.String("db", "bench_tidb_se", "Database name")
 	rows       = flag.Int("rows", 10_000_000, "Number of fact table rows to load")
+	jsonRows   = flag.Int("json-rows", 0, "Number of JSON event rows (default: same as --rows for 100%%)")
 	dimRows    = flag.Int("dim-rows", 1000, "Number of dimension table rows")
 	shards     = flag.Int("shards", 16, "Number of shards for SHARD BY tables")
 	workers    = flag.Int("workers", 8, "Concurrent workers for data loading")
 	skipLoad   = flag.Bool("skip-load", false, "Skip data loading (reuse existing data)")
 	noShard    = flag.Bool("no-shard", false, "Disable SHARD BY syntax (for stock TiDB clusters without shard support)")
+	mode       = flag.String("mode", "h2h", "Benchmark mode: h2h (head-to-head, optimizer chooses engine) or internal (force KV vs Flash)")
 	benchmarks = flag.String("bench", "all", "Comma-separated benchmarks: shard,in,filter,groupby,join,json,all")
 	iterations = flag.Int("iter", 5, "Iterations per benchmark query")
 	jsonSize   = flag.String("json-size", "small", "JSON document size: small (~200B), large (~2-5KB with 20+ paths)")
@@ -63,6 +65,15 @@ type BenchResult struct {
 	OptRows    int64
 	BaseExplan string
 	OptExplan  string
+}
+
+// H2HResult stores a single query latency for head-to-head comparison.
+// Run on both clusters, then diff the output files.
+type H2HResult struct {
+	Category string
+	Name     string
+	Latency  time.Duration
+	RowCount int64
 }
 
 var db *sql.DB
@@ -98,9 +109,14 @@ func main() {
 		fatal("ping: %v", err)
 	}
 
+	// Default json-rows to same as rows (100%)
+	if *jsonRows == 0 {
+		*jsonRows = *rows
+	}
+
 	fmt.Printf("=== tidb-se Performance Benchmark ===\n")
-	fmt.Printf("Host: %s:%d | Rows: %d | Shards: %d | Iterations: %d | JSON: %s\n\n",
-		*host, *port, *rows, *shards, *iterations, *jsonSize)
+	fmt.Printf("Host: %s:%d | Rows: %d | JSON Rows: %d | Shards: %d | Mode: %s | Iter: %d | JSON Size: %s\n\n",
+		*host, *port, *rows, *jsonRows, *shards, *mode, *iterations, *jsonSize)
 
 	if !*skipLoad {
 		setupSchema()
@@ -112,35 +128,42 @@ func main() {
 	// Wait for TiFlash replicas
 	waitForAllReplicas()
 
-	// Run benchmarks
-	selected := parseBenchmarks(*benchmarks)
-	var results []BenchResult
+	// Run benchmarks based on mode
+	if *mode == "h2h" {
+		// Head-to-head mode: let optimizer choose engine, output clean latency-per-query.
+		// Run same queries on both clusters, compare results externally.
+		results := benchHeadToHead()
+		printH2HSummary(results)
+	} else {
+		// Internal mode: force KV vs Flash engine routing for per-feature A/B testing.
+		selected := parseBenchmarks(*benchmarks)
+		var results []BenchResult
 
-	if selected["shard"] && !*noShard {
-		results = append(results, benchShardPointQuery()...)
-	} else if selected["shard"] && *noShard {
-		fmt.Println("\n--- Skipping shard benchmarks (--no-shard mode) ---")
-	}
-	if selected["in"] && !*noShard {
-		results = append(results, benchShardINQuery()...)
-	} else if selected["in"] && *noShard {
-		fmt.Println("--- Skipping IN-clause shard benchmarks (--no-shard mode) ---")
-	}
-	if selected["filter"] {
-		results = append(results, benchEncodedFilter()...)
-	}
-	if selected["groupby"] {
-		results = append(results, benchEncodedGroupBy()...)
-	}
-	if selected["join"] {
-		results = append(results, benchEncodedStarJoin()...)
-	}
-	if selected["json"] {
-		results = append(results, benchJSONShredding()...)
-	}
+		if selected["shard"] && !*noShard {
+			results = append(results, benchShardPointQuery()...)
+		} else if selected["shard"] && *noShard {
+			fmt.Println("\n--- Skipping shard benchmarks (--no-shard mode) ---")
+		}
+		if selected["in"] && !*noShard {
+			results = append(results, benchShardINQuery()...)
+		} else if selected["in"] && *noShard {
+			fmt.Println("--- Skipping IN-clause shard benchmarks (--no-shard mode) ---")
+		}
+		if selected["filter"] {
+			results = append(results, benchEncodedFilter()...)
+		}
+		if selected["groupby"] {
+			results = append(results, benchEncodedGroupBy()...)
+		}
+		if selected["join"] {
+			results = append(results, benchEncodedStarJoin()...)
+		}
+		if selected["json"] {
+			results = append(results, benchJSONShredding()...)
+		}
 
-	// Print summary
-	printSummary(results)
+		printSummary(results)
+	}
 }
 
 // ============================================================================
@@ -350,14 +373,14 @@ func loadFactTables() {
 }
 
 func loadJSONEvents() {
-	jsonRows := *rows / 10 // 10% of fact rows for JSON
+	jsonRowCount := *jsonRows
 	batchSize := 2000
 	if *jsonSize == "large" {
 		batchSize = 500 // smaller batches for large docs to avoid max_allowed_packet
 	}
-	totalBatches := jsonRows / batchSize
+	totalBatches := jsonRowCount / batchSize
 
-	fmt.Printf("  Loading %d JSON events (size=%s)...\n", jsonRows, *jsonSize)
+	fmt.Printf("  Loading %d JSON events (size=%s)...\n", jsonRowCount, *jsonSize)
 	start := time.Now()
 
 	eventTypes := []string{"click", "view", "purchase", "signup", "logout"}
@@ -408,7 +431,7 @@ func loadJSONEvents() {
 
 	wg.Wait()
 	elapsed := time.Since(start)
-	fmt.Printf("  Loaded %d JSON events in %v\n", jsonRows, elapsed)
+	fmt.Printf("  Loaded %d JSON events in %v\n", jsonRowCount, elapsed)
 }
 
 func generateSmallJSON(rng *rand.Rand, id int64, event, page string, duration int, score float64) string {
@@ -1241,6 +1264,234 @@ func benchJSONShredding() []BenchResult {
 	mustExec("SET @@tiflash_json_shredding = ON")
 
 	return results
+}
+
+// ============================================================================
+// Head-to-Head Benchmark (optimizer chooses engine, no forcing)
+// ============================================================================
+
+func benchHeadToHead() []H2HResult {
+	fmt.Println("\n=== Head-to-Head Benchmark (optimizer chooses engine) ===")
+	fmt.Println("  No engine forcing. Run same queries on stock 8.x and tidb-se, compare output.\n")
+
+	var results []H2HResult
+
+	// Enable JSON shredding if available (ignored on stock clusters)
+	mustExec("SET @@tiflash_json_shredding = ON")
+	// Let optimizer use both engines
+	mustExec("SET @@tidb_isolation_read_engines = 'tikv,tiflash'")
+	mustExec("SET @@tidb_allow_mpp = 1")
+
+	// --- Category: Point Lookups ---
+	fmt.Println("--- Point Lookups ---")
+
+	if !*noShard {
+		results = append(results, runH2H("Point Lookup", "Shard key point (tenant_id=42)",
+			"SELECT COUNT(*), SUM(revenue) FROM fact_sharded WHERE tenant_id = 42"))
+
+		results = append(results, runH2H("Point Lookup", "IN clause (5 tenants)",
+			"SELECT COUNT(*), SUM(revenue) FROM fact_sharded WHERE tenant_id IN (42,100,555,1234,7777)"))
+	}
+
+	results = append(results, runH2H("Point Lookup", "Non-shard filter (region_id=5)",
+		"SELECT COUNT(*), SUM(revenue) FROM fact_sharded WHERE region_id = 5"))
+
+	// --- Category: Aggregations ---
+	fmt.Println("--- Aggregations ---")
+
+	results = append(results, runH2H("Aggregation", "GROUP BY status (5 groups)",
+		"SELECT status, COUNT(*), SUM(revenue), AVG(revenue) FROM fact_sharded GROUP BY status"))
+
+	results = append(results, runH2H("Aggregation", "Wide 3-col GROUP BY",
+		`SELECT region_id, industry_id, status,
+			COUNT(*), SUM(revenue), MIN(revenue), MAX(revenue)
+		FROM fact_sharded
+		WHERE created_at >= '2024-01-01'
+		GROUP BY region_id, industry_id, status`))
+
+	results = append(results, runH2H("Aggregation", "GROUP BY region_id (50 groups)",
+		"SELECT region_id, COUNT(*), SUM(revenue), AVG(revenue) FROM fact_sharded GROUP BY region_id"))
+
+	// --- Category: Star Joins ---
+	fmt.Println("--- Star Joins ---")
+
+	results = append(results, runH2H("Star Join", "fact x industry (GROUP BY name)",
+		`SELECT d.name, COUNT(*), SUM(f.revenue)
+		FROM fact_sharded f
+		INNER JOIN dim_industry d ON f.industry_id = d.id
+		WHERE f.status = 'active'
+		GROUP BY d.name
+		ORDER BY SUM(f.revenue) DESC`))
+
+	results = append(results, runH2H("Star Join", "fact x industry x region (2-dim)",
+		`SELECT di.name, dr.country, COUNT(*), SUM(f.revenue)
+		FROM fact_sharded f
+		INNER JOIN dim_industry di ON f.industry_id = di.id
+		INNER JOIN dim_region dr ON f.region_id = dr.id
+		WHERE f.status IN ('active', 'pending')
+		GROUP BY di.name, dr.country
+		ORDER BY SUM(f.revenue) DESC
+		LIMIT 20`))
+
+	results = append(results, runH2H("Star Join", "LEFT JOIN fact x region",
+		`SELECT d.name, COUNT(*), SUM(f.revenue)
+		FROM fact_sharded f
+		LEFT JOIN dim_region d ON f.region_id = d.id
+		GROUP BY d.name
+		ORDER BY COUNT(*) DESC
+		LIMIT 10`))
+
+	// --- Category: JSON Single-Path ---
+	fmt.Println("--- JSON Single-Path ---")
+
+	results = append(results, runH2H("JSON", "GROUP BY $.event",
+		"SELECT payload->>'$.event' AS event, COUNT(*) FROM json_events GROUP BY payload->>'$.event'"))
+
+	results = append(results, runH2H("JSON", "Filter $.event='purchase'",
+		"SELECT COUNT(*) FROM json_events WHERE payload->>'$.event' = 'purchase'"))
+
+	results = append(results, runH2H("JSON", "Nested $.details.source IS NOT NULL",
+		"SELECT COUNT(*) FROM json_events WHERE payload->>'$.details.source' IS NOT NULL"))
+
+	results = append(results, runH2H("JSON", "Shard + JSON filter",
+		`SELECT COUNT(*), payload->>'$.page'
+		FROM json_events
+		WHERE tenant_id = 42 AND payload->>'$.event' = 'click'
+		GROUP BY payload->>'$.page'`))
+
+	// --- Category: JSON Multi-Path ---
+	fmt.Println("--- JSON Multi-Path ---")
+
+	if *jsonSize == "large" {
+		results = append(results, runH2H("JSON Multi-Path", "8-path extract + GROUP BY",
+			`SELECT
+				payload->>'$.event' AS event,
+				payload->>'$.page' AS page,
+				payload->>'$.context.browser' AS browser,
+				payload->>'$.context.device' AS device,
+				payload->>'$.context.os' AS os,
+				payload->>'$.geo.country' AS country,
+				payload->>'$.behavior.scroll_depth' AS scroll,
+				payload->>'$.product.category' AS category,
+				payload->>'$.campaign.source' AS source,
+				payload->>'$.campaign.medium' AS medium,
+				COUNT(*) AS cnt
+			FROM json_events
+			WHERE payload->>'$.event' = 'purchase'
+			GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10`))
+
+		results = append(results, runH2H("JSON Multi-Path", "Multi-path aggregation (5 AVGs)",
+			`SELECT
+				payload->>'$.event' AS event,
+				COUNT(*) AS cnt,
+				AVG(CAST(payload->>'$.duration' AS SIGNED)) AS avg_dur,
+				AVG(CAST(payload->>'$.score' AS DECIMAL(10,2))) AS avg_score,
+				AVG(CAST(payload->>'$.behavior.scroll_depth' AS SIGNED)) AS avg_scroll,
+				AVG(CAST(payload->>'$.behavior.time_on_page' AS SIGNED)) AS avg_time,
+				AVG(CAST(payload->>'$.product.price' AS DECIMAL(10,2))) AS avg_price
+			FROM json_events
+			GROUP BY 1`))
+
+		results = append(results, runH2H("JSON Multi-Path", "Nested filter + 5-path GROUP BY",
+			`SELECT
+				payload->>'$.campaign.source' AS src,
+				payload->>'$.campaign.medium' AS med,
+				payload->>'$.product.category' AS cat,
+				payload->>'$.event' AS event,
+				payload->>'$.page' AS page,
+				COUNT(*) AS cnt,
+				SUM(CAST(payload->>'$.product.price' AS DECIMAL(10,2))) AS total_price
+			FROM json_events
+			WHERE payload->>'$.campaign.source' = 'google'
+			  AND CAST(payload->>'$.product.price' AS DECIMAL(10,2)) > 100
+			GROUP BY 1, 2, 3, 4, 5`))
+	} else {
+		results = append(results, runH2H("JSON Multi-Path", "6-path extract + GROUP BY",
+			`SELECT
+				payload->>'$.event' AS event,
+				payload->>'$.page' AS page,
+				payload->>'$.user_agent' AS ua,
+				payload->>'$.ip' AS ip,
+				CAST(payload->>'$.duration' AS SIGNED) AS dur,
+				CAST(payload->>'$.score' AS DECIMAL(10,2)) AS score,
+				COUNT(*) AS cnt
+			FROM json_events
+			WHERE payload->>'$.event' = 'purchase'
+			GROUP BY 1, 2, 3, 4, 5, 6`))
+
+		results = append(results, runH2H("JSON Multi-Path", "Multi-path aggregation",
+			`SELECT
+				payload->>'$.event' AS event,
+				COUNT(*) AS cnt,
+				AVG(CAST(payload->>'$.duration' AS SIGNED)) AS avg_dur,
+				AVG(CAST(payload->>'$.score' AS DECIMAL(10,2))) AS avg_score
+			FROM json_events
+			GROUP BY 1`))
+	}
+
+	// JSON + dimension JOIN
+	results = append(results, runH2H("JSON Multi-Path", "JSON + dimension JOIN",
+		`SELECT
+			r.country,
+			payload->>'$.event' AS event,
+			COUNT(*) AS cnt,
+			SUM(CAST(payload->>'$.score' AS DECIMAL(10,2))) AS total_score
+		FROM json_events j
+		JOIN dim_region r ON r.id = (j.id % 50) + 1
+		WHERE payload->>'$.event' IN ('purchase', 'signup')
+		GROUP BY 1, 2`))
+
+	return results
+}
+
+func runH2H(category, name, query string) H2HResult {
+	latency := timeQuery(query, *iterations)
+
+	// Get row count
+	var rowCount int64
+	row := db.QueryRow("SELECT COUNT(*) FROM (" + query + ") t")
+	row.Scan(&rowCount)
+
+	fmt.Printf("  %-45s %8s  (%d rows)\n", name, fmtDur(latency), rowCount)
+
+	return H2HResult{
+		Category: category,
+		Name:     name,
+		Latency:  latency,
+		RowCount: rowCount,
+	}
+}
+
+func printH2HSummary(results []H2HResult) {
+	clusterType := "tidb-se"
+	if *noShard {
+		clusterType = "stock-8x"
+	}
+
+	fmt.Println("\n")
+	fmt.Println("==============================================================================")
+	fmt.Printf("  HEAD-TO-HEAD RESULTS — %s (%s:%d)\n", clusterType, *host, *port)
+	fmt.Printf("  Rows: %dM | JSON Rows: %dM | JSON Size: %s | Iter: %d\n",
+		*rows/1_000_000, *jsonRows/1_000_000, *jsonSize, *iterations)
+	fmt.Println("==============================================================================")
+
+	lastCategory := ""
+	for _, r := range results {
+		if r.Category != lastCategory {
+			fmt.Printf("\n  [%s]\n", r.Category)
+			lastCategory = r.Category
+		}
+		fmt.Printf("    %-45s %8s\n", r.Name, fmtDur(r.Latency))
+	}
+
+	fmt.Println("\n==============================================================================")
+
+	// Output machine-readable CSV for easy diffing
+	fmt.Println("\n--- CSV (for comparison) ---")
+	fmt.Printf("cluster,category,name,latency_ms,rows\n")
+	for _, r := range results {
+		fmt.Printf("%s,%s,%s,%d,%d\n", clusterType, r.Category, r.Name, r.Latency.Milliseconds(), r.RowCount)
+	}
 }
 
 // ============================================================================
