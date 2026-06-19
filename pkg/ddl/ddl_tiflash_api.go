@@ -22,10 +22,12 @@ import (
 	"container/list"
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/pkg/config"
 	"github.com/pingcap/tidb/pkg/config/kerneltype"
 	"github.com/pingcap/tidb/pkg/ddl/logutil"
 	"github.com/pingcap/tidb/pkg/domain/infosync"
@@ -114,6 +116,7 @@ func NewPollTiFlashBackoffContext(minThreshold, maxThreshold TiFlashTick, capaci
 type TiFlashManagementContext struct {
 	// The latest TiFlash stores info. For Classic kernel, it contains all TiFlash nodes. For NextGen kernel, it contains only TiFlash write nodes.
 	TiFlashStores map[int64]pd.StoreInfo
+	TiKVStores    map[int64]pd.StoreInfo
 	PollCounter   uint64
 	Backoff       *PollTiFlashBackoffContext
 	// tables waiting for updating progress after become available.
@@ -212,6 +215,7 @@ func NewTiFlashManagementContext() (*TiFlashManagementContext, error) {
 	return &TiFlashManagementContext{
 		PollCounter:            0,
 		TiFlashStores:          make(map[int64]pd.StoreInfo),
+		TiKVStores:             make(map[int64]pd.StoreInfo),
 		Backoff:                c,
 		UpdatingProgressTables: list.New(),
 	}, nil
@@ -289,14 +293,19 @@ func updateTiFlashWriteStores(pollTiFlashContext *TiFlashManagementContext) erro
 		return err
 	}
 	pollTiFlashContext.TiFlashStores = make(map[int64]pd.StoreInfo)
+	pollTiFlashContext.TiKVStores = make(map[int64]pd.StoreInfo)
 	for _, store := range tikvStats.Stores {
-		// Note that only TiFlash write nodes need to be polled under NextGen kernel.
-		// TiFlash compute nodes under NextGen kernel do not hold any Regions data, so it is excluded here.
-		if engine.IsTiFlashWriteHTTPResp(&store.Store) {
+		if engine.IsTiFlashHTTPResp(&store.Store) {
+			// Ignore the TiFlash read node.
+			if !engine.IsTiFlashWriteHTTPResp(&store.Store) {
+				continue
+			}
 			pollTiFlashContext.TiFlashStores[store.Store.ID] = store
+		} else {
+			pollTiFlashContext.TiKVStores[store.Store.ID] = store
 		}
 	}
-	logutil.DDLLogger().Debug("updateTiFlashWriteStores finished", zap.Int("TiFlash store count", len(pollTiFlashContext.TiFlashStores)))
+	logutil.DDLLogger().Debug("updateTiFlashWriteStores finished", zap.Int("TiFlash store count", len(pollTiFlashContext.TiFlashStores)), zap.Int("TiKV store count", len(pollTiFlashContext.TiKVStores)))
 	return nil
 }
 
@@ -342,25 +351,46 @@ func PollAvailableTableProgress(schemas infoschema.InfoSchema, _ sessionctx.Cont
 			continue
 		}
 
-		var progress float64
+		checkTiFlash := config.GetGlobalConfig().CSE.IsTiFlashEnabled()
+		checkColumnar := config.GetGlobalConfig().CSE.IsColumnarStoreEnabled()
+
+		var tiflashProgress = 1.0
+		var columnarProgress = 1.0
 		var err error
-		if len(availableTableID.ShardIDs) > 0 {
-			progress, _, err = infosync.CalculateTiFlashProgressForShards(availableTableID.ShardIDs, tableInfo.TiFlashReplica.Count, pollTiFlashContext.TiFlashStores)
-		} else {
-			progress, _, err = infosync.CalculateTiFlashProgress(availableTableID.ID, tableInfo.TiFlashReplica.Count, pollTiFlashContext.TiFlashStores)
-		}
-		if err != nil {
-			if intest.EnableInternalCheck && err.Error() != "EOF" {
-				// In the test, the server cannot start up because the port is occupied.
-				// Although the port is random. so we need to quickly return when to
-				// fail to get tiflash sync.
-				// https://github.com/pingcap/tidb/issues/39949
-				panic(err)
+
+		if checkTiFlash {
+			if len(availableTableID.ShardIDs) > 0 {
+				tiflashProgress, _, err = infosync.CalculateTiFlashProgressForShards(availableTableID.ShardIDs, tableInfo.TiFlashReplica.Count, pollTiFlashContext.TiFlashStores)
+			} else {
+				tiflashProgress, _, err = infosync.CalculateTiFlashProgress(availableTableID.ID, tableInfo.TiFlashReplica.Count, pollTiFlashContext.TiFlashStores)
 			}
-			pollTiFlashContext.UpdatingProgressTables.Remove(element)
-			element = element.Next()
-			continue
+			if err != nil {
+				if intest.EnableInternalCheck && err.Error() != "EOF" {
+					// In the test, the server cannot start up because the port is occupied.
+					// Although the port is random. so we need to quickly return when to
+					// fail to get tiflash sync.
+					// https://github.com/pingcap/tidb/issues/39949
+					panic(err)
+				}
+				pollTiFlashContext.UpdatingProgressTables.Remove(element)
+				element = element.Next()
+				continue
+			}
 		}
+		if checkColumnar {
+			columnarProgress, err = infosync.CalculateColumnarProgress(availableTableID.ID, pollTiFlashContext.TiKVStores)
+			if err != nil {
+				logutil.DDLLogger().Error("calculate columnar progress failed",
+					zap.Error(err),
+					zap.Int64("tableID", availableTableID.ID),
+					zap.Bool("IsPartition", availableTableID.IsPartition),
+				)
+				pollTiFlashContext.UpdatingProgressTables.Remove(element)
+				element = element.Next()
+				continue
+			}
+		}
+		progress := math.Min(tiflashProgress, columnarProgress)
 		err = infosync.UpdateTiFlashProgressCache(availableTableID.ID, progress)
 		if err != nil {
 			logutil.DDLLogger().Error("update tiflash sync progress cache failed",
@@ -436,6 +466,9 @@ func (d *ddl) refreshTiFlashTicker(ctx sessionctx.Context, pollTiFlashContext *T
 		needPushPending = true
 	}
 
+	checkTiFlash := config.GetGlobalConfig().CSE.IsTiFlashEnabled()
+	checkColumnar := config.GetGlobalConfig().CSE.IsColumnarStoreEnabled()
+
 	for _, tb := range tableList {
 		// For every region in each table, if it has one replica, we reckon it ready.
 		// These request can be batched as an optimization.
@@ -451,53 +484,66 @@ func (d *ddl) refreshTiFlashTicker(ctx sessionctx.Context, pollTiFlashContext *T
 				continue
 			}
 
-			var (
-				fullReplicasProgress float64
-				oneReplicaProgress   float64
-				err                  error
-			)
-			if len(tb.ShardIDs) > 0 {
-				fullReplicasProgress, oneReplicaProgress, err = infosync.CalculateTiFlashProgressForShards(tb.ShardIDs, tb.Count, pollTiFlashContext.TiFlashStores)
-			} else {
-				fullReplicasProgress, oneReplicaProgress, err = infosync.CalculateTiFlashProgress(tb.ID, tb.Count, pollTiFlashContext.TiFlashStores)
+			var tiflashProgress = 1.0
+			var tiflashAvailProgress = 1.0
+			var columnarProgress = 1.0
+			var err error
+			if checkTiFlash {
+				// Collect the replica progress for this table from TiFlash stores.
+				// fullReplicasProgress is the progress of all TiFlash replicas is setup, while availProgress is the progress of at least 1 replicas.
+				if len(tb.ShardIDs) > 0 {
+					tiflashProgress, tiflashAvailProgress, err = infosync.CalculateTiFlashProgressForShards(tb.ShardIDs, tb.Count, pollTiFlashContext.TiFlashStores)
+				} else {
+					tiflashProgress, tiflashAvailProgress, err = infosync.CalculateTiFlashProgress(tb.ID, tb.Count, pollTiFlashContext.TiFlashStores)
+				}
+				logutil.DDLLogger().Debug("tiflashProgress", zap.Float64("progress", tiflashProgress), zap.Float64("availProgress", tiflashAvailProgress))
+				if err != nil {
+					logutil.DDLLogger().Error("get tiflash sync progress failed",
+						zap.Error(err),
+						zap.Int64("tableID", tb.ID),
+					)
+					continue
+				}
 			}
-			if err != nil {
-				logutil.DDLLogger().Error("get tiflash sync progress failed",
-					zap.Error(err),
-					zap.Int64("tableID", tb.ID),
-				)
-				continue
+			if checkColumnar {
+				columnarProgress, err = infosync.CalculateColumnarProgress(tb.ID, pollTiFlashContext.TiKVStores)
+				if err != nil {
+					logutil.DDLLogger().Error("calculate columnar progress failed", zap.Error(err), zap.Int64("tableID", tb.ID))
+					continue
+				}
+				logutil.DDLLogger().Debug("columnarProgress", zap.Float64("progress", columnarProgress))
 			}
-
-			err = infosync.UpdateTiFlashProgressCache(tb.ID, fullReplicasProgress)
+			progress := math.Min(tiflashProgress, columnarProgress)
+			availProgress := math.Min(tiflashAvailProgress, columnarProgress)
+			err = infosync.UpdateTiFlashProgressCache(tb.ID, progress)
 			if err != nil {
 				logutil.DDLLogger().Error("get tiflash sync progress from cache failed",
 					zap.Error(err),
 					zap.Int64("tableID", tb.ID),
 					zap.Bool("IsPartition", tb.IsPartition),
-					zap.Float64("progress", fullReplicasProgress),
-					zap.Float64("oneReplicaProgress", oneReplicaProgress),
+					zap.Float64("progress", progress),
+					zap.Float64("availProgress", availProgress),
 				)
 				continue
 			}
 
 			// `avail` indicates that all replicas have been built, and the tiflash replica
 			// is ready for executing queries.
-			avail := fullReplicasProgress >= 1.0
+			avail := availProgress >= 1.0
 			failpoint.Inject("PollTiFlashReplicaStatusReplaceCurAvailableValue", func(val failpoint.Value) {
 				avail = val.(bool)
 			})
 
-			if fullReplicasProgress != 1 {
-				if oneReplicaProgress >= 1.0 {
-					logutil.DDLLogger().Info("Tiflash replica is not available but at least one replica have been built", zap.Int64("tableID", tb.ID), zap.Float64("progress", fullReplicasProgress), zap.Float64("oneReplicaProgress", oneReplicaProgress))
+			if progress != 1 {
+				if avail {
+					logutil.DDLLogger().Info("Tiflash replica is available but some Region replicas is being built", zap.Int64("tableID", tb.ID), zap.Float64("progress", progress), zap.Float64("availProgress", availProgress))
 				} else {
-					logutil.DDLLogger().Info("Tiflash replica is not available", zap.Int64("tableID", tb.ID), zap.Float64("progress", fullReplicasProgress), zap.Float64("oneReplicaProgress", oneReplicaProgress))
+					logutil.DDLLogger().Info("Tiflash replica is not available", zap.Int64("tableID", tb.ID), zap.Float64("progress", progress), zap.Float64("availProgress", availProgress))
 				}
 				// keep the table in backoff until all replicas are built.
 				pollTiFlashContext.Backoff.Put(tb.ID)
 			} else {
-				logutil.DDLLogger().Info("Tiflash replica is available and all Region replicas have been built", zap.Int64("tableID", tb.ID), zap.Float64("progress", fullReplicasProgress), zap.Float64("oneReplicaProgress", oneReplicaProgress))
+				logutil.DDLLogger().Info("Tiflash replica is available and all Region replicas have been built", zap.Int64("tableID", tb.ID), zap.Float64("progress", progress), zap.Float64("availProgress", availProgress))
 				pollTiFlashContext.Backoff.Remove(tb.ID)
 			}
 			failpoint.Inject("skipUpdateTableReplicaInfoInLoop", func() {
@@ -534,6 +580,10 @@ type pending struct {
 // 3. If the placement rules are missing, it will add by submit a ActionSetTiFlashReplica job to repair the entire table.
 func (d *ddl) refreshTiFlashPlacementRules(sctx sessionctx.Context, tick uint64) error {
 	if tick%RefreshRulesTick.Load() != 0 {
+		return nil
+	}
+	// No need to refresh placement rules if TiFlash is not enabled
+	if !config.GetGlobalConfig().CSE.IsTiFlashEnabled() {
 		return nil
 	}
 	schema := d.infoCache.GetLatest()

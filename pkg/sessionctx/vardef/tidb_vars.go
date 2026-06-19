@@ -421,6 +421,7 @@ const (
 	TiDBOptMergeJoinCostFactor        = "tidb_opt_merge_join_cost_factor"
 	TiDBOptHashJoinCostFactor         = "tidb_opt_hash_join_cost_factor"
 	TiDBOptIndexJoinCostFactor        = "tidb_opt_index_join_cost_factor"
+	TiDBOptIndexJoinMaxScanRowsRatio  = "tidb_opt_index_join_max_scan_rows_ratio"
 
 	// The following selectivity factors represent a multiplier for the selectivity of each predicate.
 	// These factors are used to determine the selectivity of predicates in the optimizer's cost model.
@@ -663,6 +664,9 @@ const (
 	// TiDBEnablePipelinedWindowFunction is used to control whether to use pipelined window function, it only works when tidb_enable_window_function = true.
 	TiDBEnablePipelinedWindowFunction = "tidb_enable_pipelined_window_function"
 
+	// TiDBEnableStrictNotNullCheck is used to control whether to enable strict not-null check for single-row insert in non-strict mode.
+	TiDBEnableStrictNotNullCheck = "tidb_enable_strict_not_null_check"
+
 	// TiDBEnableStrictDoubleTypeCheck is used to control table field double type syntax check.
 	TiDBEnableStrictDoubleTypeCheck = "tidb_enable_strict_double_type_check"
 
@@ -678,6 +682,11 @@ const (
 
 	// TiDBOptEnableAdvancedJoinReorder controls whether to use the advanced join reorder framework.
 	TiDBOptEnableAdvancedJoinReorder = "tidb_opt_enable_advanced_join_reorder"
+
+	// TiDBOptJoinReorderThroughProj enables join reorder to look through projection operators
+	// when extracting join groups. This allows join reorder to work with derived columns from CTEs,
+	// views, or subqueries that have expression computations in their SELECT list.
+	TiDBOptJoinReorderThroughProj = "tidb_opt_join_reorder_through_proj"
 
 	// TiDBOptJoinReorderThroughSel enables pushing selection conditions down to
 	// reordered join trees when applicable.
@@ -722,6 +731,16 @@ const (
 
 	// TiDBStmtSummaryMaxSQLLength indicates the max length of displayed normalized sql and sample sql.
 	TiDBStmtSummaryMaxSQLLength = "tidb_stmt_summary_max_sql_length"
+
+	// TiDBStmtSummaryPersistEvicted controls whether per-record LRU evictions
+	// in the v2 (persistent) statement summary are persisted to the stmt log.
+	// Off by default because it adds log volume proportional to eviction rate.
+	TiDBStmtSummaryPersistEvicted = "tidb_stmt_summary_persist_evicted"
+
+	// TiDBStmtSummaryGroupByUser, when enabled, adds the executing user to the
+	// statement summary grouping key so the same digest run by different users
+	// produces separate rows. Off by default to avoid cardinality growth.
+	TiDBStmtSummaryGroupByUser = "tidb_stmt_summary_group_by_user"
 
 	// TiDBIgnoreInlistPlanDigest enables TiDB to generate the same plan digest with SQL using different in-list arguments.
 	TiDBIgnoreInlistPlanDigest = "tidb_ignore_inlist_plan_digest"
@@ -1126,6 +1145,9 @@ const (
 
 	// TiDBAccelerateUserCreationUpdate decides whether tidb will load & update the whole user's data in-memory.
 	TiDBAccelerateUserCreationUpdate = "tidb_accelerate_user_creation_update"
+
+	// TiDBEnableCachePrepareStmt indicates whether to support cache prepare stmt in plan cache.
+	TiDBEnableCachePrepareStmt = "tidb_enable_cache_prepare_stmt"
 )
 
 // TiDB vars that have only global scope
@@ -1480,6 +1502,7 @@ const (
 	DefOptMergeJoinCostFactor               = 1.0
 	DefOptHashJoinCostFactor                = 1.0
 	DefOptIndexJoinCostFactor               = 1.0
+	DefOptIndexJoinMaxScanRowsRatio         = 0.0
 	DefOptSelectivityFactor                 = 0.8
 	DefOptForceInlineCTE                    = false
 	DefOptInSubqToJoinAndAgg                = true
@@ -1555,10 +1578,12 @@ const (
 	DefTiDBForcePriority                    = mysql.NoPriority
 	DefEnableWindowFunction                 = true
 	DefEnablePipelinedWindowFunction        = true
+	DefTiDBEnableStrictNotNullCheck         = true
 	DefEnableStrictDoubleTypeCheck          = true
 	DefEnableVectorizedExpression           = true
 	DefTiDBOptJoinReorderThreshold          = 0
 	DefTiDBOptEnableAdvancedJoinReorder     = true
+	DefTiDBOptJoinReorderThroughProj        = false
 	DefTiDBOptJoinReorderThroughSel         = false
 	DefTiDBDDLSlowOprThreshold              = 300
 	DefTiDBUseFastAnalyze                   = false
@@ -1621,6 +1646,8 @@ const (
 	DefTiDBStmtSummaryHistorySize                     = 24
 	DefTiDBStmtSummaryMaxStmtCount                    = 3000
 	DefTiDBStmtSummaryMaxSQLLength                    = 32768
+	DefTiDBStmtSummaryPersistEvicted                  = false
+	DefTiDBStmtSummaryGroupByUser                     = false
 	DefTiDBCapturePlanBaseline                        = Off
 	DefTiDBIgnoreInlistPlanDigest                     = true
 	DefTiDBEnableIndexMerge                           = true
@@ -1644,7 +1671,7 @@ const (
 	DefTiDBOptExplainEvaledSubquery                   = false
 	DefTiDBReadStaleness                              = 0
 	DefTiDBGCMaxWaitTime                              = 24 * 60 * 60
-	DefMaxAllowedPacket                        uint64 = 67108864
+	DefMaxAllowedPacket                        uint64 = config.DefMaxAllowedPacket
 	DefTiDBEnableBatchDML                             = false
 	DefTiDBMemQuotaQuery                              = memory.DefMemQuotaQuery // 1GB
 	DefTiDBStatsCacheMemQuota                         = 0
@@ -1681,7 +1708,7 @@ const (
 	DefTiDBGenerateBinaryPlan                         = true
 	DefTiDBEnableDDLAnalyze                           = false
 	DefEnableTiDBGCAwareMemoryTrack                   = false
-	DefTiDBDefaultStrMatchSelectivity                 = 0.8
+	DefTiDBDefaultStrMatchSelectivity                 = 0
 	DefTiDBEnableTmpStorageOnOOM                      = true
 	DefTiDBEnableMDL                                  = true
 	DefTiFlashFastScan                                = false
@@ -1812,6 +1839,7 @@ const (
 	DefTiDBMemArbitratorQueryReservedText             = "0"
 	DefTiDBMemArbitratorWaitAverse                    = "0"
 	DefTiDBIndexLookUpPushDownPolicy                  = IndexLookUpPushDownPolicyHintOnly
+	DefEnableCachePrepareStmt                         = false
 	// DefConnectAttrsSize is the default max aggregate byte size of connection attributes per connection.
 	// This corresponds to performance_schema_session_connect_attrs_size. In TiDB, -1 means no limit up to 64KB.
 	DefConnectAttrsSize int64 = 4096
