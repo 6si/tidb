@@ -825,6 +825,74 @@ func benchJSONShredding() []BenchResult {
 	fmt.Printf("  TiFlash (prune + shredded filter): %v\n", tiflashTime4)
 	fmt.Printf("  Speedup: %.2fx\n", speedup4)
 
+	// === A/B comparison: TiFlash blob vs TiFlash shredded (same engine, toggle read path) ===
+	fmt.Println("\n  --- JSON Shredding A/B: @@tiflash_json_shredding ON vs OFF ---")
+	fmt.Println("  Same engine (TiFlash), same data. Only the read path changes.")
+
+	mustExec("SET @@tidb_isolation_read_engines = 'tiflash'")
+
+	// OFF = read from blob (parse per row)
+	mustExec("SET @@tiflash_json_shredding = OFF")
+	blobTime := timeQuery(pathQuery, *iterations)
+
+	// ON = read from shredded sub-columns
+	mustExec("SET @@tiflash_json_shredding = ON")
+	shreddedTime := timeQuery(pathQuery, *iterations)
+
+	speedup5 := float64(blobTime) / float64(shreddedTime)
+	results = append(results, BenchResult{
+		Name:      "TiFlash JSON GROUP BY: blob vs shredded",
+		Baseline:  blobTime,
+		Optimized: shreddedTime,
+		Speedup:   speedup5,
+	})
+
+	fmt.Printf("  TiFlash blob (@@=OFF):       %v\n", blobTime)
+	fmt.Printf("  TiFlash shredded (@@=ON):    %v\n", shreddedTime)
+	fmt.Printf("  Speedup: %.2fx  %s\n", speedup5, scaleNote(speedup5))
+
+	// A/B on filter
+	mustExec("SET @@tiflash_json_shredding = OFF")
+	blobTime2 := timeQuery(filterQuery, *iterations)
+
+	mustExec("SET @@tiflash_json_shredding = ON")
+	shreddedTime2 := timeQuery(filterQuery, *iterations)
+
+	speedup6 := float64(blobTime2) / float64(shreddedTime2)
+	results = append(results, BenchResult{
+		Name:      "TiFlash JSON Filter: blob vs shredded",
+		Baseline:  blobTime2,
+		Optimized: shreddedTime2,
+		Speedup:   speedup6,
+	})
+
+	fmt.Printf("  TiFlash blob filter (@@=OFF):     %v\n", blobTime2)
+	fmt.Printf("  TiFlash shredded filter (@@=ON):  %v\n", shreddedTime2)
+	fmt.Printf("  Speedup: %.2fx  %s\n", speedup6, scaleNote(speedup6))
+
+	// A/B on nested path
+	mustExec("SET @@tiflash_json_shredding = OFF")
+	blobTime3 := timeQuery(nestedQuery, *iterations)
+
+	mustExec("SET @@tiflash_json_shredding = ON")
+	shreddedTime3 := timeQuery(nestedQuery, *iterations)
+
+	speedup7 := float64(blobTime3) / float64(shreddedTime3)
+	results = append(results, BenchResult{
+		Name:      "TiFlash Nested JSON: blob vs shredded",
+		Baseline:  blobTime3,
+		Optimized: shreddedTime3,
+		Speedup:   speedup7,
+	})
+
+	fmt.Printf("  TiFlash nested blob (@@=OFF):     %v\n", blobTime3)
+	fmt.Printf("  TiFlash nested shredded (@@=ON):  %v\n", shreddedTime3)
+	fmt.Printf("  Speedup: %.2fx  %s\n", speedup7, scaleNote(speedup7))
+
+	// Restore defaults
+	mustExec("SET @@tidb_isolation_read_engines = 'tikv,tiflash'")
+	mustExec("SET @@tiflash_json_shredding = ON")
+
 	return results
 }
 

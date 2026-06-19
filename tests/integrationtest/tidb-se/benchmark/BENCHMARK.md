@@ -229,6 +229,44 @@ This structure exercises:
 
 **Expected at scale:** 10-100x for path-level access (read 1-10 bytes vs 200-1000 bytes per row).
 
+#### JSON Shredding A/B Test (same engine, toggle read path)
+
+The benchmark also includes a direct A/B comparison within TiFlash using `@@tiflash_json_shredding`:
+
+```sql
+-- Force TiFlash engine for both tests
+SET @@tidb_isolation_read_engines = 'tiflash';
+
+-- Read from original blob (parse per row)
+SET @@tiflash_json_shredding = OFF;
+SELECT payload->>'$.event', COUNT(*) FROM json_events GROUP BY payload->>'$.event';
+
+-- Read from shredded sub-columns (direct column access)
+SET @@tiflash_json_shredding = ON;
+SELECT payload->>'$.event', COUNT(*) FROM json_events GROUP BY payload->>'$.event';
+```
+
+This is the purest measurement of JSON shredding benefit — same engine, same query, same data,
+only the internal read path changes. Expected speedup at 50M+ rows: 10-100x.
+
+| Test | Flag=OFF (blob) | Flag=ON (shredded) | What changes |
+|------|----------------|-------------------|--------------|
+| GROUP BY $.event | Parse 200B blob/row → hash GROUP BY | Read 1B dict ID/row → array GROUP BY | I/O + compute |
+| Filter $.event='purchase' | Parse blob + string compare | Dict lookup (1 int compare) | I/O + compute |
+| Nested $.details.source IS NOT NULL | Parse blob + navigate nested | Read 1-bit presence column | I/O only |
+
+---
+
+## Session Variables Used
+
+| Variable | Values | Purpose |
+|----------|--------|---------|
+| `@@tidb_isolation_read_engines` | `'tikv'`, `'tiflash'`, `'tikv,tiflash'` | Force queries to specific storage engine |
+| `@@tidb_allow_mpp` | `1` (default) | Enable TiFlash MPP execution |
+| `@@tiflash_json_shredding` | `ON` (default), `OFF` | Toggle TiFlash JSON read path: sub-columns vs blob |
+
+All variables are SET automatically by the benchmark program. No manual configuration needed.
+
 ---
 
 ## Data Loading
