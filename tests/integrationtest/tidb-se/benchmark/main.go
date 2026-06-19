@@ -48,6 +48,7 @@ var (
 	shards     = flag.Int("shards", 16, "Number of shards for SHARD BY tables")
 	workers    = flag.Int("workers", 8, "Concurrent workers for data loading")
 	skipLoad   = flag.Bool("skip-load", false, "Skip data loading (reuse existing data)")
+	noShard    = flag.Bool("no-shard", false, "Disable SHARD BY syntax (for stock TiDB clusters without shard support)")
 	benchmarks = flag.String("bench", "all", "Comma-separated benchmarks: shard,in,filter,groupby,join,json,all")
 	iterations = flag.Int("iter", 5, "Iterations per benchmark query")
 	jsonSize   = flag.String("json-size", "small", "JSON document size: small (~200B), large (~2-5KB with 20+ paths)")
@@ -115,11 +116,15 @@ func main() {
 	selected := parseBenchmarks(*benchmarks)
 	var results []BenchResult
 
-	if selected["shard"] {
+	if selected["shard"] && !*noShard {
 		results = append(results, benchShardPointQuery()...)
+	} else if selected["shard"] && *noShard {
+		fmt.Println("\n--- Skipping shard benchmarks (--no-shard mode) ---")
 	}
-	if selected["in"] {
+	if selected["in"] && !*noShard {
 		results = append(results, benchShardINQuery()...)
+	} else if selected["in"] && *noShard {
+		fmt.Println("--- Skipping IN-clause shard benchmarks (--no-shard mode) ---")
 	}
 	if selected["filter"] {
 		results = append(results, benchEncodedFilter()...)
@@ -150,17 +155,30 @@ func setupSchema() {
 		mustExec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t))
 	}
 
-	// Sharded fact table (SHARD BY)
-	mustExec(fmt.Sprintf(`CREATE TABLE fact_sharded (
-		id BIGINT NOT NULL,
-		tenant_id BIGINT NOT NULL,
-		region_id INT NOT NULL,
-		industry_id INT NOT NULL,
-		status VARCHAR(20) NOT NULL,
-		revenue BIGINT NOT NULL,
-		created_at DATETIME NOT NULL,
-		PRIMARY KEY (id, tenant_id)
-	) SHARD BY (tenant_id) SHARDS %d`, *shards))
+	// Sharded fact table (SHARD BY if supported)
+	if *noShard {
+		mustExec(`CREATE TABLE fact_sharded (
+			id BIGINT NOT NULL,
+			tenant_id BIGINT NOT NULL,
+			region_id INT NOT NULL,
+			industry_id INT NOT NULL,
+			status VARCHAR(20) NOT NULL,
+			revenue BIGINT NOT NULL,
+			created_at DATETIME NOT NULL,
+			PRIMARY KEY (id, tenant_id)
+		)`)
+	} else {
+		mustExec(fmt.Sprintf(`CREATE TABLE fact_sharded (
+			id BIGINT NOT NULL,
+			tenant_id BIGINT NOT NULL,
+			region_id INT NOT NULL,
+			industry_id INT NOT NULL,
+			status VARCHAR(20) NOT NULL,
+			revenue BIGINT NOT NULL,
+			created_at DATETIME NOT NULL,
+			PRIMARY KEY (id, tenant_id)
+		) SHARD BY (tenant_id) SHARDS %d`, *shards))
+	}
 
 	// Equivalent non-sharded table (baseline comparison)
 	mustExec(`CREATE TABLE fact_unsharded (
@@ -189,12 +207,21 @@ func setupSchema() {
 	)`)
 
 	// JSON events table (for JSON shredding benchmark)
-	mustExec(fmt.Sprintf(`CREATE TABLE json_events (
-		id BIGINT NOT NULL,
-		tenant_id BIGINT NOT NULL,
-		payload JSON NOT NULL,
-		PRIMARY KEY (id, tenant_id)
-	) SHARD BY (tenant_id) SHARDS %d`, *shards))
+	if *noShard {
+		mustExec(`CREATE TABLE json_events (
+			id BIGINT NOT NULL,
+			tenant_id BIGINT NOT NULL,
+			payload JSON NOT NULL,
+			PRIMARY KEY (id, tenant_id)
+		)`)
+	} else {
+		mustExec(fmt.Sprintf(`CREATE TABLE json_events (
+			id BIGINT NOT NULL,
+			tenant_id BIGINT NOT NULL,
+			payload JSON NOT NULL,
+			PRIMARY KEY (id, tenant_id)
+		) SHARD BY (tenant_id) SHARDS %d`, *shards))
+	}
 
 	// Set TiFlash replicas
 	for _, t := range []string{"fact_sharded", "fact_unsharded", "dim_region", "dim_industry", "json_events"} {
@@ -970,6 +997,12 @@ func benchJSONShredding() []BenchResult {
 	fmt.Printf("  Speedup: %.2fx\n", speedup4)
 
 	// === A/B comparison: TiFlash blob vs TiFlash shredded (same engine, toggle read path) ===
+	if *noShard {
+		fmt.Println("\n  --- Skipping JSON Shredding A/B (--no-shard mode, @@tiflash_json_shredding not available) ---")
+		mustExec("SET @@tidb_isolation_read_engines = 'tikv,tiflash'")
+		return results
+	}
+
 	fmt.Println("\n  --- JSON Shredding A/B: @@tiflash_json_shredding ON vs OFF ---")
 	fmt.Println("  Same engine (TiFlash), same data. Only the read path changes.")
 
