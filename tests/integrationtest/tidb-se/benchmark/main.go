@@ -174,7 +174,7 @@ func setupSchema() {
 	fmt.Println("=== Setting up schema ===")
 
 	// Drop existing tables
-	for _, t := range []string{"fact_sharded", "fact_unsharded", "dim_region", "dim_industry", "json_events"} {
+	for _, t := range []string{"fact_sharded", "fact_unsharded", "dim_region", "dim_industry", "json_events", "dim_event"} {
 		mustExec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t))
 	}
 
@@ -246,8 +246,16 @@ func setupSchema() {
 		) SHARD BY (tenant_id) SHARDS %d`, *shards))
 	}
 
+	// Dimension: event types (for JSON join benchmark)
+	mustExec(`CREATE TABLE dim_event (
+		event_name VARCHAR(50) PRIMARY KEY,
+		category VARCHAR(30) NOT NULL,
+		priority INT NOT NULL,
+		is_conversion BOOLEAN NOT NULL
+	)`)
+
 	// Set TiFlash replicas
-	for _, t := range []string{"fact_sharded", "fact_unsharded", "dim_region", "dim_industry", "json_events"} {
+	for _, t := range []string{"fact_sharded", "fact_unsharded", "dim_region", "dim_industry", "json_events", "dim_event"} {
 		mustExec(fmt.Sprintf("ALTER TABLE %s SET TIFLASH REPLICA 1", t))
 	}
 
@@ -272,7 +280,7 @@ func loadData() {
 
 	// Analyze tables for accurate statistics
 	fmt.Print("  Analyzing tables...")
-	for _, t := range []string{"fact_sharded", "fact_unsharded", "dim_region", "dim_industry", "json_events"} {
+	for _, t := range []string{"fact_sharded", "fact_unsharded", "dim_region", "dim_industry", "json_events", "dim_event"} {
 		mustExec(fmt.Sprintf("ANALYZE TABLE %s", t))
 	}
 	fmt.Println(" done")
@@ -307,7 +315,23 @@ func loadDimensions() {
 	for i, ind := range industries {
 		mustExec("INSERT INTO dim_industry VALUES (?, ?, ?)", i+1, ind, sectors[i])
 	}
-	fmt.Printf("  Loaded %d regions, %d industries\n", 50, len(industries))
+	// Event dimension table (for JSON field → dimension join benchmark)
+	eventDim := []struct {
+		name, category string
+		priority       int
+		isConversion   bool
+	}{
+		{"click", "engagement", 1, false},
+		{"view", "engagement", 1, false},
+		{"purchase", "conversion", 5, true},
+		{"signup", "acquisition", 4, true},
+		{"logout", "lifecycle", 2, false},
+	}
+	for _, e := range eventDim {
+		mustExec("INSERT INTO dim_event VALUES (?, ?, ?, ?)", e.name, e.category, e.priority, e.isConversion)
+	}
+
+	fmt.Printf("  Loaded %d regions, %d industries, %d event types\n", 50, len(industries), len(eventDim))
 }
 
 func loadFactTables() {
@@ -1431,8 +1455,8 @@ func benchHeadToHead() []H2HResult {
 			GROUP BY 1`))
 	}
 
-	// JSON + dimension JOIN
-	results = append(results, runH2H("JSON Multi-Path", "JSON + dimension JOIN",
+	// JSON + dimension JOIN (integer key — baseline)
+	results = append(results, runH2H("JSON Join", "JSON + dim_region (int key)",
 		`SELECT
 			r.country,
 			payload->>'$.event' AS event,
@@ -1442,6 +1466,32 @@ func benchHeadToHead() []H2HResult {
 		JOIN dim_region r ON r.id = (j.id % 50) + 1
 		WHERE payload->>'$.event' IN ('purchase', 'signup')
 		GROUP BY 1, 2`))
+
+	// JSON field → dimension JOIN (string key — tests encoded JOIN benefit)
+	// This joins ON a JSON-extracted field, where dictionary encoding means
+	// we're joining on compact IDs instead of full string comparisons
+	results = append(results, runH2H("JSON Join", "JSON $.event → dim_event (string key)",
+		`SELECT
+			de.category,
+			de.is_conversion,
+			COUNT(*) AS cnt,
+			AVG(CAST(payload->>'$.score' AS DECIMAL(10,2))) AS avg_score
+		FROM json_events j
+		JOIN dim_event de ON de.event_name = payload->>'$.event'
+		GROUP BY 1, 2`))
+
+	// JSON field join with filter — combines shredding + encoding + join
+	results = append(results, runH2H("JSON Join", "JSON $.event → dim_event + filter",
+		`SELECT
+			de.category,
+			payload->>'$.page' AS page,
+			COUNT(*) AS cnt
+		FROM json_events j
+		JOIN dim_event de ON de.event_name = payload->>'$.event'
+		WHERE de.is_conversion = TRUE
+		GROUP BY 1, 2
+		ORDER BY cnt DESC
+		LIMIT 20`))
 
 	return results
 }
@@ -1552,7 +1602,7 @@ func getExplainAccess(query string) string {
 
 func waitForAllReplicas() {
 	fmt.Print("  Waiting for TiFlash replicas...")
-	tables := []string{"fact_sharded", "fact_unsharded", "dim_region", "dim_industry", "json_events"}
+	tables := []string{"fact_sharded", "fact_unsharded", "dim_region", "dim_industry", "json_events", "dim_event"}
 	for attempt := 0; attempt < 120; attempt++ {
 		var ready int
 		for _, t := range tables {
