@@ -1276,8 +1276,10 @@ func benchHeadToHead() []H2HResult {
 
 	var results []H2HResult
 
-	// Enable JSON shredding if available (ignored on stock clusters)
-	mustExec("SET @@tiflash_json_shredding = ON")
+	// Enable JSON shredding if available (skip on stock clusters where variable doesn't exist)
+	if !*noShard {
+		mustExec("SET @@tiflash_json_shredding = ON")
+	}
 	// Let optimizer use both engines
 	mustExec("SET @@tidb_isolation_read_engines = 'tikv,tiflash'")
 	mustExec("SET @@tidb_allow_mpp = 1")
@@ -1447,18 +1449,12 @@ func benchHeadToHead() []H2HResult {
 func runH2H(category, name, query string) H2HResult {
 	latency := timeQuery(query, *iterations)
 
-	// Get row count
-	var rowCount int64
-	row := db.QueryRow("SELECT COUNT(*) FROM (" + query + ") t")
-	row.Scan(&rowCount)
-
-	fmt.Printf("  %-45s %8s  (%d rows)\n", name, fmtDur(latency), rowCount)
+	fmt.Printf("  %-45s %8s\n", name, fmtDur(latency))
 
 	return H2HResult{
 		Category: category,
 		Name:     name,
 		Latency:  latency,
-		RowCount: rowCount,
 	}
 }
 
@@ -1488,9 +1484,9 @@ func printH2HSummary(results []H2HResult) {
 
 	// Output machine-readable CSV for easy diffing
 	fmt.Println("\n--- CSV (for comparison) ---")
-	fmt.Printf("cluster,category,name,latency_ms,rows\n")
+	fmt.Printf("cluster,category,name,latency_ms\n")
 	for _, r := range results {
-		fmt.Printf("%s,%s,%s,%d,%d\n", clusterType, r.Category, r.Name, r.Latency.Milliseconds(), r.RowCount)
+		fmt.Printf("%s,%s,%s,%d\n", clusterType, r.Category, r.Name, r.Latency.Milliseconds())
 	}
 }
 
