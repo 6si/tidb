@@ -50,6 +50,7 @@ var (
 	skipLoad   = flag.Bool("skip-load", false, "Skip data loading (reuse existing data)")
 	benchmarks = flag.String("bench", "all", "Comma-separated benchmarks: shard,in,filter,groupby,join,json,all")
 	iterations = flag.Int("iter", 5, "Iterations per benchmark query")
+	jsonSize   = flag.String("json-size", "small", "JSON document size: small (~200B), large (~2-5KB with 20+ paths)")
 )
 
 type BenchResult struct {
@@ -97,8 +98,8 @@ func main() {
 	}
 
 	fmt.Printf("=== tidb-se Performance Benchmark ===\n")
-	fmt.Printf("Host: %s:%d | Rows: %d | Shards: %d | Iterations: %d\n\n",
-		*host, *port, *rows, *shards, *iterations)
+	fmt.Printf("Host: %s:%d | Rows: %d | Shards: %d | Iterations: %d | JSON: %s\n\n",
+		*host, *port, *rows, *shards, *iterations, *jsonSize)
 
 	if !*skipLoad {
 		setupSchema()
@@ -324,9 +325,12 @@ func loadFactTables() {
 func loadJSONEvents() {
 	jsonRows := *rows / 10 // 10% of fact rows for JSON
 	batchSize := 2000
+	if *jsonSize == "large" {
+		batchSize = 500 // smaller batches for large docs to avoid max_allowed_packet
+	}
 	totalBatches := jsonRows / batchSize
 
-	fmt.Printf("  Loading %d JSON events...\n", jsonRows)
+	fmt.Printf("  Loading %d JSON events (size=%s)...\n", jsonRows, *jsonSize)
 	start := time.Now()
 
 	eventTypes := []string{"click", "view", "purchase", "signup", "logout"}
@@ -359,24 +363,14 @@ func loadJSONEvents() {
 					duration := rng.Intn(30000)
 					score := rng.Float64() * 100
 
-					// Varied JSON with common paths + sparse fields
-					json := fmt.Sprintf(
-						`'{"event":"%s","page":"%s","duration":%d,"score":%.2f,"user_agent":"Mozilla/5.0","ip":"10.%d.%d.%d"`,
-						event, page, duration, score,
-						rng.Intn(256), rng.Intn(256), rng.Intn(256))
-
-					// Add sparse fields (appear in ~20% of rows)
-					if id%5 == 0 {
-						json += fmt.Sprintf(`,"referrer":"https://google.com/search?q=item%d"`, id%1000)
+					var jsonDoc string
+					if *jsonSize == "large" {
+						jsonDoc = generateLargeJSON(rng, id, event, page, duration, score)
+					} else {
+						jsonDoc = generateSmallJSON(rng, id, event, page, duration, score)
 					}
-					// Add nested object (appear in ~10% of rows)
-					if id%10 == 0 {
-						json += fmt.Sprintf(`,"details":{"source":"campaign_%d","medium":"cpc","cost":%d}`,
-							id%50, rng.Intn(1000))
-					}
-					json += `}'`
 
-					row := fmt.Sprintf("(%d,%d,%s)", id, tenantID, json)
+					row := fmt.Sprintf("(%d,%d,%s)", id, tenantID, jsonDoc)
 					vals = append(vals, row)
 				}
 
@@ -388,6 +382,156 @@ func loadJSONEvents() {
 	wg.Wait()
 	elapsed := time.Since(start)
 	fmt.Printf("  Loaded %d JSON events in %v\n", jsonRows, elapsed)
+}
+
+func generateSmallJSON(rng *rand.Rand, id int64, event, page string, duration int, score float64) string {
+	json := fmt.Sprintf(
+		`'{"event":"%s","page":"%s","duration":%d,"score":%.2f,"user_agent":"Mozilla/5.0","ip":"10.%d.%d.%d"`,
+		event, page, duration, score,
+		rng.Intn(256), rng.Intn(256), rng.Intn(256))
+
+	if id%5 == 0 {
+		json += fmt.Sprintf(`,"referrer":"https://google.com/search?q=item%d"`, id%1000)
+	}
+	if id%10 == 0 {
+		json += fmt.Sprintf(`,"details":{"source":"campaign_%d","medium":"cpc","cost":%d}`,
+			id%50, rng.Intn(1000))
+	}
+	json += `}'`
+	return json
+}
+
+func generateLargeJSON(rng *rand.Rand, id int64, event, page string, duration int, score float64) string {
+	// ~2-5KB document with 20+ paths at various nesting depths
+	browsers := []string{"Chrome/120.0", "Firefox/121.0", "Safari/17.2", "Edge/120.0"}
+	devices := []string{"desktop", "mobile", "tablet"}
+	osos := []string{"Windows 11", "macOS 14.2", "Linux", "iOS 17", "Android 14"}
+	screens := []string{"1920x1080", "2560x1440", "1366x768", "390x844", "1024x768"}
+	campaigns := []string{"summer_sale", "black_friday", "retargeting", "brand_awareness", "product_launch"}
+	mediums := []string{"cpc", "organic", "email", "social", "referral", "display", "affiliate"}
+	sources := []string{"google", "facebook", "twitter", "linkedin", "bing", "reddit", "newsletter"}
+	categories := []string{"electronics", "clothing", "food", "software", "books", "home", "sports"}
+	actions := []string{"add_to_cart", "remove_from_cart", "wishlist", "compare", "share", "review"}
+
+	browser := browsers[rng.Intn(len(browsers))]
+	device := devices[rng.Intn(len(devices))]
+	osName := osos[rng.Intn(len(osos))]
+	screen := screens[rng.Intn(len(screens))]
+	campaign := campaigns[rng.Intn(len(campaigns))]
+	medium := mediums[rng.Intn(len(mediums))]
+	source := sources[rng.Intn(len(sources))]
+	category := categories[rng.Intn(len(categories))]
+	action := actions[rng.Intn(len(actions))]
+
+	lat := 37.0 + rng.Float64()*10
+	lon := -122.0 + rng.Float64()*10
+	viewportW := 300 + rng.Intn(1700)
+	viewportH := 500 + rng.Intn(1000)
+	scrollDepth := rng.Intn(100)
+	timeOnPage := rng.Intn(600)
+	clickX := rng.Intn(1920)
+	clickY := rng.Intn(1080)
+	productID := rng.Intn(50000)
+	productPrice := rng.Float64() * 500
+	quantity := 1 + rng.Intn(5)
+	sessionDepth := 1 + rng.Intn(20)
+
+	json := fmt.Sprintf(`'{`+
+		`"event":"%s",`+
+		`"page":"%s",`+
+		`"duration":%d,`+
+		`"score":%.2f,`+
+		`"timestamp":%d,`+
+		`"session_id":"sess_%d",`+
+		`"user_agent":"Mozilla/5.0 (%s; %s) AppleWebKit/537.36 %s",`+
+		`"ip":"10.%d.%d.%d",`+
+		`"context":{`+
+		`"browser":"%s",`+
+		`"device":"%s",`+
+		`"os":"%s",`+
+		`"screen":"%s",`+
+		`"viewport":{"width":%d,"height":%d},`+
+		`"locale":"en-US",`+
+		`"timezone":"America/Los_Angeles",`+
+		`"cookies_enabled":true`+
+		`},`+
+		`"geo":{`+
+		`"lat":%.4f,`+
+		`"lon":%.4f,`+
+		`"city":"San Francisco",`+
+		`"region":"CA",`+
+		`"country":"US"`+
+		`},`+
+		`"behavior":{`+
+		`"scroll_depth":%d,`+
+		`"time_on_page":%d,`+
+		`"click_x":%d,`+
+		`"click_y":%d,`+
+		`"session_depth":%d,`+
+		`"is_bounce":%t,`+
+		`"is_returning":%t`+
+		`},`+
+		`"product":{`+
+		`"id":%d,`+
+		`"category":"%s",`+
+		`"price":%.2f,`+
+		`"quantity":%d,`+
+		`"action":"%s"`+
+		`},`+
+		`"campaign":{`+
+		`"name":"%s",`+
+		`"medium":"%s",`+
+		`"source":"%s",`+
+		`"cost":%.2f,`+
+		`"click_id":"clk_%d"`+
+		`}`,
+		event, page, duration, score,
+		time.Now().Unix()-rng.Int63n(86400*30),
+		rng.Int63n(1000000),
+		osName, device, browser,
+		rng.Intn(256), rng.Intn(256), rng.Intn(256),
+		browser, device, osName, screen,
+		viewportW, viewportH,
+		lat, lon,
+		scrollDepth, timeOnPage, clickX, clickY, sessionDepth,
+		scrollDepth < 20, sessionDepth > 1,
+		productID, category, productPrice, quantity, action,
+		campaign, medium, source,
+		rng.Float64()*10,
+		rng.Int63n(99999999),
+	)
+
+	// Add sparse referrer field (30% of rows)
+	if id%3 == 0 {
+		json += fmt.Sprintf(`,"referrer":"https://%s.com/search?q=item%d&ref=campaign_%s"`,
+			source, id%10000, campaign)
+	}
+
+	// Add tags array (every row — adds ~200B)
+	numTags := 3 + rng.Intn(5)
+	tagOptions := []string{"new_user", "high_value", "returning", "mobile", "desktop",
+		"organic", "paid", "social", "email", "promotion", "seasonal", "vip"}
+	json += `,"tags":[`
+	for t := 0; t < numTags; t++ {
+		if t > 0 {
+			json += ","
+		}
+		json += fmt.Sprintf(`"%s"`, tagOptions[rng.Intn(len(tagOptions))])
+	}
+	json += `]`
+
+	// Add nested details (every row for large docs)
+	json += fmt.Sprintf(`,"details":{"source":"%s","medium":"%s","cost":%d,"clicks":%d,"impressions":%d}`,
+		source, medium, rng.Intn(1000), rng.Intn(500), rng.Intn(10000))
+
+	// Add experiment data (50% of rows — A/B test context)
+	if id%2 == 0 {
+		json += fmt.Sprintf(`,"experiment":{"id":"exp_%d","variant":"%c","converted":%t}`,
+			rng.Intn(100), 'A'+byte(rng.Intn(4)), rng.Intn(2) == 1)
+	}
+
+	json += `}'`
+	return json
 }
 
 func insertBatch(table string, vals []string) {
@@ -889,6 +1033,176 @@ func benchJSONShredding() []BenchResult {
 	fmt.Printf("  TiFlash nested shredded (@@=ON):  %v\n", shreddedTime3)
 	fmt.Printf("  Speedup: %.2fx  %s\n", speedup7, scaleNote(speedup7))
 
+	// === Multi-path extraction: amplifies per-row parse cost ===
+	fmt.Println("\n  --- Multi-Path JSON Extraction (blob vs shredded) ---")
+	fmt.Println("  Extracting 8+ paths per row forces blob path to parse full document per row.")
+	fmt.Println("  Shredded path reads only needed sub-columns — no parsing overhead.")
+
+	// Multi-path query: extract 8 paths + filter + GROUP BY
+	var multiPathQuery string
+	if *jsonSize == "large" {
+		multiPathQuery = `SELECT 
+			payload->>'$.event' AS event,
+			payload->>'$.page' AS page,
+			payload->>'$.context.browser' AS browser,
+			payload->>'$.context.device' AS device,
+			payload->>'$.context.os' AS os,
+			payload->>'$.geo.country' AS country,
+			payload->>'$.behavior.scroll_depth' AS scroll,
+			payload->>'$.product.category' AS category,
+			payload->>'$.campaign.source' AS source,
+			payload->>'$.campaign.medium' AS medium,
+			COUNT(*) AS cnt
+		FROM json_events
+		WHERE payload->>'$.event' = 'purchase'
+		GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10`
+	} else {
+		multiPathQuery = `SELECT 
+			payload->>'$.event' AS event,
+			payload->>'$.page' AS page,
+			payload->>'$.user_agent' AS ua,
+			payload->>'$.ip' AS ip,
+			CAST(payload->>'$.duration' AS SIGNED) AS dur,
+			CAST(payload->>'$.score' AS DECIMAL(10,2)) AS score,
+			COUNT(*) AS cnt
+		FROM json_events
+		WHERE payload->>'$.event' = 'purchase'
+		GROUP BY 1, 2, 3, 4, 5, 6`
+	}
+
+	mustExec("SET @@tiflash_json_shredding = OFF")
+	blobMulti := timeQuery(multiPathQuery, *iterations)
+
+	mustExec("SET @@tiflash_json_shredding = ON")
+	shreddedMulti := timeQuery(multiPathQuery, *iterations)
+
+	speedupMulti := float64(blobMulti) / float64(shreddedMulti)
+	results = append(results, BenchResult{
+		Name:      "Multi-Path Extract (8+ paths): blob vs shredded",
+		Baseline:  blobMulti,
+		Optimized: shreddedMulti,
+		Speedup:   speedupMulti,
+	})
+
+	fmt.Printf("  TiFlash blob (8-path, @@=OFF):       %v\n", blobMulti)
+	fmt.Printf("  TiFlash shredded (8-path, @@=ON):    %v\n", shreddedMulti)
+	fmt.Printf("  Speedup: %.2fx  %s\n", speedupMulti, scaleNote(speedupMulti))
+
+	// Multi-path aggregation: analytics across many JSON fields
+	var multiAggQuery string
+	if *jsonSize == "large" {
+		multiAggQuery = `SELECT 
+			payload->>'$.event' AS event,
+			COUNT(*) AS cnt,
+			AVG(CAST(payload->>'$.duration' AS SIGNED)) AS avg_dur,
+			AVG(CAST(payload->>'$.score' AS DECIMAL(10,2))) AS avg_score,
+			AVG(CAST(payload->>'$.behavior.scroll_depth' AS SIGNED)) AS avg_scroll,
+			AVG(CAST(payload->>'$.behavior.time_on_page' AS SIGNED)) AS avg_time,
+			AVG(CAST(payload->>'$.product.price' AS DECIMAL(10,2))) AS avg_price
+		FROM json_events
+		GROUP BY 1`
+	} else {
+		multiAggQuery = `SELECT 
+			payload->>'$.event' AS event,
+			COUNT(*) AS cnt,
+			AVG(CAST(payload->>'$.duration' AS SIGNED)) AS avg_dur,
+			AVG(CAST(payload->>'$.score' AS DECIMAL(10,2))) AS avg_score
+		FROM json_events
+		GROUP BY 1`
+	}
+
+	mustExec("SET @@tiflash_json_shredding = OFF")
+	blobAgg := timeQuery(multiAggQuery, *iterations)
+
+	mustExec("SET @@tiflash_json_shredding = ON")
+	shreddedAgg := timeQuery(multiAggQuery, *iterations)
+
+	speedupAgg := float64(blobAgg) / float64(shreddedAgg)
+	results = append(results, BenchResult{
+		Name:      "Multi-Path Agg (GROUP BY + AVGs): blob vs shredded",
+		Baseline:  blobAgg,
+		Optimized: shreddedAgg,
+		Speedup:   speedupAgg,
+	})
+
+	fmt.Printf("  TiFlash blob agg (@@=OFF):       %v\n", blobAgg)
+	fmt.Printf("  TiFlash shredded agg (@@=ON):    %v\n", shreddedAgg)
+	fmt.Printf("  Speedup: %.2fx  %s\n", speedupAgg, scaleNote(speedupAgg))
+
+	// Nested multi-path with filter on nested field
+	var nestedMultiQuery string
+	if *jsonSize == "large" {
+		nestedMultiQuery = `SELECT
+			payload->>'$.campaign.source' AS src,
+			payload->>'$.campaign.medium' AS med,
+			payload->>'$.product.category' AS cat,
+			payload->>'$.event' AS event,
+			payload->>'$.page' AS page,
+			COUNT(*) AS cnt,
+			SUM(CAST(payload->>'$.product.price' AS DECIMAL(10,2))) AS total_price
+		FROM json_events
+		WHERE payload->>'$.campaign.source' = 'google'
+		  AND CAST(payload->>'$.product.price' AS DECIMAL(10,2)) > 100
+		GROUP BY 1, 2, 3, 4, 5`
+	} else {
+		nestedMultiQuery = `SELECT
+			payload->>'$.event' AS event,
+			payload->>'$.page' AS page,
+			payload->>'$.ip' AS ip,
+			COUNT(*) AS cnt
+		FROM json_events
+		WHERE payload->>'$.details.source' IS NOT NULL
+		  AND CAST(payload->>'$.score' AS DECIMAL(10,2)) > 50
+		GROUP BY 1, 2, 3`
+	}
+
+	mustExec("SET @@tiflash_json_shredding = OFF")
+	blobNested := timeQuery(nestedMultiQuery, *iterations)
+
+	mustExec("SET @@tiflash_json_shredding = ON")
+	shreddedNested := timeQuery(nestedMultiQuery, *iterations)
+
+	speedupNested := float64(blobNested) / float64(shreddedNested)
+	results = append(results, BenchResult{
+		Name:      "Nested Multi-Path + Filter: blob vs shredded",
+		Baseline:  blobNested,
+		Optimized: shreddedNested,
+		Speedup:   speedupNested,
+	})
+
+	fmt.Printf("  TiFlash blob nested (@@=OFF):       %v\n", blobNested)
+	fmt.Printf("  TiFlash shredded nested (@@=ON):    %v\n", shreddedNested)
+	fmt.Printf("  Speedup: %.2fx  %s\n", speedupNested, scaleNote(speedupNested))
+
+	// JSON + dimension JOIN (combines shredding with star join)
+	joinJSONQuery := `SELECT 
+		r.country,
+		payload->>'$.event' AS event,
+		COUNT(*) AS cnt,
+		SUM(CAST(payload->>'$.score' AS DECIMAL(10,2))) AS total_score
+	FROM json_events j
+	JOIN dim_region r ON r.id = (j.id % 50) + 1
+	WHERE payload->>'$.event' IN ('purchase', 'signup')
+	GROUP BY 1, 2`
+
+	mustExec("SET @@tiflash_json_shredding = OFF")
+	blobJoin := timeQuery(joinJSONQuery, *iterations)
+
+	mustExec("SET @@tiflash_json_shredding = ON")
+	shreddedJoin := timeQuery(joinJSONQuery, *iterations)
+
+	speedupJoin := float64(blobJoin) / float64(shreddedJoin)
+	results = append(results, BenchResult{
+		Name:      "JSON + JOIN (dim table): blob vs shredded",
+		Baseline:  blobJoin,
+		Optimized: shreddedJoin,
+		Speedup:   speedupJoin,
+	})
+
+	fmt.Printf("  TiFlash blob+join (@@=OFF):       %v\n", blobJoin)
+	fmt.Printf("  TiFlash shredded+join (@@=ON):    %v\n", shreddedJoin)
+	fmt.Printf("  Speedup: %.2fx  %s\n", speedupJoin, scaleNote(speedupJoin))
+
 	// Restore defaults
 	mustExec("SET @@tidb_isolation_read_engines = 'tikv,tiflash'")
 	mustExec("SET @@tiflash_json_shredding = ON")
@@ -1001,8 +1315,8 @@ func printSummary(results []BenchResult) {
 	fmt.Println("╔══════════════════════════════════════════════════════════════════════════════╗")
 	fmt.Println("║                    tidb-se PERFORMANCE BENCHMARK SUMMARY                    ║")
 	fmt.Println("╠══════════════════════════════════════════════════════════════════════════════╣")
-	fmt.Printf("║ %-76s ║\n", fmt.Sprintf("Host: %s:%d | Rows: %dM | Shards: %d",
-		*host, *port, *rows/1_000_000, *shards))
+	fmt.Printf("║ %-76s ║\n", fmt.Sprintf("Host: %s:%d | Rows: %dM | Shards: %d | JSON: %s",
+		*host, *port, *rows/1_000_000, *shards, *jsonSize))
 	fmt.Println("╠══════════════════════════════════════════════════════════════════════════════╣")
 	fmt.Printf("║ %-40s │ %8s │ %8s │ %7s ║\n", "Benchmark", "Baseline", "Optimized", "Speedup")
 	fmt.Println("╠──────────────────────────────────────────┼──────────┼──────────┼─────────╣")
