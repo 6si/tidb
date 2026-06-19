@@ -531,6 +531,11 @@ const (
 	// TiDBTiFlashDictEncodingMaxCardinality sets the max distinct values threshold for dictionary encoding.
 	TiDBTiFlashDictEncodingMaxCardinality = "tidb_tiflash_dict_encoding_max_cardinality"
 
+	// TiFlashJsonShredding controls whether TiFlash reads JSON data from shredded sub-columns (ON)
+	// or from the original binary blob (OFF). Data is always dual-written (blob + sub-columns);
+	// this flag only controls the read path for A/B performance comparison.
+	TiFlashJsonShredding = "tiflash_json_shredding"
+
 	// TiDBMPPStoreFailTTL is the unavailable time when a store is detected failed. During that time, tidb will not send any task to
 	// TiFlash even though the failed TiFlash node has been recovered.
 	TiDBMPPStoreFailTTL = "tidb_mpp_store_fail_ttl"
@@ -1529,6 +1534,7 @@ const (
 	DefTiDBEnableTiFlashPipelineMode        = true
 	DefTiFlashEncodedOperations             = false
 	DefTiFlashDictEncodingMaxCardinality    = 4096
+	DefTiFlashJsonShredding                 = true
 	DefTiDBMPPStoreFailTTL                  = "0s"
 	DefTiDBTxnMode                          = PessimisticTxnMode
 	DefTiDBRowFormatV1                      = 1

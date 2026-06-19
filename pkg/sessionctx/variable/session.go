@@ -1050,6 +1050,10 @@ type SessionVars struct {
 	// TiFlashDictEncodingMaxCardinality sets the max distinct values threshold for dictionary encoding.
 	TiFlashDictEncodingMaxCardinality int64
 
+	// TiFlashJsonShredding controls whether TiFlash reads JSON from shredded sub-columns (true)
+	// or from the original binary blob (false). Only affects the read path.
+	TiFlashJsonShredding bool
+
 	// TiDBAllowAutoRandExplicitInsert indicates whether explicit insertion on auto_random column is allowed.
 	AllowAutoRandExplicitInsert bool
 
@@ -2454,6 +2458,7 @@ func NewSessionVars(hctx HookContext) *SessionVars {
 		TiFlashFastScan:                       vardef.DefTiFlashFastScan,
 		TiFlashEncodedOperations:               vardef.DefTiFlashEncodedOperations,
 		TiFlashDictEncodingMaxCardinality:      int64(vardef.DefTiFlashDictEncodingMaxCardinality),
+		TiFlashJsonShredding:                   vardef.DefTiFlashJsonShredding,
 		EnableTiFlashReadForWriteStmt:          true,
 		ForeignKeyChecks:                 vardef.DefTiDBForeignKeyChecks,
 		HookContext:                      hctx,

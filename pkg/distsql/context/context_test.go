@@ -75,6 +75,7 @@ func TestContextDetach(t *testing.T) {
 		TiFlashMaxQueryMemoryPerNode:         1,
 		TiFlashQuerySpillRatio:               1.0,
 		TiFlashHashJoinVersion:               joinversion.HashJoinVersionLegacy,
+		TiFlashJsonShredding:                 true,
 
 		DistSQLConcurrency:            1,
 		ReplicaReadType:               kv.ReplicaReadFollower,
