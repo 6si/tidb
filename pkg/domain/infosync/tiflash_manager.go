@@ -373,7 +373,7 @@ func (m *TiFlashReplicaManagerCtx) PostAccelerateScheduleBatch(ctx context.Conte
 	}
 	input := make([]*router.KeyRange, 0, len(tableIDs))
 	for _, tableID := range tableIDs {
-		startKey := tablecodec.EncodeTablePrefix(tableID)
+		startKey := tablecodec.GenTableRecordPrefix(tableID)
 		endKey := tablecodec.EncodeTablePrefix(tableID + 1)
 		startKey, endKey = m.codec.EncodeRegionRange(startKey, endKey)
 		input = append(input, pd.NewKeyRange(startKey, endKey))
@@ -383,7 +383,7 @@ func (m *TiFlashReplicaManagerCtx) PostAccelerateScheduleBatch(ctx context.Conte
 
 // GetRegionCountFromPD is a helper function calling `/stats/region`.
 func (m *TiFlashReplicaManagerCtx) GetRegionCountFromPD(ctx context.Context, tableID int64, regionCount *int) error {
-	startKey := tablecodec.EncodeTablePrefix(tableID)
+	startKey := tablecodec.GenTableRecordPrefix(tableID)
 	endKey := tablecodec.EncodeTablePrefix(tableID + 1)
 	startKey, endKey = m.codec.EncodeRegionRange(startKey, endKey)
 	stats, err := m.pdHTTPCli.GetRegionStatusByKeyRange(ctx, pd.NewKeyRange(startKey, endKey), true)
@@ -432,9 +432,7 @@ func (*mockTiFlashReplicaManagerCtx) GetPlacementRule(context.Context, int64) (*
 // MakeNewRule creates a pd rule for TiFlash.
 func MakeNewRule(id int64, count uint64, locationLabels []string) pd.Rule {
 	ruleID := MakeRuleID(id)
-	// Use tablePrefix (not tableRecordPrefix) so the rule covers empty sentinel
-	// regions that exist in [tablePrefix(id), tableRecordPrefix(id)] for partitioned tables.
-	startKey := tablecodec.EncodeTablePrefix(id)
+	startKey := tablecodec.GenTableRecordPrefix(id)
 	endKey := tablecodec.EncodeTablePrefix(id + 1)
 
 	ruleNew := makeBaseRule()
