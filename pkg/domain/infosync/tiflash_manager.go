@@ -204,7 +204,7 @@ func calculateTiFlashProgressForShards(
 	}
 	var totalPeerCount int
 	for _, shardID := range shardIDs {
-		cnt, _, _, err := getTiFlashPeerWithoutLagCount(tiFlashStores, keyspaceID, shardID)
+		cnt, _, _, err := getTiFlashPeerWithoutLagCount(context.Background(), tiFlashStores, keyspaceID, shardID)
 		if err != nil {
 			logutil.BgLogger().Error("Fail to get peer count from TiFlash for shard.", zap.Int64("shardID", shardID))
 			return 0, 0, errors.Trace(err)
