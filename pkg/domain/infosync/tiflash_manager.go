@@ -373,7 +373,7 @@ func (m *TiFlashReplicaManagerCtx) PostAccelerateScheduleBatch(ctx context.Conte
 	}
 	input := make([]*router.KeyRange, 0, len(tableIDs))
 	for _, tableID := range tableIDs {
-		startKey := tablecodec.GenTableRecordPrefix(tableID)
+		startKey := tablecodec.EncodeTablePrefix(tableID)
 		endKey := tablecodec.EncodeTablePrefix(tableID + 1)
 		startKey, endKey = m.codec.EncodeRegionRange(startKey, endKey)
 		input = append(input, pd.NewKeyRange(startKey, endKey))
