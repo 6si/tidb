@@ -383,7 +383,7 @@ func (m *TiFlashReplicaManagerCtx) PostAccelerateScheduleBatch(ctx context.Conte
 
 // GetRegionCountFromPD is a helper function calling `/stats/region`.
 func (m *TiFlashReplicaManagerCtx) GetRegionCountFromPD(ctx context.Context, tableID int64, regionCount *int) error {
-	startKey := tablecodec.GenTableRecordPrefix(tableID)
+	startKey := tablecodec.EncodeTablePrefix(tableID)
 	endKey := tablecodec.EncodeTablePrefix(tableID + 1)
 	startKey, endKey = m.codec.EncodeRegionRange(startKey, endKey)
 	stats, err := m.pdHTTPCli.GetRegionStatusByKeyRange(ctx, pd.NewKeyRange(startKey, endKey), true)
@@ -432,7 +432,9 @@ func (*mockTiFlashReplicaManagerCtx) GetPlacementRule(context.Context, int64) (*
 // MakeNewRule creates a pd rule for TiFlash.
 func MakeNewRule(id int64, count uint64, locationLabels []string) pd.Rule {
 	ruleID := MakeRuleID(id)
-	startKey := tablecodec.GenTableRecordPrefix(id)
+	// Use tablePrefix (not tableRecordPrefix) so the rule covers empty sentinel
+	// regions that exist in [tablePrefix(id), tableRecordPrefix(id)] for partitioned tables.
+	startKey := tablecodec.EncodeTablePrefix(id)
 	endKey := tablecodec.EncodeTablePrefix(id + 1)
 
 	ruleNew := makeBaseRule()

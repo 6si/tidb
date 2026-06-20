@@ -48,8 +48,9 @@ var (
 	dimRows    = flag.Int("dim-rows", 1000, "Number of dimension table rows")
 	shards     = flag.Int("shards", 16, "Number of shards for SHARD BY tables")
 	workers    = flag.Int("workers", 8, "Concurrent workers for data loading")
-	skipLoad   = flag.Bool("skip-load", false, "Skip data loading (reuse existing data)")
-	noShard    = flag.Bool("no-shard", false, "Disable SHARD BY syntax (for stock TiDB clusters without shard support)")
+	skipLoad     = flag.Bool("skip-load", false, "Skip data loading (reuse existing data)")
+	loadJSONOnly = flag.Bool("load-json-only", false, "Load only json_events table (table must already exist; skips fact/dim tables)")
+	noShard      = flag.Bool("no-shard", false, "Disable SHARD BY syntax (for stock TiDB clusters without shard support)")
 	mode       = flag.String("mode", "h2h", "Benchmark mode: h2h (head-to-head, optimizer chooses engine) or internal (force KV vs Flash)")
 	benchmarks = flag.String("bench", "all", "Comma-separated benchmarks: shard,in,filter,groupby,join,json,all")
 	iterations = flag.Int("iter", 5, "Iterations per benchmark query")
@@ -118,7 +119,10 @@ func main() {
 	fmt.Printf("Host: %s:%d | Rows: %d | JSON Rows: %d | Shards: %d | Mode: %s | Iter: %d | JSON Size: %s\n\n",
 		*host, *port, *rows, *jsonRows, *shards, *mode, *iterations, *jsonSize)
 
-	if !*skipLoad {
+	if *loadJSONOnly {
+		fmt.Println("[load-json-only] Loading only json_events (fact/dim tables unchanged)\n")
+		loadJSONEvents()
+	} else if !*skipLoad {
 		setupSchema()
 		loadData()
 	} else {
@@ -1607,10 +1611,11 @@ func waitForAllReplicas() {
 		var ready int
 		for _, t := range tables {
 			var avail int
+			var progress float64
 			row := db.QueryRow(fmt.Sprintf(
-				"SELECT IFNULL(AVAILABLE, 0) FROM information_schema.tiflash_replica WHERE TABLE_SCHEMA='%s' AND TABLE_NAME='%s'",
+				"SELECT IFNULL(AVAILABLE, 0), IFNULL(PROGRESS, 0) FROM information_schema.tiflash_replica WHERE TABLE_SCHEMA='%s' AND TABLE_NAME='%s'",
 				*database, t))
-			if err := row.Scan(&avail); err == nil && avail == 1 {
+			if err := row.Scan(&avail, &progress); err == nil && (avail == 1 || progress >= 0.99) {
 				ready++
 			}
 		}
