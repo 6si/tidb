@@ -165,6 +165,9 @@ func main() {
 		if selected["json"] {
 			results = append(results, benchJSONShredding()...)
 		}
+		if selected["subquery"] {
+			results = append(results, benchSubqueries()...)
+		}
 
 		printSummary(results)
 	}
@@ -941,6 +944,136 @@ func benchEncodedStarJoin() []BenchResult {
 	fmt.Printf("  TiFlash (LEFT MPP join):  %v\n", tiflashTime3)
 	fmt.Printf("  Speedup: %.2fx\n", speedup3)
 
+	// 3-table join: fact × region × industry with sector filter
+	fmt.Println("\n  --- Multi-Table Joins (3-4 tables) ---")
+
+	results = append(results, runInternal("3-table fact×region×industry (sector)",
+		`SELECT dr.country, di.sector, COUNT(*), SUM(f.revenue)
+		FROM fact_sharded f
+		INNER JOIN dim_region dr ON f.region_id = dr.id
+		INNER JOIN dim_industry di ON f.industry_id = di.id
+		WHERE dr.country IN ('US', 'EU') AND di.sector = 'Tech'
+		GROUP BY dr.country, di.sector`))
+
+	// 3-table JSON join: json_events × dim_event × dim_region
+	results = append(results, runInternal("3-table json×event×region",
+		`SELECT de.category, dr.country, COUNT(*) AS cnt,
+			AVG(CAST(j.payload->>'$.score' AS DECIMAL(10,2))) AS avg_score
+		FROM json_events j
+		INNER JOIN dim_event de ON de.event_name = j.payload->>'$.event'
+		INNER JOIN dim_region dr ON dr.id = (j.id % 50) + 1
+		GROUP BY de.category, dr.country
+		ORDER BY cnt DESC
+		LIMIT 20`))
+
+	// 4-table join: fact × json × dim_event × dim_region
+	results = append(results, runInternal("4-table fact×json×event×region",
+		`SELECT de.category, dr.country, f.status,
+			COUNT(*) AS cnt, SUM(f.revenue) AS total_rev
+		FROM fact_sharded f
+		INNER JOIN json_events j ON j.id = f.id AND j.tenant_id = f.tenant_id
+		INNER JOIN dim_event de ON de.event_name = j.payload->>'$.event'
+		INNER JOIN dim_region dr ON dr.id = f.region_id
+		WHERE de.is_conversion = TRUE
+		GROUP BY de.category, dr.country, f.status
+		ORDER BY total_rev DESC
+		LIMIT 20`))
+
+	// 3-table LEFT JOIN: fact LEFT JOIN region LEFT JOIN industry
+	results = append(results, runInternal("3-table LEFT JOIN fact×region×industry",
+		`SELECT dr.country, di.sector,
+			COUNT(*) AS cnt, SUM(f.revenue) AS total_rev
+		FROM fact_sharded f
+		LEFT JOIN dim_region dr ON f.region_id = dr.id
+		LEFT JOIN dim_industry di ON f.industry_id = di.id
+		GROUP BY dr.country, di.sector
+		ORDER BY total_rev DESC
+		LIMIT 20`))
+
+	// Mixed INNER + LEFT: fact INNER JOIN region LEFT JOIN industry
+	results = append(results, runInternal("Mixed INNER+LEFT fact×region×industry",
+		`SELECT dr.country, di.sector,
+			COUNT(*) AS cnt, SUM(f.revenue) AS total_rev, AVG(f.revenue) AS avg_rev
+		FROM fact_sharded f
+		INNER JOIN dim_region dr ON f.region_id = dr.id
+		LEFT JOIN dim_industry di ON f.industry_id = di.id
+		WHERE dr.country = 'US'
+		GROUP BY dr.country, di.sector
+		ORDER BY total_rev DESC`))
+
+	// LEFT JOIN with JSON: json_events LEFT JOIN dim_event
+	results = append(results, runInternal("LEFT JOIN json×event (sparse match)",
+		`SELECT de.category, COUNT(*) AS cnt,
+			AVG(CAST(j.payload->>'$.score' AS DECIMAL(10,2))) AS avg_score
+		FROM json_events j
+		LEFT JOIN dim_event de ON de.event_name = j.payload->>'$.event'
+		GROUP BY de.category
+		ORDER BY cnt DESC`))
+
+	return results
+}
+
+func benchSubqueries() []BenchResult {
+	fmt.Println("\n--- Benchmark: Subqueries (TiKV vs TiFlash) ---")
+	var results []BenchResult
+
+	// IN subquery: fact rows whose tenant has purchase events
+	results = append(results, runInternal("IN subquery (purchase tenants)",
+		`SELECT COUNT(*), SUM(revenue)
+		FROM fact_sharded
+		WHERE tenant_id IN (
+			SELECT DISTINCT tenant_id FROM json_events
+			WHERE payload->>'$.event' = 'purchase'
+		)`))
+
+	// EXISTS correlated subquery
+	results = append(results, runInternal("EXISTS subquery (correlated)",
+		`SELECT COUNT(*), SUM(revenue)
+		FROM fact_sharded f
+		WHERE EXISTS (
+			SELECT 1 FROM json_events j
+			WHERE j.tenant_id = f.tenant_id
+			AND j.payload->>'$.event' = 'purchase'
+		)`))
+
+	// Scalar subquery: revenue above global average
+	results = append(results, runInternal("Scalar subquery (revenue > avg)",
+		`SELECT f.status, COUNT(*), SUM(f.revenue)
+		FROM fact_sharded f
+		WHERE f.revenue > (SELECT AVG(revenue) FROM fact_sharded)
+		GROUP BY f.status`))
+
+	// Derived table joined to dimension
+	results = append(results, runInternal("Derived table + JOIN",
+		`SELECT sub.event, dr.country, sub.cnt, sub.avg_score
+		FROM (
+			SELECT payload->>'$.event' AS event,
+				(id % 50) + 1 AS region_id,
+				COUNT(*) AS cnt,
+				AVG(CAST(payload->>'$.score' AS DECIMAL(10,2))) AS avg_score
+			FROM json_events
+			GROUP BY payload->>'$.event', (id % 50) + 1
+		) sub
+		INNER JOIN dim_region dr ON dr.id = sub.region_id
+		ORDER BY sub.cnt DESC
+		LIMIT 20`))
+
+	// NOT IN subquery: tenants without purchase events
+	results = append(results, runInternal("NOT IN subquery (no purchases)",
+		`SELECT COUNT(*), SUM(revenue)
+		FROM fact_sharded
+		WHERE tenant_id NOT IN (
+			SELECT DISTINCT tenant_id FROM json_events
+			WHERE payload->>'$.event' = 'purchase'
+		)`))
+
+	// Subquery in HAVING clause
+	results = append(results, runInternal("Subquery in HAVING",
+		`SELECT f.status, COUNT(*) AS cnt, SUM(f.revenue) AS total_rev
+		FROM fact_sharded f
+		GROUP BY f.status
+		HAVING SUM(f.revenue) > (SELECT AVG(revenue) * 1000 FROM fact_sharded)`))
+
 	return results
 }
 
@@ -1116,6 +1249,48 @@ func benchJSONShredding() []BenchResult {
 	fmt.Printf("  TiFlash nested blob (@@=OFF):     %v\n", blobTime3)
 	fmt.Printf("  TiFlash nested shredded (@@=ON):  %v\n", shreddedTime3)
 	fmt.Printf("  Speedup: %.2fx  %s\n", speedup7, scaleNote(speedup7))
+
+	// === Comparison Operators A/B: string GT/LT/NE/LIKE, numeric GT, Float64 GT, range ===
+	fmt.Println("\n  --- JSON Comparison Operators A/B: blob vs shredded ---")
+	fmt.Println("  Tests GT/LT/NE/LIKE on string, Int64, and Float64 sub-columns.")
+
+	// String GT (dictionary-aware comparison)
+	results = append(results, runAB("String GT $.event>'click'",
+		`SELECT COUNT(*) FROM json_events WHERE payload->>'$.event' > 'click'`))
+
+	// String NE (dictionary-aware)
+	results = append(results, runAB("String NE $.event!='purchase'",
+		`SELECT COUNT(*) FROM json_events WHERE payload->>'$.event' != 'purchase'`))
+
+	// String LIKE (dictionary-aware pattern match)
+	results = append(results, runAB("String LIKE $.event LIKE '%pur%'",
+		`SELECT COUNT(*) FROM json_events WHERE payload->>'$.event' LIKE '%pur%'`))
+
+	// Numeric Int64 GT
+	results = append(results, runAB("Int64 GT $.duration>15000",
+		`SELECT COUNT(*) FROM json_events WHERE CAST(payload->>'$.duration' AS SIGNED) > 15000`))
+
+	// Numeric Float64 GT
+	results = append(results, runAB("Float64 GT $.score>50",
+		`SELECT COUNT(*) FROM json_events WHERE CAST(payload->>'$.score' AS DECIMAL(10,2)) > 50.0`))
+
+	// Float64 range scan (BETWEEN = GE + LE)
+	results = append(results, runAB("Float64 BETWEEN $.score 25-75",
+		`SELECT COUNT(*) FROM json_events WHERE CAST(payload->>'$.score' AS DECIMAL(10,2)) BETWEEN 25.0 AND 75.0`))
+
+	// Combined: comparison filter + GROUP BY (fused filter + aggregation)
+	results = append(results, runAB("GT filter + GROUP BY",
+		`SELECT payload->>'$.event' AS evt, COUNT(*) FROM json_events WHERE CAST(payload->>'$.score' AS DECIMAL(10,2)) > 50.0 GROUP BY evt`))
+
+	if *jsonSize == "large" {
+		// Nested Float64 GT
+		results = append(results, runAB("Nested Float64 GT $.product.price>100",
+			`SELECT COUNT(*) FROM json_events WHERE CAST(payload->>'$.product.price' AS DECIMAL(10,2)) > 100.0`))
+
+		// Nested String GT
+		results = append(results, runAB("Nested String GT $.campaign.src>'facebook'",
+			`SELECT COUNT(*) FROM json_events WHERE payload->>'$.campaign.source' > 'facebook'`))
+	}
 
 	// === Multi-path extraction: amplifies per-row parse cost ===
 	fmt.Println("\n  --- Multi-Path JSON Extraction (blob vs shredded) ---")
@@ -1389,6 +1564,38 @@ func benchHeadToHead() []H2HResult {
 		WHERE tenant_id = 42 AND payload->>'$.event' = 'click'
 		GROUP BY payload->>'$.page'`))
 
+	// --- Category: JSON Comparison Operators ---
+	fmt.Println("--- JSON Comparison Operators ---")
+
+	results = append(results, runH2H("JSON Comparison", "String GT $.event>'click'",
+		"SELECT COUNT(*) FROM json_events WHERE payload->>'$.event' > 'click'"))
+
+	results = append(results, runH2H("JSON Comparison", "String NE $.event!='purchase'",
+		"SELECT COUNT(*) FROM json_events WHERE payload->>'$.event' != 'purchase'"))
+
+	results = append(results, runH2H("JSON Comparison", "String LIKE $.event LIKE '%pur%'",
+		"SELECT COUNT(*) FROM json_events WHERE payload->>'$.event' LIKE '%pur%'"))
+
+	results = append(results, runH2H("JSON Comparison", "Int64 GT $.duration>15000",
+		"SELECT COUNT(*) FROM json_events WHERE CAST(payload->>'$.duration' AS SIGNED) > 15000"))
+
+	results = append(results, runH2H("JSON Comparison", "Float64 GT $.score>50",
+		"SELECT COUNT(*) FROM json_events WHERE CAST(payload->>'$.score' AS DECIMAL(10,2)) > 50.0"))
+
+	results = append(results, runH2H("JSON Comparison", "Float64 BETWEEN $.score 25-75",
+		"SELECT COUNT(*) FROM json_events WHERE CAST(payload->>'$.score' AS DECIMAL(10,2)) BETWEEN 25.0 AND 75.0"))
+
+	results = append(results, runH2H("JSON Comparison", "GT filter + GROUP BY",
+		`SELECT payload->>'$.event' AS evt, COUNT(*) FROM json_events WHERE CAST(payload->>'$.score' AS DECIMAL(10,2)) > 50.0 GROUP BY evt`))
+
+	if *jsonSize == "large" {
+		results = append(results, runH2H("JSON Comparison", "Nested Float64 GT $.product.price>100",
+			"SELECT COUNT(*) FROM json_events WHERE CAST(payload->>'$.product.price' AS DECIMAL(10,2)) > 100.0"))
+
+		results = append(results, runH2H("JSON Comparison", "Nested String GT $.campaign.src>'fb'",
+			"SELECT COUNT(*) FROM json_events WHERE payload->>'$.campaign.source' > 'facebook'"))
+	}
+
 	// --- Category: JSON Multi-Path ---
 	fmt.Println("--- JSON Multi-Path ---")
 
@@ -1497,7 +1704,165 @@ func benchHeadToHead() []H2HResult {
 		ORDER BY cnt DESC
 		LIMIT 20`))
 
+	// --- Category: Multi-Table Joins (3-4 tables) ---
+	fmt.Println("--- Multi-Table Joins ---")
+
+	results = append(results, runH2H("Multi-Table Join", "3-table fact×region×industry (sector)",
+		`SELECT dr.country, di.sector, COUNT(*), SUM(f.revenue)
+		FROM fact_sharded f
+		INNER JOIN dim_region dr ON f.region_id = dr.id
+		INNER JOIN dim_industry di ON f.industry_id = di.id
+		WHERE dr.country IN ('US', 'EU') AND di.sector = 'Tech'
+		GROUP BY dr.country, di.sector`))
+
+	results = append(results, runH2H("Multi-Table Join", "3-table json×event×region",
+		`SELECT de.category, dr.country, COUNT(*) AS cnt,
+			AVG(CAST(j.payload->>'$.score' AS DECIMAL(10,2))) AS avg_score
+		FROM json_events j
+		INNER JOIN dim_event de ON de.event_name = j.payload->>'$.event'
+		INNER JOIN dim_region dr ON dr.id = (j.id % 50) + 1
+		GROUP BY de.category, dr.country
+		ORDER BY cnt DESC
+		LIMIT 20`))
+
+	results = append(results, runH2H("Multi-Table Join", "4-table fact×json×event×region",
+		`SELECT de.category, dr.country, f.status,
+			COUNT(*) AS cnt, SUM(f.revenue) AS total_rev
+		FROM fact_sharded f
+		INNER JOIN json_events j ON j.id = f.id AND j.tenant_id = f.tenant_id
+		INNER JOIN dim_event de ON de.event_name = j.payload->>'$.event'
+		INNER JOIN dim_region dr ON dr.id = f.region_id
+		WHERE de.is_conversion = TRUE
+		GROUP BY de.category, dr.country, f.status
+		ORDER BY total_rev DESC
+		LIMIT 20`))
+
+	results = append(results, runH2H("Multi-Table Join", "3-table LEFT JOIN fact×region×industry",
+		`SELECT dr.country, di.sector,
+			COUNT(*) AS cnt, SUM(f.revenue) AS total_rev
+		FROM fact_sharded f
+		LEFT JOIN dim_region dr ON f.region_id = dr.id
+		LEFT JOIN dim_industry di ON f.industry_id = di.id
+		GROUP BY dr.country, di.sector
+		ORDER BY total_rev DESC
+		LIMIT 20`))
+
+	results = append(results, runH2H("Multi-Table Join", "Mixed INNER+LEFT fact×region×industry",
+		`SELECT dr.country, di.sector,
+			COUNT(*) AS cnt, SUM(f.revenue) AS total_rev, AVG(f.revenue) AS avg_rev
+		FROM fact_sharded f
+		INNER JOIN dim_region dr ON f.region_id = dr.id
+		LEFT JOIN dim_industry di ON f.industry_id = di.id
+		WHERE dr.country = 'US'
+		GROUP BY dr.country, di.sector
+		ORDER BY total_rev DESC`))
+
+	results = append(results, runH2H("Multi-Table Join", "LEFT JOIN json×event (sparse match)",
+		`SELECT de.category, COUNT(*) AS cnt,
+			AVG(CAST(j.payload->>'$.score' AS DECIMAL(10,2))) AS avg_score
+		FROM json_events j
+		LEFT JOIN dim_event de ON de.event_name = j.payload->>'$.event'
+		GROUP BY de.category
+		ORDER BY cnt DESC`))
+
+	// --- Category: Subqueries ---
+	fmt.Println("--- Subqueries ---")
+
+	results = append(results, runH2H("Subquery", "IN subquery (purchase tenants)",
+		`SELECT COUNT(*), SUM(revenue)
+		FROM fact_sharded
+		WHERE tenant_id IN (
+			SELECT DISTINCT tenant_id FROM json_events
+			WHERE payload->>'$.event' = 'purchase'
+		)`))
+
+	results = append(results, runH2H("Subquery", "EXISTS subquery (correlated)",
+		`SELECT COUNT(*), SUM(revenue)
+		FROM fact_sharded f
+		WHERE EXISTS (
+			SELECT 1 FROM json_events j
+			WHERE j.tenant_id = f.tenant_id
+			AND j.payload->>'$.event' = 'purchase'
+		)`))
+
+	results = append(results, runH2H("Subquery", "Scalar subquery (revenue > avg)",
+		`SELECT f.status, COUNT(*), SUM(f.revenue)
+		FROM fact_sharded f
+		WHERE f.revenue > (SELECT AVG(revenue) FROM fact_sharded)
+		GROUP BY f.status`))
+
+	results = append(results, runH2H("Subquery", "Derived table + JOIN",
+		`SELECT sub.event, dr.country, sub.cnt, sub.avg_score
+		FROM (
+			SELECT payload->>'$.event' AS event,
+				(id % 50) + 1 AS region_id,
+				COUNT(*) AS cnt,
+				AVG(CAST(payload->>'$.score' AS DECIMAL(10,2))) AS avg_score
+			FROM json_events
+			GROUP BY payload->>'$.event', (id % 50) + 1
+		) sub
+		INNER JOIN dim_region dr ON dr.id = sub.region_id
+		ORDER BY sub.cnt DESC
+		LIMIT 20`))
+
+	results = append(results, runH2H("Subquery", "NOT IN subquery (no purchases)",
+		`SELECT COUNT(*), SUM(revenue)
+		FROM fact_sharded
+		WHERE tenant_id NOT IN (
+			SELECT DISTINCT tenant_id FROM json_events
+			WHERE payload->>'$.event' = 'purchase'
+		)`))
+
+	results = append(results, runH2H("Subquery", "Subquery in HAVING",
+		`SELECT f.status, COUNT(*) AS cnt, SUM(f.revenue) AS total_rev
+		FROM fact_sharded f
+		GROUP BY f.status
+		HAVING SUM(f.revenue) > (SELECT AVG(revenue) * 1000 FROM fact_sharded)`))
+
 	return results
+}
+
+func runInternal(name, query string) BenchResult {
+	mustExec("SET @@tidb_isolation_read_engines = 'tikv'")
+	tikvTime := timeQuery(query, *iterations)
+
+	mustExec("SET @@tidb_isolation_read_engines = 'tiflash'")
+	mustExec("SET @@tidb_allow_mpp = 1")
+	tiflashTime := timeQuery(query, *iterations)
+
+	mustExec("SET @@tidb_isolation_read_engines = 'tikv,tiflash'")
+
+	speedup := float64(tikvTime) / float64(tiflashTime)
+
+	fmt.Printf("  %-45s TiKV=%8s  TiFlash=%8s  %.2fx\n",
+		name, fmtDur(tikvTime), fmtDur(tiflashTime), speedup)
+
+	return BenchResult{
+		Name:      name,
+		Baseline:  tikvTime,
+		Optimized: tiflashTime,
+		Speedup:   speedup,
+	}
+}
+
+func runAB(name, query string) BenchResult {
+	mustExec("SET @@tiflash_json_shredding = OFF")
+	blobTime := timeQuery(query, *iterations)
+
+	mustExec("SET @@tiflash_json_shredding = ON")
+	shreddedTime := timeQuery(query, *iterations)
+
+	speedup := float64(blobTime) / float64(shreddedTime)
+
+	fmt.Printf("  %-45s blob=%8s  shredded=%8s  %.2fx %s\n",
+		name, fmtDur(blobTime), fmtDur(shreddedTime), speedup, scaleNote(speedup))
+
+	return BenchResult{
+		Name:      name,
+		Baseline:  blobTime,
+		Optimized: shreddedTime,
+		Speedup:   speedup,
+	}
 }
 
 func runH2H(category, name, query string) H2HResult {
@@ -1634,7 +1999,7 @@ func waitForAllReplicas() {
 func parseBenchmarks(s string) map[string]bool {
 	m := make(map[string]bool)
 	if s == "all" {
-		for _, b := range []string{"shard", "in", "filter", "groupby", "join", "json"} {
+		for _, b := range []string{"shard", "in", "filter", "groupby", "join", "json", "subquery"} {
 			m[b] = true
 		}
 		return m
