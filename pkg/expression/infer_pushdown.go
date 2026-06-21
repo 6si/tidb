@@ -322,7 +322,8 @@ func scalarExprSupportedByFlash(ctx EvalContext, function *ScalarFunction) bool 
 			tipb.ScalarFuncSig_CoalesceDuration,
 			tipb.ScalarFuncSig_IfNullDuration,
 			tipb.ScalarFuncSig_IfDuration,
-			tipb.ScalarFuncSig_CaseWhenDuration:
+			tipb.ScalarFuncSig_CaseWhenDuration,
+			tipb.ScalarFuncSig_InJson:
 			return false
 		}
 		return true

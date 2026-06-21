@@ -656,14 +656,19 @@ func TestJsonPushDownToFlash(t *testing.T) {
 	require.NoError(t, err)
 	exprs = append(exprs, function)
 
-	// InJson
+	pushed, remained = PushDownExprs(pushDownCtx, exprs, kv.TiFlash)
+	require.Len(t, pushed, len(exprs))
+	require.Len(t, remained, 0)
+
+	// InJson — NOT pushable (TiFlash does not implement InJson)
+	exprs = exprs[:0]
 	function, err = NewFunction(mock.NewContext(), ast.In, types.NewFieldType(mysql.TypeLonglong), jsonColumn, jsonColumn, jsonColumn)
 	require.NoError(t, err)
 	exprs = append(exprs, function)
 
 	pushed, remained = PushDownExprs(pushDownCtx, exprs, kv.TiFlash)
-	require.Len(t, pushed, len(exprs))
-	require.Len(t, remained, 0)
+	require.Len(t, pushed, 0)
+	require.Len(t, remained, 1)
 }
 
 func TestExprPushDownToFlash(t *testing.T) {
