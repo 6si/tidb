@@ -499,6 +499,9 @@ func (p *PhysicalTableScan) OperatorInfo(normalized bool) string {
 	if p.StoreType == kv.TiFlash && p.Table.GetPartitionInfo() != nil && p.IsMPPOrBatchCop && p.SCtx().GetSessionVars().StmtCtx.UseDynamicPartitionPrune() {
 		buffer.WriteString(", PartitionTableScan:true")
 	}
+	if !normalized && p.StoreType == kv.TiFlash {
+		p.appendTiFlashSEAnnotations(&buffer)
+	}
 	if len(p.runtimeFilterList) > 0 {
 		buffer.WriteString(", runtime filter:")
 		for i, runtimeFilter := range p.runtimeFilterList {
@@ -569,6 +572,92 @@ func (p *PhysicalTableScan) haveCorCol() bool {
 		}
 	}
 	return false
+}
+
+// appendTiFlashSEAnnotations appends SE-specific annotations to the EXPLAIN
+// output for TiFlash table scans: JSON shredding paths and whether the table
+// has JSON columns that can benefit from sidecar sub-column reads.
+func (p *PhysicalTableScan) appendTiFlashSEAnnotations(buffer *strings.Builder) {
+	vars := p.SCtx().GetSessionVars()
+
+	// JSON shredding annotation: show which JSON paths will use sidecar reads.
+	hasJSONCol := false
+	for _, col := range p.Columns {
+		if col.GetType() == mysql.TypeJSON {
+			hasJSONCol = true
+			break
+		}
+	}
+	if !hasJSONCol {
+		return
+	}
+
+	if vars.TiFlashJSONShredding {
+		// Collect JSON paths from filter conditions and late-materialization filters.
+		paths := collectJSONExtractPaths(p.FilterCondition)
+		paths = append(paths, collectJSONExtractPaths(p.LateMaterializationFilterCondition)...)
+		paths = dedup(paths)
+		if len(paths) > 0 {
+			buffer.WriteString(", json_shredding:[")
+			buffer.WriteString(strings.Join(paths, ", "))
+			buffer.WriteString("]")
+		} else {
+			buffer.WriteString(", json_shredding:on")
+		}
+	}
+}
+
+// collectJSONExtractPaths walks an expression tree and returns JSON paths
+// found as constant arguments to json_extract calls (e.g. "$.event").
+func collectJSONExtractPaths(exprs []expression.Expression) []string {
+	var paths []string
+	for _, expr := range exprs {
+		paths = append(paths, extractJSONPaths(expr)...)
+	}
+	return paths
+}
+
+func extractJSONPaths(expr expression.Expression) []string {
+	sf, ok := expr.(*expression.ScalarFunction)
+	if !ok {
+		return nil
+	}
+	var paths []string
+	if sf.FuncName.L == ast.JSONExtract {
+		// json_extract(col, '$.path1', '$.path2', ...)
+		// The first arg is the column; remaining args are path constants.
+		for i, arg := range sf.GetArgs() {
+			if i == 0 {
+				continue
+			}
+			if c, ok := arg.(*expression.Constant); ok {
+				pathStr := c.Value.GetString()
+				if len(pathStr) > 0 {
+					paths = append(paths, pathStr)
+				}
+			}
+		}
+	}
+	// Recurse into all arguments to find nested json_extract calls.
+	for _, arg := range sf.GetArgs() {
+		paths = append(paths, extractJSONPaths(arg)...)
+	}
+	return paths
+}
+
+func dedup(ss []string) []string {
+	if len(ss) <= 1 {
+		return ss
+	}
+	seen := make(map[string]struct{}, len(ss))
+	result := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			result = append(result, s)
+		}
+	}
+	return result
 }
 
 // IsFullScan is to judge whether the PhysicalTableScan is full-scan
