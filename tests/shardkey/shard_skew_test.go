@@ -41,10 +41,10 @@ func TestShardSkew_BasicQuery(t *testing.T) {
 		ORDER BY SHARD_ID`).Rows()
 	require.Len(t, rows, 4)
 	for i, row := range rows {
-		require.Equal(t, "test", row[0])  // TABLE_SCHEMA
-		require.Equal(t, "skew1", row[1]) // TABLE_NAME
-		require.Equal(t, "company_id", row[2]) // SHARD_KEY
-		require.Equal(t, "4", row[3])     // SHARD_COUNT
+		require.Equal(t, "test", row[0])               // TABLE_SCHEMA
+		require.Equal(t, "skew1", row[1])              // TABLE_NAME
+		require.Equal(t, "company_id", row[2])         // SHARD_KEY
+		require.Equal(t, "4", row[3])                  // SHARD_COUNT
 		require.Equal(t, fmt.Sprintf("%d", i), row[4]) // SHARD_ID
 	}
 }

@@ -40,24 +40,24 @@ import (
 )
 
 var (
-	host       = flag.String("host", "127.0.0.1", "TiDB host")
-	port       = flag.Int("port", 4000, "TiDB port")
-	user       = flag.String("user", "root", "TiDB user")
-	password   = flag.String("password", "", "TiDB password")
-	database   = flag.String("db", "bench_tidb_se", "Database name")
-	rows       = flag.Int("rows", 10_000_000, "Number of fact table rows to load")
-	jsonRows   = flag.Int("json-rows", 0, "Number of JSON event rows (default: same as --rows for 100%%)")
-	dimRows    = flag.Int("dim-rows", 1000, "Number of dimension table rows")
-	shards     = flag.Int("shards", 16, "Number of shards for SHARD BY tables")
-	workers    = flag.Int("workers", 8, "Concurrent workers for data loading")
+	host         = flag.String("host", "127.0.0.1", "TiDB host")
+	port         = flag.Int("port", 4000, "TiDB port")
+	user         = flag.String("user", "root", "TiDB user")
+	password     = flag.String("password", "", "TiDB password")
+	database     = flag.String("db", "bench_tidb_se", "Database name")
+	rows         = flag.Int("rows", 10_000_000, "Number of fact table rows to load")
+	jsonRows     = flag.Int("json-rows", 0, "Number of JSON event rows (default: same as --rows for 100%%)")
+	dimRows      = flag.Int("dim-rows", 1000, "Number of dimension table rows")
+	shards       = flag.Int("shards", 16, "Number of shards for SHARD BY tables")
+	workers      = flag.Int("workers", 8, "Concurrent workers for data loading")
 	skipLoad     = flag.Bool("skip-load", false, "Skip data loading (reuse existing data)")
 	loadJSONOnly = flag.Bool("load-json-only", false, "Load only json_events table (table must already exist; skips fact/dim tables)")
 	noShard      = flag.Bool("no-shard", false, "Disable SHARD BY syntax (for stock TiDB clusters without shard support)")
-	mode       = flag.String("mode", "h2h", "Benchmark mode: h2h (head-to-head, optimizer chooses engine) or internal (force KV vs Flash)")
-	benchmarks = flag.String("bench", "all", "Comma-separated benchmarks: shard,in,filter,groupby,join,json,all")
-	iterations = flag.Int("iter", 5, "Iterations per benchmark query")
-	jsonSize   = flag.String("json-size", "small", "JSON document size: small (~200B), large (~2-5KB with 20+ paths)")
-	parallel   = flag.Int("parallel", 1, "Concurrent query streams per benchmark (1 = serial, >1 = parallel execution)")
+	mode         = flag.String("mode", "h2h", "Benchmark mode: h2h (head-to-head, optimizer chooses engine) or internal (force KV vs Flash)")
+	benchmarks   = flag.String("bench", "all", "Comma-separated benchmarks: shard,in,filter,groupby,join,json,all")
+	iterations   = flag.Int("iter", 5, "Iterations per benchmark query")
+	jsonSize     = flag.String("json-size", "small", "JSON document size: small (~200B), large (~2-5KB with 20+ paths)")
+	parallel     = flag.Int("parallel", 1, "Concurrent query streams per benchmark (1 = serial, >1 = parallel execution)")
 )
 
 type BenchResult struct {
@@ -404,8 +404,8 @@ func loadFactTables() {
 
 				for i := 0; i < batchSize; i++ {
 					id := baseID + int64(i) + 1
-					tenantID := (id % 10000) + 1 // 10K tenants
-					partTenantID := (id % 1000) + 1  // 1K tenants for partitioned table
+					tenantID := (id % 10000) + 1    // 10K tenants
+					partTenantID := (id % 1000) + 1 // 1K tenants for partitioned table
 					regionID := (id % 50) + 1
 					industryID := (id % 20) + 1
 					status := statuses[id%5]
@@ -2251,8 +2251,8 @@ func getExplainAccess(query string) string {
 	var parts []string
 	for rows.Next() {
 		cols, _ := rows.Columns()
-		vals := make([]interface{}, len(cols))
-		ptrs := make([]interface{}, len(cols))
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
 		for i := range vals {
 			ptrs[i] = &vals[i]
 		}
@@ -2365,7 +2365,7 @@ func fmtDur(d time.Duration) string {
 	return fmt.Sprintf("%.2fs", d.Seconds())
 }
 
-func mustExec(query string, args ...interface{}) {
+func mustExec(query string, args ...any) {
 	_, err := db.Exec(query, args...)
 	if err != nil {
 		// Non-fatal for SET commands that may not exist yet
@@ -2376,7 +2376,7 @@ func mustExec(query string, args ...interface{}) {
 	}
 }
 
-func fatal(format string, args ...interface{}) {
+func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "FATAL: "+format+"\n", args...)
 	os.Exit(1)
 }

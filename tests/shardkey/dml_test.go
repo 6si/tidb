@@ -574,4 +574,3 @@ func joinPlan(rows [][]any) string {
 	}
 	return strings.Join(parts, "\n")
 }
-

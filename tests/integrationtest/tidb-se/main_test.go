@@ -57,7 +57,7 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func mustExec(t *testing.T, query string, args ...interface{}) {
+func mustExec(t *testing.T, query string, args ...any) {
 	t.Helper()
 	_, err := db.Exec(query, args...)
 	if err != nil {
@@ -65,7 +65,7 @@ func mustExec(t *testing.T, query string, args ...interface{}) {
 	}
 }
 
-func mustQuery(t *testing.T, query string, args ...interface{}) *sql.Rows {
+func mustQuery(t *testing.T, query string, args ...any) *sql.Rows {
 	t.Helper()
 	rows, err := db.Query(query, args...)
 	if err != nil {
@@ -1380,7 +1380,7 @@ func TestJsonShredding_LargeDocuments(t *testing.T) {
 		t.Fatalf("Expected 50 active rows, got %d", count)
 	}
 
-	// Sparse field query  
+	// Sparse field query
 	count = queryInt(t, `SELECT COUNT(*) FROM test_json_large WHERE data->>'$.medium_field' IS NOT NULL`)
 	if count != 10 { // every 5th row
 		t.Fatalf("Expected 10 rows with medium_field, got %d", count)
