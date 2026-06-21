@@ -1798,6 +1798,41 @@ func benchHeadToHead() []H2HResult {
 		ORDER BY cnt DESC
 		LIMIT 20`))
 
+	// --- Category: JSON + Shard Pruning (combined optimizations) ---
+	fmt.Println("--- JSON + Shard Pruning ---")
+
+	// Single tenant filter + JSON extract: shard pruning (1/16) + blob-skip
+	results = append(results, runH2H("JSON+Shard", "tenant_id=42 + JSON filter $.event",
+		`SELECT COUNT(*), payload->>'$.event' AS ev
+		FROM json_events
+		WHERE tenant_id = 42 AND payload->>'$.event' = 'purchase'
+		GROUP BY ev`))
+
+	// Single tenant + JSON numeric aggregation: shard pruning + cast pushdown + blob-skip
+	results = append(results, runH2H("JSON+Shard", "tenant_id=42 + AVG(CAST $.score)",
+		`SELECT COUNT(*),
+			AVG(CAST(json_extract(payload, '$.score') AS DOUBLE)),
+			AVG(CAST(json_extract(payload, '$.duration') AS DOUBLE))
+		FROM json_events
+		WHERE tenant_id = 42`))
+
+	// Single tenant + JSON BETWEEN: shard pruning + cast pushdown + blob-skip
+	results = append(results, runH2H("JSON+Shard", "tenant_id=42 + BETWEEN $.score",
+		`SELECT COUNT(*)
+		FROM json_events
+		WHERE tenant_id = 42
+			AND CAST(json_extract(payload, '$.score') AS DOUBLE) BETWEEN 25.0 AND 75.0`))
+
+	// Single tenant + multi-path GROUP BY: shard pruning + multi-path blob-skip
+	results = append(results, runH2H("JSON+Shard", "tenant_id=42 + 3-path GROUP BY",
+		`SELECT payload->>'$.event' AS ev,
+			AVG(CAST(json_extract(payload, '$.score') AS DOUBLE)) AS avg_score,
+			AVG(CAST(json_extract(payload, '$.duration') AS DOUBLE)) AS avg_dur,
+			COUNT(*) AS cnt
+		FROM json_events
+		WHERE tenant_id = 42
+		GROUP BY ev`))
+
 	// --- Category: Multi-Table Joins (3-4 tables) ---
 	fmt.Println("--- Multi-Table Joins ---")
 
