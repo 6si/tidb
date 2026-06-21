@@ -623,7 +623,8 @@ func TestJsonPushDownToFlash(t *testing.T) {
 	require.Len(t, pushed, len(exprs))
 	require.Len(t, remained, 0)
 
-	// functions that can not be pushed to tiflash
+	// JSON comparison functions that CAN be pushed to TiFlash
+	// (enabled for JSON shredding filter pushdown)
 	exprs = exprs[:0]
 	// LTJson
 	function, err = NewFunction(mock.NewContext(), ast.LT, types.NewFieldType(mysql.TypeLonglong), jsonColumn, jsonColumn)
@@ -661,8 +662,8 @@ func TestJsonPushDownToFlash(t *testing.T) {
 	exprs = append(exprs, function)
 
 	pushed, remained = PushDownExprs(pushDownCtx, exprs, kv.TiFlash)
-	require.Len(t, pushed, 0)
-	require.Len(t, remained, len(exprs))
+	require.Len(t, pushed, len(exprs))
+	require.Len(t, remained, 0)
 }
 
 func TestExprPushDownToFlash(t *testing.T) {
