@@ -351,11 +351,11 @@ func scalarExprSupportedByFlash(ctx EvalContext, function *ScalarFunction) bool 
 		retType := function.RetType
 		switch function.Function.PbCode() {
 		case tipb.ScalarFuncSig_CastDecimalAsInt, tipb.ScalarFuncSig_CastIntAsInt, tipb.ScalarFuncSig_CastRealAsInt, tipb.ScalarFuncSig_CastTimeAsInt,
-			tipb.ScalarFuncSig_CastStringAsInt /*, tipb.ScalarFuncSig_CastDurationAsInt, tipb.ScalarFuncSig_CastJsonAsInt*/ :
+			tipb.ScalarFuncSig_CastStringAsInt, tipb.ScalarFuncSig_CastJsonAsInt /*, tipb.ScalarFuncSig_CastDurationAsInt*/ :
 			// TiFlash cast only support cast to Int64 or the source type is the same as the target type
 			return (sourceType.GetType() == retType.GetType() && mysql.HasUnsignedFlag(sourceType.GetFlag()) == mysql.HasUnsignedFlag(retType.GetFlag())) || retType.GetType() == mysql.TypeLonglong
-		case tipb.ScalarFuncSig_CastIntAsReal, tipb.ScalarFuncSig_CastRealAsReal, tipb.ScalarFuncSig_CastStringAsReal, tipb.ScalarFuncSig_CastTimeAsReal, tipb.ScalarFuncSig_CastDecimalAsReal: /*
-			  tipb.ScalarFuncSig_CastDurationAsReal, tipb.ScalarFuncSig_CastJsonAsReal*/
+		case tipb.ScalarFuncSig_CastIntAsReal, tipb.ScalarFuncSig_CastRealAsReal, tipb.ScalarFuncSig_CastStringAsReal, tipb.ScalarFuncSig_CastTimeAsReal, tipb.ScalarFuncSig_CastDecimalAsReal,
+			tipb.ScalarFuncSig_CastJsonAsReal /*, tipb.ScalarFuncSig_CastDurationAsReal*/ :
 			// TiFlash cast only support cast to Float64 or the source type is the same as the target type
 			return sourceType.GetType() == retType.GetType() || retType.GetType() == mysql.TypeDouble
 		case tipb.ScalarFuncSig_CastDecimalAsDecimal, tipb.ScalarFuncSig_CastIntAsDecimal, tipb.ScalarFuncSig_CastRealAsDecimal, tipb.ScalarFuncSig_CastTimeAsDecimal,
