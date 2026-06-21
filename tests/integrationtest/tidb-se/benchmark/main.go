@@ -25,11 +25,13 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"flag"
 	"fmt"
 	"math/rand"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +57,7 @@ var (
 	benchmarks = flag.String("bench", "all", "Comma-separated benchmarks: shard,in,filter,groupby,join,json,all")
 	iterations = flag.Int("iter", 5, "Iterations per benchmark query")
 	jsonSize   = flag.String("json-size", "small", "JSON document size: small (~200B), large (~2-5KB with 20+ paths)")
+	parallel   = flag.Int("parallel", 1, "Concurrent query streams per benchmark (1 = serial, >1 = parallel execution)")
 )
 
 type BenchResult struct {
@@ -116,8 +119,8 @@ func main() {
 	}
 
 	fmt.Printf("=== tidb-se Performance Benchmark ===\n")
-	fmt.Printf("Host: %s:%d | Rows: %d | JSON Rows: %d | Shards: %d | Mode: %s | Iter: %d | JSON Size: %s\n\n",
-		*host, *port, *rows, *jsonRows, *shards, *mode, *iterations, *jsonSize)
+	fmt.Printf("Host: %s:%d | Rows: %d | JSON Rows: %d | Shards: %d | Mode: %s | Iter: %d | JSON Size: %s | Parallel: %d\n\n",
+		*host, *port, *rows, *jsonRows, *shards, *mode, *iterations, *jsonSize, *parallel)
 
 	if *loadJSONOnly {
 		fmt.Println("[load-json-only] Loading only json_events (fact/dim tables unchanged)\n")
@@ -1955,6 +1958,9 @@ func benchHeadToHead() []H2HResult {
 }
 
 func runInternal(name, query string) BenchResult {
+	if *parallel > 1 {
+		return runInternalParallel(name, query)
+	}
 	mustExec("SET @@tidb_isolation_read_engines = 'tikv'")
 	tikvTime := timeQuery(query, *iterations)
 
@@ -1977,7 +1983,55 @@ func runInternal(name, query string) BenchResult {
 	}
 }
 
+func runInternalParallel(name, query string) BenchResult {
+	ctx := context.Background()
+
+	runStreams := func(setSQL []string) time.Duration {
+		var wg sync.WaitGroup
+		latencies := make([]time.Duration, *parallel)
+		for s := 0; s < *parallel; s++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				conn, err := db.Conn(ctx)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				for _, s := range setSQL {
+					conn.ExecContext(ctx, s)
+				}
+				latencies[idx] = timeQueryOnConn(conn, query, *iterations)
+			}(s)
+		}
+		wg.Wait()
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		return latencies[*parallel/2]
+	}
+
+	tikvTime := runStreams([]string{"SET @@tidb_isolation_read_engines = 'tikv'"})
+	tiflashTime := runStreams([]string{
+		"SET @@tidb_isolation_read_engines = 'tiflash'",
+		"SET @@tidb_allow_mpp = 1",
+	})
+
+	speedup := float64(tikvTime) / float64(tiflashTime)
+
+	fmt.Printf("  %-45s TiKV=%8s  TiFlash=%8s  %.2fx  [%d streams]\n",
+		name, fmtDur(tikvTime), fmtDur(tiflashTime), speedup, *parallel)
+
+	return BenchResult{
+		Name:      name,
+		Baseline:  tikvTime,
+		Optimized: tiflashTime,
+		Speedup:   speedup,
+	}
+}
+
 func runAB(name, query string) BenchResult {
+	if *parallel > 1 {
+		return runABParallel(name, query)
+	}
 	mustExec("SET @@tiflash_json_shredding = OFF")
 	blobTime := timeQuery(query, *iterations)
 
@@ -1988,6 +2042,48 @@ func runAB(name, query string) BenchResult {
 
 	fmt.Printf("  %-45s blob=%8s  shredded=%8s  %.2fx %s\n",
 		name, fmtDur(blobTime), fmtDur(shreddedTime), speedup, scaleNote(speedup))
+
+	return BenchResult{
+		Name:      name,
+		Baseline:  blobTime,
+		Optimized: shreddedTime,
+		Speedup:   speedup,
+	}
+}
+
+func runABParallel(name, query string) BenchResult {
+	ctx := context.Background()
+
+	runStreams := func(setSQL string) time.Duration {
+		var wg sync.WaitGroup
+		latencies := make([]time.Duration, *parallel)
+		for s := 0; s < *parallel; s++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				conn, err := db.Conn(ctx)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				conn.ExecContext(ctx, setSQL)
+				conn.ExecContext(ctx, "SET @@tidb_isolation_read_engines = 'tiflash'")
+				conn.ExecContext(ctx, "SET @@tidb_allow_mpp = 1")
+				latencies[idx] = timeQueryOnConn(conn, query, *iterations)
+			}(s)
+		}
+		wg.Wait()
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		return latencies[*parallel/2]
+	}
+
+	blobTime := runStreams("SET @@tiflash_json_shredding = OFF")
+	shreddedTime := runStreams("SET @@tiflash_json_shredding = ON")
+
+	speedup := float64(blobTime) / float64(shreddedTime)
+
+	fmt.Printf("  %-45s blob=%8s  shredded=%8s  %.2fx %s  [%d streams]\n",
+		name, fmtDur(blobTime), fmtDur(shreddedTime), speedup, scaleNote(speedup), *parallel)
 
 	return BenchResult{
 		Name:      name,
@@ -2046,6 +2142,13 @@ func printH2HSummary(results []H2HResult) {
 // ============================================================================
 
 func timeQuery(query string, iterations int) time.Duration {
+	if *parallel > 1 {
+		return timeQueryParallel(query, iterations, *parallel)
+	}
+	return timeQuerySerial(query, iterations)
+}
+
+func timeQuerySerial(query string, iterations int) time.Duration {
 	// Warmup
 	db.QueryRow(query).Scan()
 
@@ -2059,6 +2162,78 @@ func timeQuery(query string, iterations int) time.Duration {
 		}
 		for rows.Next() {
 			// drain
+		}
+		rows.Close()
+		total += time.Since(start)
+	}
+	return total / time.Duration(iterations)
+}
+
+// timeQueryParallel runs the same query on N concurrent connections.
+// Each stream does warmup + iterations. Returns the median latency
+// across all streams (p50). Prints p50/p95/max for visibility.
+func timeQueryParallel(query string, iterations int, streams int) time.Duration {
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	latencies := make([]time.Duration, streams)
+
+	for s := 0; s < streams; s++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "  WARN parallel conn: %v\n", err)
+				return
+			}
+			defer conn.Close()
+
+			// Warmup
+			conn.QueryContext(ctx, query)
+
+			var total time.Duration
+			for i := 0; i < iterations; i++ {
+				start := time.Now()
+				rows, err := conn.QueryContext(ctx, query)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "  WARN parallel query: %v\n", err)
+					return
+				}
+				for rows.Next() {
+				}
+				rows.Close()
+				total += time.Since(start)
+			}
+			latencies[idx] = total / time.Duration(iterations)
+		}(s)
+	}
+	wg.Wait()
+
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	p50 := latencies[streams/2]
+	p95 := latencies[int(float64(streams)*0.95)]
+	if streams > 1 {
+		fmt.Fprintf(os.Stderr, "    [%d streams] p50=%s p95=%s max=%s\n",
+			streams, fmtDur(p50), fmtDur(p95), fmtDur(latencies[streams-1]))
+	}
+	return p50
+}
+
+// timeQueryOnConn runs a query on a specific connection (for parallel
+// internal/AB mode where session variables must be pinned to a connection).
+func timeQueryOnConn(conn *sql.Conn, query string, iterations int) time.Duration {
+	ctx := context.Background()
+	conn.QueryContext(ctx, query) // warmup
+
+	var total time.Duration
+	for i := 0; i < iterations; i++ {
+		start := time.Now()
+		rows, err := conn.QueryContext(ctx, query)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  WARN query error: %v\n", err)
+			return 0
+		}
+		for rows.Next() {
 		}
 		rows.Close()
 		total += time.Since(start)
