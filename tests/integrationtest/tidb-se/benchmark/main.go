@@ -168,6 +168,9 @@ func main() {
 		if selected["subquery"] {
 			results = append(results, benchSubqueries()...)
 		}
+		if selected["partition"] {
+			results = append(results, benchPartitioning()...)
+		}
 
 		printSummary(results)
 	}
@@ -181,7 +184,7 @@ func setupSchema() {
 	fmt.Println("=== Setting up schema ===")
 
 	// Drop existing tables
-	for _, t := range []string{"fact_sharded", "fact_unsharded", "dim_region", "dim_industry", "json_events", "dim_event"} {
+	for _, t := range []string{"fact_sharded", "fact_unsharded", "fact_partitioned", "dim_region", "dim_industry", "json_events", "dim_event"} {
 		mustExec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t))
 	}
 
@@ -261,8 +264,11 @@ func setupSchema() {
 		is_conversion BOOLEAN NOT NULL
 	)`)
 
+	// LIST-partitioned fact table: 1 partition per tenant_id (1000 tenants)
+	createPartitioned()
+
 	// Set TiFlash replicas
-	for _, t := range []string{"fact_sharded", "fact_unsharded", "dim_region", "dim_industry", "json_events", "dim_event"} {
+	for _, t := range []string{"fact_sharded", "fact_unsharded", "fact_partitioned", "dim_region", "dim_industry", "json_events", "dim_event"} {
 		mustExec(fmt.Sprintf("ALTER TABLE %s SET TIFLASH REPLICA 1", t))
 	}
 
@@ -287,7 +293,7 @@ func loadData() {
 
 	// Analyze tables for accurate statistics
 	fmt.Print("  Analyzing tables...")
-	for _, t := range []string{"fact_sharded", "fact_unsharded", "dim_region", "dim_industry", "json_events", "dim_event"} {
+	for _, t := range []string{"fact_sharded", "fact_unsharded", "fact_partitioned", "dim_region", "dim_industry", "json_events", "dim_event"} {
 		mustExec(fmt.Sprintf("ANALYZE TABLE %s", t))
 	}
 	fmt.Println(" done")
@@ -341,6 +347,31 @@ func loadDimensions() {
 	fmt.Printf("  Loaded %d regions, %d industries, %d event types\n", 50, len(industries), len(eventDim))
 }
 
+func createPartitioned() {
+	const numPartitions = 1000
+	fmt.Printf("  Creating fact_partitioned (LIST, %d partitions)...\n", numPartitions)
+
+	ddl := `CREATE TABLE fact_partitioned (
+		id BIGINT NOT NULL,
+		tenant_id BIGINT NOT NULL,
+		region_id INT NOT NULL,
+		industry_id INT NOT NULL,
+		status VARCHAR(20) NOT NULL,
+		revenue BIGINT NOT NULL,
+		created_at DATETIME NOT NULL,
+		PRIMARY KEY (id, tenant_id)
+	) PARTITION BY LIST (tenant_id) (`
+
+	for i := 1; i <= numPartitions; i++ {
+		if i > 1 {
+			ddl += ","
+		}
+		ddl += fmt.Sprintf("PARTITION p%d VALUES IN (%d)", i, i)
+	}
+	ddl += ")"
+	mustExec(ddl)
+}
+
 func loadFactTables() {
 	batchSize := 5000
 	totalBatches := *rows / batchSize
@@ -348,7 +379,7 @@ func loadFactTables() {
 
 	statuses := []string{"active", "inactive", "pending", "archived", "deleted"}
 
-	fmt.Printf("  Loading %d rows into fact_sharded + fact_unsharded (%d workers, batch=%d)...\n",
+	fmt.Printf("  Loading %d rows into fact_sharded + fact_unsharded + fact_partitioned (%d workers, batch=%d)...\n",
 		*rows, *workers, batchSize)
 
 	start := time.Now()
@@ -365,12 +396,13 @@ func loadFactTables() {
 			}
 
 			for b := startBatch; b < endBatch; b++ {
-				var shardedVals, unshardedVals []string
+				var shardedVals, unshardedVals, partVals []string
 				baseID := int64(b) * int64(batchSize)
 
 				for i := 0; i < batchSize; i++ {
 					id := baseID + int64(i) + 1
 					tenantID := (id % 10000) + 1 // 10K tenants
+					partTenantID := (id % 1000) + 1  // 1K tenants for partitioned table
 					regionID := (id % 50) + 1
 					industryID := (id % 20) + 1
 					status := statuses[id%5]
@@ -382,12 +414,16 @@ func loadFactTables() {
 
 					row := fmt.Sprintf("(%d,%d,%d,%d,'%s',%d,'2024-01-01')",
 						id, tenantID, regionID, industryID, status, revenue)
+					partRow := fmt.Sprintf("(%d,%d,%d,%d,'%s',%d,'2024-01-01')",
+						id, partTenantID, regionID, industryID, status, revenue)
 					shardedVals = append(shardedVals, row)
 					unshardedVals = append(unshardedVals, row)
+					partVals = append(partVals, partRow)
 				}
 
 				insertBatch("fact_sharded", shardedVals)
 				insertBatch("fact_unsharded", unshardedVals)
+				insertBatch("fact_partitioned", partVals)
 
 				if b%100 == 0 && workerID == 0 {
 					pct := float64(b-startBatch) / float64(endBatch-startBatch) * 100
@@ -400,7 +436,7 @@ func loadFactTables() {
 	wg.Wait()
 	elapsed := time.Since(start)
 	rate := float64(*rows) / elapsed.Seconds()
-	fmt.Printf("\r  Loaded %d rows in %v (%.0f rows/s)                    \n", *rows*2, elapsed, rate*2)
+	fmt.Printf("\r  Loaded %d rows in %v (%.0f rows/s)                    \n", *rows*3, elapsed, rate*3)
 }
 
 func loadJSONEvents() {
@@ -1073,6 +1109,56 @@ func benchSubqueries() []BenchResult {
 		FROM fact_sharded f
 		GROUP BY f.status
 		HAVING SUM(f.revenue) > (SELECT AVG(revenue) * 1000 FROM fact_sharded)`))
+
+	return results
+}
+
+func benchPartitioning() []BenchResult {
+	fmt.Println("\n--- Benchmark: Partition Pruning (unpartitioned vs LIST-partitioned) ---")
+	var results []BenchResult
+
+	// Point query: single tenant_id
+	results = append(results, runInternal("Unpartitioned point tenant_id=42",
+		`SELECT COUNT(*), SUM(revenue) FROM fact_sharded WHERE tenant_id = 42`))
+
+	results = append(results, runInternal("LIST-partitioned point tenant_id=42",
+		`SELECT COUNT(*), SUM(revenue) FROM fact_partitioned WHERE tenant_id = 42`))
+
+	// IN query: 5 tenants
+	results = append(results, runInternal("Unpartitioned IN (5 tenants)",
+		`SELECT COUNT(*), SUM(revenue) FROM fact_sharded WHERE tenant_id IN (10, 20, 30, 40, 50)`))
+
+	results = append(results, runInternal("LIST-partitioned IN (5 tenants)",
+		`SELECT COUNT(*), SUM(revenue) FROM fact_partitioned WHERE tenant_id IN (10, 20, 30, 40, 50)`))
+
+	// Point query + aggregation
+	results = append(results, runInternal("Unpartitioned GROUP BY status (1 tenant)",
+		`SELECT status, COUNT(*), SUM(revenue) FROM fact_sharded WHERE tenant_id = 42 GROUP BY status`))
+
+	results = append(results, runInternal("LIST-partitioned GROUP BY status (1 tenant)",
+		`SELECT status, COUNT(*), SUM(revenue) FROM fact_partitioned WHERE tenant_id = 42 GROUP BY status`))
+
+	// Partition pruning + JOIN (1:many)
+	results = append(results, runInternal("Unpartitioned JOIN dim_region (1 tenant)",
+		`SELECT dr.country, COUNT(*), SUM(f.revenue)
+		FROM fact_sharded f
+		INNER JOIN dim_region dr ON f.region_id = dr.id
+		WHERE f.tenant_id = 42
+		GROUP BY dr.country`))
+
+	results = append(results, runInternal("LIST-partitioned JOIN dim_region (1 tenant)",
+		`SELECT dr.country, COUNT(*), SUM(f.revenue)
+		FROM fact_partitioned f
+		INNER JOIN dim_region dr ON f.region_id = dr.id
+		WHERE f.tenant_id = 42
+		GROUP BY dr.country`))
+
+	// Full scan (no pruning — shows overhead, if any, of partitioning)
+	results = append(results, runInternal("Unpartitioned full scan GROUP BY",
+		`SELECT status, COUNT(*), SUM(revenue) FROM fact_sharded GROUP BY status`))
+
+	results = append(results, runInternal("LIST-partitioned full scan GROUP BY",
+		`SELECT status, COUNT(*), SUM(revenue) FROM fact_partitioned GROUP BY status`))
 
 	return results
 }
@@ -1819,6 +1905,52 @@ func benchHeadToHead() []H2HResult {
 		GROUP BY f.status
 		HAVING SUM(f.revenue) > (SELECT AVG(revenue) * 1000 FROM fact_sharded)`))
 
+	// --- Category: Partition Pruning ---
+	fmt.Println("--- Partition Pruning ---")
+
+	// Partitioned vs unpartitioned: point query on tenant_id
+	results = append(results, runH2H("Partition", "Unpartitioned point tenant_id=42",
+		`SELECT COUNT(*), SUM(revenue) FROM fact_sharded WHERE tenant_id = 42`))
+
+	results = append(results, runH2H("Partition", "LIST-partitioned point tenant_id=42",
+		`SELECT COUNT(*), SUM(revenue) FROM fact_partitioned WHERE tenant_id = 42`))
+
+	// Range scan: tenant_id IN (...)
+	results = append(results, runH2H("Partition", "Unpartitioned IN (5 tenants)",
+		`SELECT COUNT(*), SUM(revenue) FROM fact_sharded WHERE tenant_id IN (10, 20, 30, 40, 50)`))
+
+	results = append(results, runH2H("Partition", "LIST-partitioned IN (5 tenants)",
+		`SELECT COUNT(*), SUM(revenue) FROM fact_partitioned WHERE tenant_id IN (10, 20, 30, 40, 50)`))
+
+	// Partition pruning + aggregation
+	results = append(results, runH2H("Partition", "Unpartitioned GROUP BY status (1 tenant)",
+		`SELECT status, COUNT(*), SUM(revenue) FROM fact_sharded WHERE tenant_id = 42 GROUP BY status`))
+
+	results = append(results, runH2H("Partition", "LIST-partitioned GROUP BY status (1 tenant)",
+		`SELECT status, COUNT(*), SUM(revenue) FROM fact_partitioned WHERE tenant_id = 42 GROUP BY status`))
+
+	// Partition pruning + JOIN (1:many — one tenant's partitioned rows joined to dim_region)
+	results = append(results, runH2H("Partition", "Unpartitioned JOIN dim_region (1 tenant)",
+		`SELECT dr.country, COUNT(*), SUM(f.revenue)
+		FROM fact_sharded f
+		INNER JOIN dim_region dr ON f.region_id = dr.id
+		WHERE f.tenant_id = 42
+		GROUP BY dr.country`))
+
+	results = append(results, runH2H("Partition", "LIST-partitioned JOIN dim_region (1 tenant)",
+		`SELECT dr.country, COUNT(*), SUM(f.revenue)
+		FROM fact_partitioned f
+		INNER JOIN dim_region dr ON f.region_id = dr.id
+		WHERE f.tenant_id = 42
+		GROUP BY dr.country`))
+
+	// Full scan comparison (no pruning benefit)
+	results = append(results, runH2H("Partition", "Unpartitioned full scan GROUP BY status",
+		`SELECT status, COUNT(*), SUM(revenue) FROM fact_sharded GROUP BY status`))
+
+	results = append(results, runH2H("Partition", "LIST-partitioned full scan GROUP BY status",
+		`SELECT status, COUNT(*), SUM(revenue) FROM fact_partitioned GROUP BY status`))
+
 	return results
 }
 
@@ -1999,7 +2131,7 @@ func waitForAllReplicas() {
 func parseBenchmarks(s string) map[string]bool {
 	m := make(map[string]bool)
 	if s == "all" {
-		for _, b := range []string{"shard", "in", "filter", "groupby", "join", "json", "subquery"} {
+		for _, b := range []string{"shard", "in", "filter", "groupby", "join", "json", "subquery", "partition"} {
 			m[b] = true
 		}
 		return m
