@@ -2939,18 +2939,18 @@ func (e *memtableRetriever) dataForShardSkew(ctx context.Context, sctx sessionct
 
 			for i, physID := range ski.ShardIDs {
 				record := types.MakeDatums(
-					schema.DBName.O,       // TABLE_SCHEMA
-					tbl.Name.O,            // TABLE_NAME
-					tbl.ID,                // TABLE_ID
-					shardKey,              // SHARD_KEY
-					int64(ski.ShardCnt),   // SHARD_COUNT
-					int64(i),              // SHARD_ID
-					physID,                // PHYSICAL_TABLE_ID
-					shardCounts[i],        // ROW_COUNT
-					minCnt,                // MIN_ROW_COUNT
-					maxCnt,                // MAX_ROW_COUNT
-					avgCnt,                // AVG_ROW_COUNT
-					skewRatio,             // SKEW_RATIO
+					schema.DBName.O,     // TABLE_SCHEMA
+					tbl.Name.O,          // TABLE_NAME
+					tbl.ID,              // TABLE_ID
+					shardKey,            // SHARD_KEY
+					int64(ski.ShardCnt), // SHARD_COUNT
+					int64(i),            // SHARD_ID
+					physID,              // PHYSICAL_TABLE_ID
+					shardCounts[i],      // ROW_COUNT
+					minCnt,              // MIN_ROW_COUNT
+					maxCnt,              // MAX_ROW_COUNT
+					avgCnt,              // AVG_ROW_COUNT
+					skewRatio,           // SKEW_RATIO
 				)
 				rows = append(rows, record)
 				e.recordMemoryConsume(record)

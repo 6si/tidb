@@ -1150,7 +1150,7 @@ func (s *PartitionProcessor) PruneShardKeyPartition(_ base.PlanContext, pi *mode
 
 	// Build a map from shard key column ID to its position in the shard key.
 	// The expression columns carry the ColInfo which has the table-level column ID.
-	shardColIDs := make(map[int64]int, len(ski.Columns))    // colID → position in ski.Columns
+	shardColIDs := make(map[int64]int, len(ski.Columns))         // colID → position in ski.Columns
 	shardColCollations := make(map[int]string, len(ski.Columns)) // shard position → collation
 	for i, colName := range ski.Columns {
 		for _, col := range tblInfo.Columns {
