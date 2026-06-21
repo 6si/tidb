@@ -137,7 +137,7 @@ type EncodedFilterHint struct {
 	FilterType string
 
 	// Values are the filter constant values (for eq/in predicates)
-	Values []interface{}
+	Values []any
 
 	// CanUseEncodedPath indicates the filter can run without decoding
 	CanUseEncodedPath bool
