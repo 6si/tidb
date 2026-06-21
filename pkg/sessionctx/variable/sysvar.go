@@ -237,8 +237,8 @@ var defaultSysVars = []*SysVar{
 		s.TiFlashDictEncodingMaxCardinality = TidbOptInt64(val, int64(vardef.DefTiFlashDictEncodingMaxCardinality))
 		return nil
 	}},
-	{Scope: vardef.ScopeGlobal | vardef.ScopeSession, Name: vardef.TiFlashJsonShredding, Type: vardef.TypeBool, Value: BoolToOnOff(vardef.DefTiFlashJsonShredding), SetSession: func(s *SessionVars, val string) error {
-		s.TiFlashJsonShredding = TiDBOptOn(val)
+	{Scope: vardef.ScopeGlobal | vardef.ScopeSession, Name: vardef.TiFlashJSONShredding, Type: vardef.TypeBool, Value: BoolToOnOff(vardef.DefTiFlashJSONShredding), SetSession: func(s *SessionVars, val string) error {
+		s.TiFlashJSONShredding = TiDBOptOn(val)
 		return nil
 	}},
 	{Scope: vardef.ScopeGlobal, Name: vardef.TiDBEnableTiFlashPipelineMode, Type: vardef.TypeBool, Value: BoolToOnOff(vardef.DefTiDBEnableTiFlashPipelineMode), SetGlobal: func(ctx context.Context, vars *SessionVars, s string) error {

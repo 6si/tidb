@@ -170,7 +170,7 @@ func newDefaultReorgDistSQLCtx(kvClient kv.Client, warnHandler contextutil.WarnA
 		TiFlashMaxQueryMemoryPerNode:         vardef.DefTiFlashMemQuotaQueryPerNode,
 		TiFlashQuerySpillRatio:               vardef.DefTiFlashQuerySpillRatio,
 		TiFlashHashJoinVersion:               vardef.DefTiFlashHashJoinVersion,
-		TiFlashJsonShredding:                 vardef.DefTiFlashJsonShredding,
+		TiFlashJSONShredding:                 vardef.DefTiFlashJSONShredding,
 		ResourceGroupName:                    resourcegroup.DefaultResourceGroupName,
 		ExecDetails:                          &execDetails,
 		RuntimeStatsColl:                     execdetails.NewRuntimeStatsColl(nil),

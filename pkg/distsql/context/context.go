@@ -62,7 +62,7 @@ type DistSQLContext struct {
 	TiFlashMaxQueryMemoryPerNode         int64
 	TiFlashQuerySpillRatio               float64
 	TiFlashHashJoinVersion               string
-	TiFlashJsonShredding                 bool
+	TiFlashJSONShredding                 bool
 
 	DistSQLConcurrency            int
 	ReplicaReadType               kv.ReplicaReadType
