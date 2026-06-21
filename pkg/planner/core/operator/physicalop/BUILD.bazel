@@ -138,7 +138,7 @@ go_test(
     ],
     embed = [":physicalop"],
     flaky = True,
-    shard_count = 9,
+    shard_count = 11,
     deps = [
         "//pkg/expression",
         "//pkg/parser/ast",

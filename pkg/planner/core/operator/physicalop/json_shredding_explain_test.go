@@ -144,3 +144,63 @@ func TestDedup(t *testing.T) {
 	require.Empty(t, dedup(nil))
 	require.Equal(t, []string{"a"}, dedup([]string{"a"}))
 }
+
+func TestHasEqualityOnColumns(t *testing.T) {
+	tenantCol := genTestColumn(mysql.TypeLonglong, 1)
+	tenantCol.OrigName = "tenant_id"
+
+	valConst := &expression.Constant{
+		Value:   types.NewDatum(42),
+		RetType: types.NewFieldType(mysql.TypeLonglong),
+	}
+
+	// eq(tenant_id, 42) — should match
+	eqFn, err := expression.NewFunction(mock.NewContext(), ast.EQ, types.NewFieldType(mysql.TypeLonglong), tenantCol, valConst)
+	require.NoError(t, err)
+
+	colNames := map[string]struct{}{"tenant_id": {}}
+	require.True(t, hasEqualityOnColumns([]expression.Expression{eqFn}, colNames))
+
+	// gt(tenant_id, 42) — should NOT match (not equality)
+	gtFn, err := expression.NewFunction(mock.NewContext(), ast.GT, types.NewFieldType(mysql.TypeLonglong), tenantCol, valConst)
+	require.NoError(t, err)
+	require.False(t, hasEqualityOnColumns([]expression.Expression{gtFn}, colNames))
+
+	// eq on a different column — should NOT match
+	otherCol := genTestColumn(mysql.TypeLonglong, 2)
+	otherCol.OrigName = "status"
+	eqOther, err := expression.NewFunction(mock.NewContext(), ast.EQ, types.NewFieldType(mysql.TypeLonglong), otherCol, valConst)
+	require.NoError(t, err)
+	require.False(t, hasEqualityOnColumns([]expression.Expression{eqOther}, colNames))
+}
+
+func TestCheckEqualityOnColumnNested(t *testing.T) {
+	tenantCol := genTestColumn(mysql.TypeLonglong, 1)
+	tenantCol.OrigName = "tenant_id"
+	statusCol := genTestColumn(mysql.TypeString, 2)
+	statusCol.OrigName = "status"
+
+	val42 := &expression.Constant{
+		Value:   types.NewDatum(42),
+		RetType: types.NewFieldType(mysql.TypeLonglong),
+	}
+	valActive := &expression.Constant{
+		Value:   types.NewStringDatum("active"),
+		RetType: types.NewFieldType(mysql.TypeString),
+	}
+
+	// AND(eq(tenant_id, 42), eq(status, 'active'))
+	eqTenant, err := expression.NewFunction(mock.NewContext(), ast.EQ, types.NewFieldType(mysql.TypeLonglong), tenantCol, val42)
+	require.NoError(t, err)
+	eqStatus, err := expression.NewFunction(mock.NewContext(), ast.EQ, types.NewFieldType(mysql.TypeLonglong), statusCol, valActive)
+	require.NoError(t, err)
+	andFn, err := expression.NewFunction(mock.NewContext(), ast.LogicAnd, types.NewFieldType(mysql.TypeLonglong), eqTenant, eqStatus)
+	require.NoError(t, err)
+
+	colNames := map[string]struct{}{"tenant_id": {}}
+	require.True(t, checkEqualityOnColumn(andFn, colNames))
+
+	// AND doesn't contain shard key
+	otherNames := map[string]struct{}{"region_id": {}}
+	require.False(t, checkEqualityOnColumn(andFn, otherNames))
+}

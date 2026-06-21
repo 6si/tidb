@@ -575,36 +575,139 @@ func (p *PhysicalTableScan) haveCorCol() bool {
 }
 
 // appendTiFlashSEAnnotations appends SE-specific annotations to the EXPLAIN
-// output for TiFlash table scans: JSON shredding paths and whether the table
-// has JSON columns that can benefit from sidecar sub-column reads.
+// output for TiFlash table scans: JSON shredding paths, dictionary encoding
+// eligibility, and shard key pruning information.
 func (p *PhysicalTableScan) appendTiFlashSEAnnotations(buffer *strings.Builder) {
 	vars := p.SCtx().GetSessionVars()
 
 	// JSON shredding annotation: show which JSON paths will use sidecar reads.
-	hasJSONCol := false
-	for _, col := range p.Columns {
-		if col.GetType() == mysql.TypeJSON {
-			hasJSONCol = true
-			break
+	if vars.TiFlashJSONShredding {
+		hasJSONCol := false
+		for _, col := range p.Columns {
+			if col.GetType() == mysql.TypeJSON {
+				hasJSONCol = true
+				break
+			}
+		}
+		if hasJSONCol {
+			paths := collectJSONExtractPaths(p.FilterCondition)
+			paths = append(paths, collectJSONExtractPaths(p.LateMaterializationFilterCondition)...)
+			paths = dedup(paths)
+			if len(paths) > 0 {
+				buffer.WriteString(", json_shredding:[")
+				buffer.WriteString(strings.Join(paths, ", "))
+				buffer.WriteString("]")
+			} else {
+				buffer.WriteString(", json_shredding:on")
+			}
 		}
 	}
-	if !hasJSONCol {
+
+	// Dictionary encoding annotation: list columns eligible for encoded operations.
+	if vars.TiFlashEncodedOperations {
+		p.appendDictEncodingAnnotation(buffer, vars.TiFlashDictEncodingMaxCardinality)
+	}
+
+	// Shard pruning annotation: show shard key info and pruning status.
+	if p.Table.ShardKeyInfo != nil {
+		p.appendShardPruningAnnotation(buffer)
+	}
+}
+
+// appendDictEncodingAnnotation identifies columns with low NDV that are
+// eligible for dictionary-encoded filter/group-by in TiFlash.
+func (p *PhysicalTableScan) appendDictEncodingAnnotation(buffer *strings.Builder, maxCard int64) {
+	stats := p.StatsInfo()
+	if stats == nil || stats.ColNDVs == nil {
 		return
 	}
 
-	if vars.TiFlashJSONShredding {
-		// Collect JSON paths from filter conditions and late-materialization filters.
-		paths := collectJSONExtractPaths(p.FilterCondition)
-		paths = append(paths, collectJSONExtractPaths(p.LateMaterializationFilterCondition)...)
-		paths = dedup(paths)
-		if len(paths) > 0 {
-			buffer.WriteString(", json_shredding:[")
-			buffer.WriteString(strings.Join(paths, ", "))
-			buffer.WriteString("]")
-		} else {
-			buffer.WriteString(", json_shredding:on")
+	schema := p.Schema()
+	if schema == nil {
+		return
+	}
+
+	var eligible []string
+	for _, col := range schema.Columns {
+		ndv, ok := stats.ColNDVs[col.UniqueID]
+		if !ok || ndv <= 0 {
+			continue
+		}
+		if int64(ndv) <= maxCard {
+			name := col.OrigName
+			if idx := strings.LastIndex(name, "."); idx >= 0 {
+				name = name[idx+1:]
+			}
+			eligible = append(eligible, fmt.Sprintf("%s(%d)", name, int64(ndv)))
 		}
 	}
+	if len(eligible) > 0 {
+		buffer.WriteString(", dict_encoded:[")
+		buffer.WriteString(strings.Join(eligible, ", "))
+		buffer.WriteString("]")
+	}
+}
+
+// appendShardPruningAnnotation shows shard key metadata and whether the
+// filter conditions allow shard pruning (equality on shard key column).
+func (p *PhysicalTableScan) appendShardPruningAnnotation(buffer *strings.Builder) {
+	ski := p.Table.ShardKeyInfo
+	buffer.WriteString(", shard_by:[")
+	buffer.WriteString(strings.Join(ski.Columns, ", "))
+	buffer.WriteString("]")
+	buffer.WriteString(fmt.Sprintf(" shards:%d", ski.ShardCnt))
+
+	// Check if filter conditions contain equality on the shard key column(s),
+	// which would allow TiFlash to prune to a single shard.
+	allConds := make([]expression.Expression, 0, len(p.FilterCondition)+len(p.AccessCondition))
+	allConds = append(allConds, p.FilterCondition...)
+	allConds = append(allConds, p.AccessCondition...)
+
+	shardColSet := make(map[string]struct{}, len(ski.Columns))
+	for _, c := range ski.Columns {
+		shardColSet[strings.ToLower(c)] = struct{}{}
+	}
+
+	pruned := hasEqualityOnColumns(allConds, shardColSet)
+	if pruned {
+		buffer.WriteString(fmt.Sprintf(" pruned:1/%d", ski.ShardCnt))
+	}
+}
+
+// hasEqualityOnColumns checks whether any expression in the list contains
+// an equality predicate (EQ) on a column whose name is in the target set.
+func hasEqualityOnColumns(exprs []expression.Expression, colNames map[string]struct{}) bool {
+	for _, expr := range exprs {
+		if checkEqualityOnColumn(expr, colNames) {
+			return true
+		}
+	}
+	return false
+}
+
+func checkEqualityOnColumn(expr expression.Expression, colNames map[string]struct{}) bool {
+	sf, ok := expr.(*expression.ScalarFunction)
+	if !ok {
+		return false
+	}
+	if sf.FuncName.L == ast.EQ {
+		for _, arg := range sf.GetArgs() {
+			if col, ok := arg.(*expression.Column); ok {
+				if _, found := colNames[strings.ToLower(col.OrigName)]; found {
+					return true
+				}
+			}
+		}
+	}
+	// Recurse into AND conditions.
+	if sf.FuncName.L == ast.LogicAnd {
+		for _, arg := range sf.GetArgs() {
+			if checkEqualityOnColumn(arg, colNames) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // collectJSONExtractPaths walks an expression tree and returns JSON paths
