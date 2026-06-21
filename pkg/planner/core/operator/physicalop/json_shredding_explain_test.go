@@ -172,6 +172,13 @@ func TestHasEqualityOnColumns(t *testing.T) {
 	eqOther, err := expression.NewFunction(mock.NewContext(), ast.EQ, types.NewFieldType(mysql.TypeLonglong), otherCol, valConst)
 	require.NoError(t, err)
 	require.False(t, hasEqualityOnColumns([]expression.Expression{eqOther}, colNames))
+
+	// eq with fully qualified OrigName (e.g. "test.table.tenant_id") — should match
+	fqCol := genTestColumn(mysql.TypeLonglong, 3)
+	fqCol.OrigName = "test.sharded_t.tenant_id"
+	eqFQ, err := expression.NewFunction(mock.NewContext(), ast.EQ, types.NewFieldType(mysql.TypeLonglong), fqCol, valConst)
+	require.NoError(t, err)
+	require.True(t, hasEqualityOnColumns([]expression.Expression{eqFQ}, colNames))
 }
 
 func TestCheckEqualityOnColumnNested(t *testing.T) {

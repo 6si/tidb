@@ -151,6 +151,10 @@ type PhysicalTableScan struct {
 
 	GroupedRanges  [][]*ranger.Range `plan-cache-clone:"shallow"`
 	GroupByColIdxs []int             `plan-cache-clone:"shallow"`
+
+	// ShardKeyPruned is set when a parent Selection contains an equality
+	// predicate on the shard key column(s), indicating shard pruning is possible.
+	ShardKeyPruned bool
 }
 
 const emptyPhysicalTableScanSize = int64(unsafe.Sizeof(PhysicalTableScan{}))
@@ -650,6 +654,8 @@ func (p *PhysicalTableScan) appendDictEncodingAnnotation(buffer *strings.Builder
 
 // appendShardPruningAnnotation shows shard key metadata and whether the
 // filter conditions allow shard pruning (equality on shard key column).
+// ShardKeyPruned is set by markShardKeyPruned during plan building when
+// the parent Selection's conditions contain equality on the shard key.
 func (p *PhysicalTableScan) appendShardPruningAnnotation(buffer *strings.Builder) {
 	ski := p.Table.ShardKeyInfo
 	buffer.WriteString(", shard_by:[")
@@ -657,8 +663,12 @@ func (p *PhysicalTableScan) appendShardPruningAnnotation(buffer *strings.Builder
 	buffer.WriteString("]")
 	buffer.WriteString(fmt.Sprintf(" shards:%d", ski.ShardCnt))
 
-	// Check if filter conditions contain equality on the shard key column(s),
-	// which would allow TiFlash to prune to a single shard.
+	if p.ShardKeyPruned {
+		buffer.WriteString(fmt.Sprintf(" pruned:1/%d", ski.ShardCnt))
+		return
+	}
+
+	// Fallback: check scan-local conditions (AccessCondition, FilterCondition).
 	allConds := make([]expression.Expression, 0, len(p.FilterCondition)+len(p.AccessCondition))
 	allConds = append(allConds, p.FilterCondition...)
 	allConds = append(allConds, p.AccessCondition...)
@@ -668,9 +678,25 @@ func (p *PhysicalTableScan) appendShardPruningAnnotation(buffer *strings.Builder
 		shardColSet[strings.ToLower(c)] = struct{}{}
 	}
 
-	pruned := hasEqualityOnColumns(allConds, shardColSet)
-	if pruned {
+	if hasEqualityOnColumns(allConds, shardColSet) {
 		buffer.WriteString(fmt.Sprintf(" pruned:1/%d", ski.ShardCnt))
+	}
+}
+
+// MarkShardKeyPrunedFromSelection checks if the given conditions (typically
+// from a parent Selection) contain equality on the shard key column(s) and
+// sets the ShardKeyPruned flag on this scan if so.
+func (p *PhysicalTableScan) MarkShardKeyPrunedFromSelection(conditions []expression.Expression) {
+	ski := p.Table.ShardKeyInfo
+	if ski == nil || len(conditions) == 0 {
+		return
+	}
+	shardColSet := make(map[string]struct{}, len(ski.Columns))
+	for _, c := range ski.Columns {
+		shardColSet[strings.ToLower(c)] = struct{}{}
+	}
+	if hasEqualityOnColumns(conditions, shardColSet) {
+		p.ShardKeyPruned = true
 	}
 }
 
@@ -693,7 +719,13 @@ func checkEqualityOnColumn(expr expression.Expression, colNames map[string]struc
 	if sf.FuncName.L == ast.EQ {
 		for _, arg := range sf.GetArgs() {
 			if col, ok := arg.(*expression.Column); ok {
-				if _, found := colNames[strings.ToLower(col.OrigName)]; found {
+				name := strings.ToLower(col.OrigName)
+				// OrigName may be fully qualified (e.g. "test.table.col");
+				// extract just the column part for matching.
+				if idx := strings.LastIndex(name, "."); idx >= 0 {
+					name = name[idx+1:]
+				}
+				if _, found := colNames[name]; found {
 					return true
 				}
 			}
@@ -804,6 +836,7 @@ func (p *PhysicalTableScan) BuildPushedDownSelection(stats *property.StatsInfo, 
 				conditions = append(conditions, cond)
 			}
 		}
+		p.MarkShardKeyPrunedFromSelection(conditions)
 		if len(conditions) == 0 {
 			return nil
 		}
@@ -1001,6 +1034,7 @@ func BuildIndexMergeTableScan(ds *logicalop.DataSource, tableFilters []expressio
 				logutil.BgLogger().Debug("calculate selectivity failed, use selection factor", zap.Error(err))
 				selectivity = cost.SelectionFactor
 			}
+			ts.MarkShardKeyPrunedFromSelection(pushedFilters)
 			sel := PhysicalSelection{Conditions: pushedFilters}.Init(ts.SCtx(), ts.StatsInfo().ScaleByExpectCnt(ts.SCtx().GetSessionVars(), selectivity*totalRowCount), ts.QueryBlockOffset())
 			sel.SetChildren(ts)
 			currentTopPlan = sel

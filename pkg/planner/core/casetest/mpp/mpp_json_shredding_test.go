@@ -198,7 +198,23 @@ func TestShardPruningExplainAnnotation(t *testing.T) {
 		require.True(t, foundShardBy,
 			"shard_by annotation should appear for tables with ShardKeyInfo")
 
-		// Case 2: No ShardKeyInfo — no shard annotation
+		// Case 2: Equality on shard key — should show pruned:1/16
+		tbl.Meta().ShardKeyInfo = &model.ShardKeyInfo{
+			Columns:  []string{"tenant_id"},
+			ShardCnt: 16,
+		}
+		rows = tk.MustQuery("explain select count(*) from sharded_t where tenant_id = 42").Rows()
+		foundPruned := false
+		for _, row := range rows {
+			operatorInfo := row[len(row)-1].(string)
+			if strings.Contains(operatorInfo, "shard_by:[tenant_id]") && strings.Contains(operatorInfo, "pruned:1/16") {
+				foundPruned = true
+			}
+		}
+		require.True(t, foundPruned,
+			"pruned:1/16 should appear when WHERE has equality on shard key")
+
+		// Case 3: No ShardKeyInfo — no shard annotation
 		tbl.Meta().ShardKeyInfo = nil
 		rows = tk.MustQuery("explain select count(*) from sharded_t").Rows()
 		for _, row := range rows {
