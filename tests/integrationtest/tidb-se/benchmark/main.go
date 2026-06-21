@@ -58,6 +58,7 @@ var (
 	iterations   = flag.Int("iter", 5, "Iterations per benchmark query")
 	jsonSize     = flag.String("json-size", "small", "JSON document size: small (~200B), large (~2-5KB with 20+ paths)")
 	parallel     = flag.Int("parallel", 1, "Concurrent query streams per benchmark (1 = serial, >1 = parallel execution)")
+	coldCache    = flag.Bool("cold-cache", false, "Cold-cache mode: skip warmup, single iteration per query. Caller must drop OS page cache externally before each invocation.")
 )
 
 type BenchResult struct {
@@ -119,8 +120,12 @@ func main() {
 	}
 
 	fmt.Printf("=== tidb-se Performance Benchmark ===\n")
-	fmt.Printf("Host: %s:%d | Rows: %d | JSON Rows: %d | Shards: %d | Mode: %s | Iter: %d | JSON Size: %s | Parallel: %d\n\n",
-		*host, *port, *rows, *jsonRows, *shards, *mode, *iterations, *jsonSize, *parallel)
+	cacheMode := "warm"
+	if *coldCache {
+		cacheMode = "COLD"
+	}
+	fmt.Printf("Host: %s:%d | Rows: %d | JSON Rows: %d | Shards: %d | Mode: %s | Iter: %d | JSON Size: %s | Parallel: %d | Cache: %s\n\n",
+		*host, *port, *rows, *jsonRows, *shards, *mode, *iterations, *jsonSize, *parallel, cacheMode)
 
 	if *loadJSONOnly {
 		fmt.Println("[load-json-only] Loading only json_events (fact/dim tables unchanged)\n")
@@ -2112,10 +2117,14 @@ func printH2HSummary(results []H2HResult) {
 	}
 
 	fmt.Println("\n")
+	cacheLabel := "warm"
+	if *coldCache {
+		cacheLabel = "COLD"
+	}
 	fmt.Println("==============================================================================")
 	fmt.Printf("  HEAD-TO-HEAD RESULTS — %s (%s:%d)\n", clusterType, *host, *port)
-	fmt.Printf("  Rows: %dM | JSON Rows: %dM | JSON Size: %s | Iter: %d\n",
-		*rows/1_000_000, *jsonRows/1_000_000, *jsonSize, *iterations)
+	fmt.Printf("  Rows: %dM | JSON Rows: %dM | JSON Size: %s | Iter: %d | Cache: %s\n",
+		*rows/1_000_000, *jsonRows/1_000_000, *jsonSize, *iterations, cacheLabel)
 	fmt.Println("==============================================================================")
 
 	lastCategory := ""
@@ -2142,6 +2151,9 @@ func printH2HSummary(results []H2HResult) {
 // ============================================================================
 
 func timeQuery(query string, iterations int) time.Duration {
+	if *coldCache {
+		return timeQueryColdCache(query, iterations)
+	}
 	if *parallel > 1 {
 		return timeQueryParallel(query, iterations, *parallel)
 	}
@@ -2165,6 +2177,32 @@ func timeQuerySerial(query string, iterations int) time.Duration {
 		}
 		rows.Close()
 		total += time.Since(start)
+	}
+	return total / time.Duration(iterations)
+}
+
+// timeQueryColdCache runs the query with no warmup. The caller is
+// responsible for dropping OS page cache on storage nodes before
+// invoking the benchmark (e.g. via kubectl exec on each pod:
+// "sudo sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'").
+// This measures true cold-read I/O performance.
+func timeQueryColdCache(query string, iterations int) time.Duration {
+	var total time.Duration
+	for i := 0; i < iterations; i++ {
+		start := time.Now()
+		rows, err := db.Query(query)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  WARN query error: %v\n", err)
+			return 0
+		}
+		for rows.Next() {
+		}
+		rows.Close()
+		elapsed := time.Since(start)
+		total += elapsed
+		if iterations > 1 {
+			fmt.Fprintf(os.Stderr, "    [cold iter %d/%d] %s\n", i+1, iterations, fmtDur(elapsed))
+		}
 	}
 	return total / time.Duration(iterations)
 }
