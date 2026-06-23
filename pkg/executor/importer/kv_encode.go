@@ -43,6 +43,49 @@ type TableKVEncoder struct {
 	insertColumnRowCache []types.Datum
 	rowCache             []types.Datum
 	hasValueCache        []bool
+
+	// allowedPhysicalIDs restricts which partitions/shards rows may be routed to,
+	// set when IMPORT INTO ... PARTITION(...) targets a subset of partitions.
+	// nil means no restriction (whole-table import). When set, a row whose
+	// computed partition/shard is not in this set is rejected, preventing
+	// physical SST ingest into a partition that was not verified empty.
+	allowedPhysicalIDs map[int64]struct{}
+	// partitionedTable is the encoder's table viewed as a PartitionedTable,
+	// cached to resolve a row's target partition for allowedPhysicalIDs checks.
+	partitionedTable table.PartitionedTable
+}
+
+// SetAllowedPartitions restricts the encoder to only emit rows that route to one
+// of the given physical partition/shard IDs. Rows routing elsewhere are rejected.
+func (en *TableKVEncoder) SetAllowedPartitions(ids map[int64]struct{}) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	pt, ok := en.GetTable().(table.PartitionedTable)
+	if !ok {
+		return errors.New("IMPORT INTO PARTITION requires a partitioned or SHARD BY table")
+	}
+	en.allowedPhysicalIDs = ids
+	en.partitionedTable = pt
+	return nil
+}
+
+// checkRowPartition verifies that record routes to an allowed partition/shard.
+func (en *TableKVEncoder) checkRowPartition(record []types.Datum) error {
+	if en.allowedPhysicalIDs == nil {
+		return nil
+	}
+	evalCtx := en.SessionCtx.GetExprCtx().GetEvalCtx()
+	phys, err := en.partitionedTable.GetPartitionByRow(evalCtx, record)
+	if err != nil {
+		return err
+	}
+	if _, ok := en.allowedPhysicalIDs[phys.GetPhysicalID()]; !ok {
+		return errors.Errorf(
+			"a row was routed to a partition/shard outside the IMPORT INTO PARTITION target set; "+
+				"input data must only contain rows belonging to the targeted partition(s)")
+	}
+	return nil
 }
 
 type simpleColAssignExprCreator interface {
@@ -99,6 +142,9 @@ func (en *TableKVEncoder) Encode(row []types.Datum, rowID int64) (*kv.Pairs, err
 	defer en.TruncateWarns()
 	record, err := en.parserData2TableData(row, rowID)
 	if err != nil {
+		return nil, err
+	}
+	if err := en.checkRowPartition(record); err != nil {
 		return nil, err
 	}
 

@@ -17,6 +17,7 @@ package importer
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/docker/go-units"
 	"github.com/pingcap/errors"
@@ -24,6 +25,7 @@ import (
 	tidb "github.com/pingcap/tidb/pkg/config"
 	"github.com/pingcap/tidb/pkg/config/deploymode"
 	"github.com/pingcap/tidb/pkg/lightning/common"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/objstore"
 	"github.com/pingcap/tidb/pkg/objstore/storeapi"
 	"github.com/pingcap/tidb/pkg/parser/terror"
@@ -118,6 +120,9 @@ func (e *LoadDataController) checkStarterMaxImportDataSize() error {
 }
 
 func (e *LoadDataController) checkTableEmpty(ctx context.Context, conn sqlexec.SQLExecutor) error {
+	if len(e.TargetPartitions) > 0 {
+		return e.checkPartitionsEmpty(ctx, conn)
+	}
 	sql := common.SprintfWithIdentifiers("SELECT 1 FROM %s.%s USE INDEX() LIMIT 1", e.DBName, e.Table.Meta().Name.L)
 	rs, err := conn.ExecuteInternal(ctx, sql)
 	if err != nil {
@@ -130,6 +135,73 @@ func (e *LoadDataController) checkTableEmpty(ctx context.Context, conn sqlexec.S
 	}
 	if len(rows) > 0 {
 		return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs("target table is not empty")
+	}
+	return nil
+}
+
+// checkPartitionsEmpty checks that only the targeted partitions/shards are empty,
+// allowing IMPORT INTO on a table whose other partitions contain data.
+func (e *LoadDataController) checkPartitionsEmpty(ctx context.Context, conn sqlexec.SQLExecutor) error {
+	tblInfo := e.Table.Meta()
+	// Validate the table is partitioned or sharded.
+	if tblInfo.GetPartitionInfo() == nil && tblInfo.ShardKeyInfo == nil {
+		return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs(
+			"PARTITION clause requires a partitioned or SHARD BY table")
+	}
+	// Safety guard: reject if the table has unique secondary indexes. Unique
+	// indexes span all partitions, so even if the target partition range is
+	// empty, SST ingest could produce duplicate unique-index keys that
+	// collide with rows in other partitions.
+	if err := e.rejectExtraUniqueIndexes(tblInfo); err != nil {
+		return err
+	}
+	// Build: SELECT 1 FROM db.tbl PARTITION(p1, p2, ...) USE INDEX() LIMIT 1
+	var partList strings.Builder
+	for i, p := range e.TargetPartitions {
+		if i > 0 {
+			partList.WriteString(", ")
+		}
+		partList.WriteString(common.EscapeIdentifier(p.L))
+	}
+	sql := fmt.Sprintf("SELECT 1 FROM %s.%s PARTITION(%s) USE INDEX() LIMIT 1",
+		common.EscapeIdentifier(e.DBName),
+		common.EscapeIdentifier(tblInfo.Name.L),
+		partList.String())
+	rs, err := conn.ExecuteInternal(ctx, sql)
+	if err != nil {
+		return errors.Annotatef(err, "checking target partitions empty")
+	}
+	defer terror.Call(rs.Close)
+	rows, err := sqlexec.DrainRecordSet(ctx, rs, 1)
+	if err != nil {
+		return err
+	}
+	if len(rows) > 0 {
+		return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs(
+			"target partition(s) are not empty")
+	}
+	return nil
+}
+
+// rejectExtraUniqueIndexes returns an error if the table has any unique
+// secondary index. Unique indexes span all partitions, so partition-scoped
+// IMPORT INTO cannot guarantee no collisions on those indexes without an
+// expensive cross-partition duplicate-detect pass (Option B territory).
+// The clustered PK is safe because its key range is partition-scoped.
+func (*LoadDataController) rejectExtraUniqueIndexes(tblInfo *model.TableInfo) error {
+	for _, idx := range tblInfo.Indices {
+		if idx.State != model.StatePublic {
+			continue
+		}
+		if idx.Primary {
+			continue
+		}
+		if idx.Unique {
+			return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs(
+				fmt.Sprintf("partition-scoped IMPORT INTO does not support tables "+
+					"with unique secondary indexes (found index %q); use whole-table "+
+					"IMPORT INTO or the double-ingestion pattern instead", idx.Name.O))
+		}
 	}
 	return nil
 }

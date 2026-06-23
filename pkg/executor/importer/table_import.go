@@ -47,8 +47,10 @@ import (
 	"github.com/pingcap/tidb/pkg/lightning/mydump"
 	verify "github.com/pingcap/tidb/pkg/lightning/verification"
 	"github.com/pingcap/tidb/pkg/meta/autoid"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	tidbmetrics "github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/objstore/compressedio"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/sessiontxn"
@@ -397,7 +399,43 @@ func (e *LoadDataController) getKVEncoder(logger *zap.Logger, chunk *Chunk, encT
 		Table:  encTable,
 		Logger: log.Logger{Logger: logger.With(zap.String("path", chunk.Path))},
 	}
-	return NewTableKVEncoder(cfg, e)
+	encoder, err := NewTableKVEncoder(cfg, e)
+	if err != nil {
+		return nil, err
+	}
+	if len(e.TargetPartitions) > 0 {
+		ids, err := resolveTargetPhysicalIDs(encTable.Meta(), e.TargetPartitions)
+		if err != nil {
+			return nil, err
+		}
+		if err := encoder.SetAllowedPartitions(ids); err != nil {
+			return nil, err
+		}
+	}
+	return encoder, nil
+}
+
+// resolveTargetPhysicalIDs maps the IMPORT INTO PARTITION(...) names to physical
+// partition/shard IDs using the table's (synthetic, for SHARD BY) partition
+// definitions. It errors if any named partition does not exist.
+func resolveTargetPhysicalIDs(tblInfo *model.TableInfo, names []ast.CIStr) (map[int64]struct{}, error) {
+	pi := tblInfo.GetPartitionInfo()
+	if pi == nil {
+		return nil, errors.Errorf("table %q is not partitioned or sharded", tblInfo.Name.O)
+	}
+	byName := make(map[string]int64, len(pi.Definitions))
+	for _, def := range pi.Definitions {
+		byName[def.Name.L] = def.ID
+	}
+	ids := make(map[int64]struct{}, len(names))
+	for _, n := range names {
+		id, ok := byName[n.L]
+		if !ok {
+			return nil, errors.Errorf("unknown partition %q in table %q", n.O, tblInfo.Name.O)
+		}
+		ids[id] = struct{}{}
+	}
+	return ids, nil
 }
 
 // GetKVEncoderForDupResolve get the KV encoder for duplicate resolution.

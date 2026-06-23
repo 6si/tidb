@@ -335,6 +335,12 @@ type Plan struct {
 	ManualRecovery bool
 	// the keyspace name when submitting this job, only for import-into
 	Keyspace string
+
+	// TargetPartitions is the list of partition/shard names specified in the
+	// IMPORT INTO ... PARTITION(p1, p2) clause. When non-empty, only these
+	// partitions are required to be empty (range-scoped precheck), allowing
+	// import into specific partitions/shards of an otherwise populated table.
+	TargetPartitions []ast.CIStr `json:",omitempty"`
 }
 
 // GetOnDupKeyMode returns the conflict handling mode.
@@ -552,6 +558,9 @@ func NewImportPlan(ctx context.Context, userSctx sessionctx.Context, plan *plann
 		DataSourceType:         getDataSourceType(plan),
 		User:                   userSctx.GetSessionVars().User.String(),
 		Keyspace:               userSctx.GetStore().GetKeyspace(),
+	}
+	if len(plan.Table.PartitionNames) > 0 {
+		p.TargetPartitions = plan.Table.PartitionNames
 	}
 	if err := p.initOptions(ctx, userSctx, plan.Options); err != nil {
 		return nil, err
