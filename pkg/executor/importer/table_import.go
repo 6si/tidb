@@ -16,6 +16,7 @@ package importer
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -416,16 +417,26 @@ func (e *LoadDataController) getKVEncoder(logger *zap.Logger, chunk *Chunk, encT
 }
 
 // resolveTargetPhysicalIDs maps the IMPORT INTO PARTITION(...) names to physical
-// partition/shard IDs using the table's (synthetic, for SHARD BY) partition
-// definitions. It errors if any named partition does not exist.
+// partition/shard IDs. It errors if any named partition does not exist.
+//
+// It supports two table shapes:
+//   - Regular partitioned tables: names match PartitionInfo.Definitions[].Name.
+//   - SHARD BY tables: the synthetic shard PartitionInfo is in-memory only and is
+//     absent from the serialized TableInfo carried in the import plan, so shards
+//     are resolved from ShardKeyInfo.ShardIDs with the canonical names
+//     "shard_<i>" (matching the InfoSchema builder in tables.go).
 func resolveTargetPhysicalIDs(tblInfo *model.TableInfo, names []ast.CIStr) (map[int64]struct{}, error) {
-	pi := tblInfo.GetPartitionInfo()
-	if pi == nil {
+	byName := make(map[string]int64)
+	if pi := tblInfo.GetPartitionInfo(); pi != nil {
+		for _, def := range pi.Definitions {
+			byName[def.Name.L] = def.ID
+		}
+	} else if ski := tblInfo.ShardKeyInfo; ski != nil && len(ski.ShardIDs) > 0 {
+		for i, physID := range ski.ShardIDs {
+			byName[fmt.Sprintf("shard_%d", i)] = physID
+		}
+	} else {
 		return nil, errors.Errorf("table %q is not partitioned or sharded", tblInfo.Name.O)
-	}
-	byName := make(map[string]int64, len(pi.Definitions))
-	for _, def := range pi.Definitions {
-		byName[def.Name.L] = def.ID
 	}
 	ids := make(map[int64]struct{}, len(names))
 	for _, n := range names {

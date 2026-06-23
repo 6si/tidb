@@ -410,7 +410,10 @@ func (sch *importScheduler) OnNextSubtasksBatch(
 	logger.Info("on next subtasks batch")
 
 	// Check table emptiness again after the task is started.
-	if kerneltype.IsClassic() && task.Step == proto.StepInit {
+	// When TargetPartitions is set (partition-scoped IMPORT INTO), skip the
+	// table-wide check — the frontend already validated that the target
+	// partitions/shards are empty in checkPartitionsEmpty.
+	if kerneltype.IsClassic() && task.Step == proto.StepInit && len(taskMeta.Plan.TargetPartitions) == 0 {
 		if err = sch.checkImportTableEmpty(ctx, taskMeta); err != nil {
 			return nil, errors.Trace(err)
 		}

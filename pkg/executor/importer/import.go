@@ -730,6 +730,12 @@ func (p *Plan) initDefaultOptions(ctx context.Context, targetNodeCPUCnt int, sto
 		threadCnt = 2
 	}
 	p.Checksum = config.OpLevelRequired
+	// Partition-scoped imports cannot use the table-wide checksum (the remote
+	// checksum covers all partitions, but the local checksum covers only the
+	// imported data). Auto-disable until per-partition checksum is implemented.
+	if len(p.TargetPartitions) > 0 {
+		p.Checksum = config.OpLevelOff
+	}
 	p.ThreadCnt = threadCnt
 	p.MaxWriteSpeed = unlimitedWriteSpeed
 	p.SplitFile = false

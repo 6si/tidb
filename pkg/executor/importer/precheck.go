@@ -17,13 +17,13 @@ package importer
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/docker/go-units"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/br/pkg/streamhelper"
 	tidb "github.com/pingcap/tidb/pkg/config"
 	"github.com/pingcap/tidb/pkg/config/deploymode"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/lightning/common"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/objstore"
@@ -31,6 +31,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/terror"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/store"
+	"github.com/pingcap/tidb/pkg/tablecodec"
 	"github.com/pingcap/tidb/pkg/util/cdcutil"
 	"github.com/pingcap/tidb/pkg/util/dbterror/exeerrors"
 	"github.com/pingcap/tidb/pkg/util/intest"
@@ -77,7 +78,7 @@ func (e *LoadDataController) checkRequirements(ctx context.Context, se sessionct
 			}
 		}
 	}
-	if err := e.checkTableEmpty(ctx, conn); err != nil {
+	if err := e.checkTableEmpty(ctx, se, conn); err != nil {
 		return err
 	}
 	if !e.DisablePrecheck {
@@ -119,9 +120,9 @@ func (e *LoadDataController) checkStarterMaxImportDataSize() error {
 	))
 }
 
-func (e *LoadDataController) checkTableEmpty(ctx context.Context, conn sqlexec.SQLExecutor) error {
+func (e *LoadDataController) checkTableEmpty(ctx context.Context, se sessionctx.Context, conn sqlexec.SQLExecutor) error {
 	if len(e.TargetPartitions) > 0 {
-		return e.checkPartitionsEmpty(ctx, conn)
+		return e.checkPartitionsEmpty(se)
 	}
 	sql := common.SprintfWithIdentifiers("SELECT 1 FROM %s.%s USE INDEX() LIMIT 1", e.DBName, e.Table.Meta().Name.L)
 	rs, err := conn.ExecuteInternal(ctx, sql)
@@ -141,7 +142,14 @@ func (e *LoadDataController) checkTableEmpty(ctx context.Context, conn sqlexec.S
 
 // checkPartitionsEmpty checks that only the targeted partitions/shards are empty,
 // allowing IMPORT INTO on a table whose other partitions contain data.
-func (e *LoadDataController) checkPartitionsEmpty(ctx context.Context, conn sqlexec.SQLExecutor) error {
+//
+// Emptiness is checked at the KV layer by scanning each target physical
+// partition/shard key range for a single key, rather than via a SQL
+// SELECT ... PARTITION(...) probe. SHARD BY tables expose their shards as
+// a synthetic PartitionInfo that is not addressable by the SQL PARTITION()
+// clause, so a key-range scan is the only mechanism that works for both
+// regular partitioned tables and SHARD BY tables.
+func (e *LoadDataController) checkPartitionsEmpty(se sessionctx.Context) error {
 	tblInfo := e.Table.Meta()
 	// Validate the table is partitioned or sharded.
 	if tblInfo.GetPartitionInfo() == nil && tblInfo.ShardKeyInfo == nil {
@@ -155,32 +163,34 @@ func (e *LoadDataController) checkPartitionsEmpty(ctx context.Context, conn sqle
 	if err := e.rejectExtraUniqueIndexes(tblInfo); err != nil {
 		return err
 	}
-	// Build: SELECT 1 FROM db.tbl PARTITION(p1, p2, ...) USE INDEX() LIMIT 1
-	var partList strings.Builder
-	for i, p := range e.TargetPartitions {
-		if i > 0 {
-			partList.WriteString(", ")
+	ids, err := resolveTargetPhysicalIDs(tblInfo, e.TargetPartitions)
+	if err != nil {
+		return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs(err.Error())
+	}
+	snap := se.GetStore().GetSnapshot(kv.MaxVersion)
+	for physID := range ids {
+		empty, err := physicalTableEmpty(snap, physID)
+		if err != nil {
+			return errors.Annotatef(err, "checking target partition/shard %d empty", physID)
 		}
-		partList.WriteString(common.EscapeIdentifier(p.L))
-	}
-	sql := fmt.Sprintf("SELECT 1 FROM %s.%s PARTITION(%s) USE INDEX() LIMIT 1",
-		common.EscapeIdentifier(e.DBName),
-		common.EscapeIdentifier(tblInfo.Name.L),
-		partList.String())
-	rs, err := conn.ExecuteInternal(ctx, sql)
-	if err != nil {
-		return errors.Annotatef(err, "checking target partitions empty")
-	}
-	defer terror.Call(rs.Close)
-	rows, err := sqlexec.DrainRecordSet(ctx, rs, 1)
-	if err != nil {
-		return err
-	}
-	if len(rows) > 0 {
-		return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs(
-			"target partition(s) are not empty")
+		if !empty {
+			return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs(
+				"target partition(s)/shard(s) are not empty")
+		}
 	}
 	return nil
+}
+
+// physicalTableEmpty reports whether the physical table/partition/shard with the
+// given ID has no keys (neither records nor local index entries) in the snapshot.
+func physicalTableEmpty(snap kv.Snapshot, physID int64) (bool, error) {
+	start := tablecodec.GenTablePrefix(physID)
+	iter, err := snap.Iter(start, start.PrefixNext())
+	if err != nil {
+		return false, err
+	}
+	defer iter.Close()
+	return !iter.Valid(), nil
 }
 
 // rejectExtraUniqueIndexes returns an error if the table has any unique
