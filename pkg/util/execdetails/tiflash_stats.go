@@ -260,6 +260,8 @@ func (context *TiFlashScanContext) String() string {
 		remoteStreamInfo = fmt.Sprintf("min_remote_stream:%dms, max_remote_stream:%dms, ", context.minRemoteStreamMs, context.maxRemoteStreamMs)
 	}
 
+	output = append(output, "dict_encoding:auto")
+
 	// note: "tot" is short for "total"
 	output = append(output, fmt.Sprintf("tiflash_scan:{"+
 		"mvcc_input_rows:%d, "+
