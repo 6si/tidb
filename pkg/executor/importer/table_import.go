@@ -589,7 +589,16 @@ func (ti *TableImporter) ImportAndCleanup(ctx context.Context, closedEngine *bac
 	importErr := closedEngine.Import(ctx, ti.regionSplitSize, ti.regionSplitKeys)
 	failpoint.InjectCall("mockDataEngineImportErr", &importErr)
 	if common.ErrFoundDuplicateKeys.Equal(importErr) {
-		importErr = ingestctrl.ConvertToErrFoundConflictRecords(importErr, ti.encTable)
+		if ti.OnDupKey == OnDupKeyModeReplace {
+			// In replace mode, duplicate keys are expected when importing
+			// into non-empty tables. The newly imported data has a later
+			// commit timestamp and shadows the old data via MVCC.
+			ti.logger.Info("duplicate keys detected during import (replace mode), continuing",
+				zap.String("engine", closedEngine.GetUUID().String()))
+			importErr = nil
+		} else {
+			importErr = ingestctrl.ConvertToErrFoundConflictRecords(importErr, ti.encTable)
+		}
 	}
 	if closedEngine.GetID() != common.IndexEngineID {
 		// todo: change to a finer-grain progress later.
@@ -775,9 +784,16 @@ func (ti *TableImporter) ImportSelectedRows(ctx context.Context, se sessionctx.C
 	})
 	if err = closedDataEngine.Import(ctx, ti.regionSplitSize, ti.regionSplitKeys); err != nil {
 		if common.ErrFoundDuplicateKeys.Equal(err) {
-			err = ingestctrl.ConvertToErrFoundConflictRecords(err, ti.encTable)
+			if ti.OnDupKey == OnDupKeyModeReplace {
+				ti.logger.Info("duplicate keys detected during import (replace mode), continuing")
+				err = nil
+			} else {
+				err = ingestctrl.ConvertToErrFoundConflictRecords(err, ti.encTable)
+			}
 		}
-		return 0, err
+		if err != nil {
+			return 0, err
+		}
 	}
 	dataKVCount := ti.backend.GetImportedKVCount(closedDataEngine.GetUUID())
 
@@ -787,9 +803,16 @@ func (ti *TableImporter) ImportSelectedRows(ctx context.Context, se sessionctx.C
 	}
 	if err = closedIndexEngine.Import(ctx, ti.regionSplitSize, ti.regionSplitKeys); err != nil {
 		if common.ErrFoundDuplicateKeys.Equal(err) {
-			err = ingestctrl.ConvertToErrFoundConflictRecords(err, ti.encTable)
+			if ti.OnDupKey == OnDupKeyModeReplace {
+				ti.logger.Info("duplicate keys detected during index import (replace mode), continuing")
+				err = nil
+			} else {
+				err = ingestctrl.ConvertToErrFoundConflictRecords(err, ti.encTable)
+			}
 		}
-		return 0, err
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	allocators := ti.Allocators()

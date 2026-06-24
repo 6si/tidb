@@ -220,6 +220,11 @@ const (
 	OnDupKeyModeCapture OnDupKeyMode = "capture"
 	// OnDupKeyModeError means fail on first conflict.
 	OnDupKeyModeError OnDupKeyMode = "error"
+	// OnDupKeyModeReplace resolves conflicts by keeping the newly imported
+	// row and deleting the pre-existing conflicting row(s). Works with
+	// both local sort and global sort, and allows importing into non-empty
+	// tables.
+	OnDupKeyModeReplace OnDupKeyMode = "replace"
 )
 
 // DataSourceType indicates the data source type of IMPORT INTO.
@@ -928,7 +933,7 @@ func (p *Plan) initOptions(ctx context.Context, seCtx sessionctx.Context, option
 		}
 		mode := OnDupKeyMode(strings.ToLower(v))
 		switch mode {
-		case OnDupKeyModeCapture, OnDupKeyModeError:
+		case OnDupKeyModeCapture, OnDupKeyModeError, OnDupKeyModeReplace:
 			p.OnDupKey = mode
 		default:
 			return exeerrors.ErrInvalidOptionVal.FastGenByArgs(opt.Name)
@@ -992,7 +997,9 @@ func (p *Plan) initOptions(ctx context.Context, seCtx sessionctx.Context, option
 	}
 
 	if _, ok := specifiedOptions[onDupKeyOption]; ok && p.IsLocalSort() {
-		return exeerrors.ErrLoadDataUnsupportedOption.FastGenByArgs(onDupKeyOption, "local sort")
+		if p.OnDupKey != OnDupKeyModeReplace {
+			return exeerrors.ErrLoadDataUnsupportedOption.FastGenByArgs(onDupKeyOption+"="+string(p.OnDupKey), "local sort (only 'replace' is supported)")
+		}
 	}
 
 	if kerneltype.IsClassic() {
@@ -1015,6 +1022,12 @@ func (p *Plan) initOptions(ctx context.Context, seCtx sessionctx.Context, option
 
 	if p.SplitFile && len(p.LinesTerminatedBy) == 0 {
 		return exeerrors.ErrInvalidOptionVal.FastGenByArgs("lines_terminated_by, should not be empty when use split_file")
+	}
+
+	// When on_duplicate_key=replace, disable checksum since existing data
+	// in the table makes table-wide checksum comparison meaningless.
+	if p.OnDupKey == OnDupKeyModeReplace {
+		p.Checksum = config.OpLevelOff
 	}
 
 	p.adjustOptions(targetNodeCPUCnt)
@@ -1966,7 +1979,7 @@ func (e *LoadDataController) getLocalBackendCfg(keyspace, pdAddr, dataDir string
 		MemTableSize:                config.DefaultEngineMemCacheSize,
 		LocalWriterMemCacheSize:     int64(config.DefaultLocalWriterMemCacheSize),
 		ShouldCheckTiKV:             true,
-		DupeDetectEnabled:           false,
+		DupeDetectEnabled:           e.OnDupKey == OnDupKeyModeReplace,
 		DuplicateDetectOpt:          common.DupDetectOpt{ReportErrOnDup: false},
 		TiKVWorkerURL:               tidb.GetGlobalConfig().TiKVWorkerURL,
 		StoreWriteBWLimit:           int(e.MaxWriteSpeed),

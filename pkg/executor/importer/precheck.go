@@ -24,6 +24,7 @@ import (
 	tidb "github.com/pingcap/tidb/pkg/config"
 	"github.com/pingcap/tidb/pkg/config/deploymode"
 	"github.com/pingcap/tidb/pkg/lightning/common"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/objstore"
 	"github.com/pingcap/tidb/pkg/objstore/storeapi"
 	"github.com/pingcap/tidb/pkg/parser/terror"
@@ -75,8 +76,15 @@ func (e *LoadDataController) checkRequirements(ctx context.Context, se sessionct
 			}
 		}
 	}
-	if err := e.checkTableEmpty(ctx, conn); err != nil {
-		return err
+	if e.OnDupKey != OnDupKeyModeReplace {
+		if err := e.checkTableEmpty(ctx, conn); err != nil {
+			return err
+		}
+	}
+	if e.OnDupKey == OnDupKeyModeReplace && e.IsLocalSort() {
+		if err := e.checkReplaceLocalSortRequirements(); err != nil {
+			return err
+		}
 	}
 	if !e.DisablePrecheck {
 		if err := e.checkCDCPiTRTasks(ctx, se); err != nil {
@@ -85,6 +93,27 @@ func (e *LoadDataController) checkRequirements(ctx context.Context, se sessionct
 	}
 	if e.IsGlobalSort() {
 		return e.checkGlobalSortStorePrivilege(ctx)
+	}
+	return nil
+}
+
+// checkReplaceLocalSortRequirements validates that local sort + replace mode
+// is safe for the target table. Tables with secondary indexes are rejected
+// because MVCC shadowing alone cannot clean up orphaned index entries from
+// the old row versions; global sort (which has a full conflict resolution
+// pipeline) should be used instead.
+func (e *LoadDataController) checkReplaceLocalSortRequirements() error {
+	tblInfo := e.Table.Meta()
+	for _, idx := range tblInfo.Indices {
+		if idx.Primary {
+			continue
+		}
+		if idx.State != model.StatePublic {
+			continue
+		}
+		return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs(
+			"on_duplicate_key='replace' with local sort does not support tables with secondary indexes; " +
+				"use global sort (cloud_storage_uri option) or remove secondary indexes before import")
 	}
 	return nil
 }
