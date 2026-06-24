@@ -21,11 +21,13 @@ import (
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/expression/aggregation"
 	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/planner/core/base"
 	"github.com/pingcap/tidb/pkg/planner/core/operator/physicalop"
 	"github.com/pingcap/tidb/pkg/planner/util"
 	"github.com/pingcap/tidb/pkg/planner/util/coreusage"
+	"github.com/pingcap/tidb/pkg/types"
 )
 
 // InjectExtraProjection is used to extract the expressions of specific
@@ -119,10 +121,16 @@ func injectProjBelowUnion(un *physicalop.PhysicalUnionAll) *physicalop.PhysicalU
 func InjectProjBelowAgg(aggPlan base.PhysicalPlan, aggFuncs []*aggregation.AggFuncDesc, groupByItems []expression.Expression) base.PhysicalPlan {
 	hasScalarFunc := false
 	exprCtx := aggPlan.SCtx().GetExprCtx()
+	ectx := exprCtx.GetEvalCtx()
 	coreusage.WrapCastForAggFuncs(exprCtx, aggFuncs)
 	for i := 0; !hasScalarFunc && i < len(aggFuncs); i++ {
 		for _, arg := range aggFuncs[i].Args {
-			_, isScalarFunc := arg.(*expression.ScalarFunction)
+			sf, isScalarFunc := arg.(*expression.ScalarFunction)
+			// Skip SUM(CAST(Int AS Decimal)): TiFlash handles this natively
+			// with Int128 accumulation, bypassing the expensive per-row cast.
+			if isScalarFunc && isSumCastIntAsDecimal(aggFuncs[i], sf, ectx) {
+				continue
+			}
 			hasScalarFunc = hasScalarFunc || isScalarFunc
 		}
 		for _, byItem := range aggFuncs[i].OrderByItems {
@@ -142,10 +150,33 @@ func InjectProjBelowAgg(aggPlan base.PhysicalPlan, aggFuncs []*aggregation.AggFu
 	projExprs := make([]expression.Expression, 0, cap(projSchemaCols))
 	cursor := 0
 
-	ectx := exprCtx.GetEvalCtx()
 	for _, f := range aggFuncs {
 		for i, arg := range f.Args {
 			if _, isCnst := arg.(*expression.Constant); isCnst {
+				continue
+			}
+			// Keep SUM(CAST(Int AS Decimal)) inline: pass its inner arg
+			// through the Projection so TiFlash sees the nested pattern.
+			if sf, ok := arg.(*expression.ScalarFunction); ok && isSumCastIntAsDecimal(f, sf, ectx) {
+				innerArg := sf.GetArgs()[0]
+				if _, isCnst := innerArg.(*expression.Constant); !isCnst {
+					idx := slices.IndexFunc(projExprs, func(a expression.Expression) bool {
+						return a.Equal(ectx, innerArg)
+					})
+					if idx < 0 {
+						projExprs = append(projExprs, innerArg)
+						newCol := &expression.Column{
+							UniqueID: aggPlan.SCtx().GetSessionVars().AllocPlanColumnID(),
+							RetType:  innerArg.GetType(ectx),
+							Index:    cursor,
+						}
+						projSchemaCols = append(projSchemaCols, newCol)
+						sf.GetArgs()[0] = newCol
+						cursor++
+					} else {
+						sf.GetArgs()[0] = projSchemaCols[idx]
+					}
+				}
 				continue
 			}
 			projExprs = append(projExprs, arg)
@@ -215,6 +246,24 @@ func InjectProjBelowAgg(aggPlan base.PhysicalPlan, aggFuncs []*aggregation.AggFu
 
 	aggPlan.SetChildren(proj)
 	return aggPlan
+}
+
+// isSumCastIntAsDecimal returns true when f is SUM and sf is CAST(Int → Decimal).
+// TiFlash handles SUM(CAST(Int64 AS Decimal)) natively with an Int128
+// accumulator + AVX2 SIMD, so we keep the CAST nested inside SUM instead of
+// extracting it into a separate Projection.
+func isSumCastIntAsDecimal(f *aggregation.AggFuncDesc, sf *expression.ScalarFunction, ectx expression.EvalContext) bool {
+	if f.Name != ast.AggFuncSum {
+		return false
+	}
+	if sf.FuncName.L != ast.Cast {
+		return false
+	}
+	args := sf.GetArgs()
+	if len(args) != 1 {
+		return false
+	}
+	return args[0].GetType(ectx).EvalType() == types.ETInt
 }
 
 // InjectProjBelowSort extracts the ScalarFunctions of `orderByItems` into a
