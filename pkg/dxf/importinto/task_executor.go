@@ -584,10 +584,14 @@ func (m *mergeSortStepExecutor) ResetSummary() {
 }
 
 func getOnDupForConflictedKV(onDupKeyMode importer.OnDupKeyMode) engineapi.OnDuplicateKey {
-	if onDupKeyMode == importer.OnDupKeyModeCapture {
+	switch onDupKeyMode {
+	case importer.OnDupKeyModeCapture:
 		return engineapi.OnDuplicateKeyRecord
+	case importer.OnDupKeyModeReplace:
+		return engineapi.OnDuplicateKeyRecord
+	default:
+		return engineapi.OnDuplicateKeyError
 	}
-	return engineapi.OnDuplicateKeyError
 }
 
 func normalizeSubtaskErr(err error) error {

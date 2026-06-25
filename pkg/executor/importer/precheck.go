@@ -75,8 +75,10 @@ func (e *LoadDataController) checkRequirements(ctx context.Context, se sessionct
 			}
 		}
 	}
-	if err := e.checkTableEmpty(ctx, conn); err != nil {
-		return err
+	if e.Plan.OnDupKey != OnDupKeyModeReplace {
+		if err := e.checkTableEmpty(ctx, conn); err != nil {
+			return err
+		}
 	}
 	if !e.DisablePrecheck {
 		if err := e.checkCDCPiTRTasks(ctx, se); err != nil {

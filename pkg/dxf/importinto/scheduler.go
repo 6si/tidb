@@ -410,7 +410,8 @@ func (sch *importScheduler) OnNextSubtasksBatch(
 	logger.Info("on next subtasks batch")
 
 	// Check table emptiness again after the task is started.
-	if kerneltype.IsClassic() && task.Step == proto.StepInit {
+	// Skip check in replace mode since non-empty tables are allowed.
+	if kerneltype.IsClassic() && task.Step == proto.StepInit && taskMeta.Plan.OnDupKey != importer.OnDupKeyModeReplace {
 		if err = sch.checkImportTableEmpty(ctx, taskMeta); err != nil {
 			return nil, errors.Trace(err)
 		}

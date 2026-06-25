@@ -220,6 +220,10 @@ const (
 	OnDupKeyModeCapture OnDupKeyMode = "capture"
 	// OnDupKeyModeError means fail on first conflict.
 	OnDupKeyModeError OnDupKeyMode = "error"
+	// OnDupKeyModeReplace resolves duplicates by replacing old rows with new
+	// ones. Within-batch duplicates are detected via DupDetectKeyAdapter and
+	// cross-batch conflicts are resolved via MVCC timestamp ordering.
+	OnDupKeyModeReplace OnDupKeyMode = "replace"
 )
 
 // DataSourceType indicates the data source type of IMPORT INTO.
@@ -928,7 +932,7 @@ func (p *Plan) initOptions(ctx context.Context, seCtx sessionctx.Context, option
 		}
 		mode := OnDupKeyMode(strings.ToLower(v))
 		switch mode {
-		case OnDupKeyModeCapture, OnDupKeyModeError:
+		case OnDupKeyModeCapture, OnDupKeyModeError, OnDupKeyModeReplace:
 			p.OnDupKey = mode
 		default:
 			return exeerrors.ErrInvalidOptionVal.FastGenByArgs(opt.Name)
@@ -991,8 +995,14 @@ func (p *Plan) initOptions(ctx context.Context, seCtx sessionctx.Context, option
 		p.ManualRecovery = true
 	}
 
-	if _, ok := specifiedOptions[onDupKeyOption]; ok && p.IsLocalSort() {
+	if _, ok := specifiedOptions[onDupKeyOption]; ok && p.IsLocalSort() && p.OnDupKey != OnDupKeyModeReplace {
 		return exeerrors.ErrLoadDataUnsupportedOption.FastGenByArgs(onDupKeyOption, "local sort")
+	}
+	if p.OnDupKey == OnDupKeyModeReplace && p.IsLocalSort() && GetNumOfIndexGenKV(p.TableInfo) > 0 {
+		return exeerrors.ErrLoadDataUnsupportedOption.FastGenByArgs("on_duplicate_key='replace' with secondary indexes", "local sort")
+	}
+	if p.OnDupKey == OnDupKeyModeReplace {
+		p.Checksum = config.OpLevelOff
 	}
 
 	if kerneltype.IsClassic() {
@@ -1966,8 +1976,8 @@ func (e *LoadDataController) getLocalBackendCfg(keyspace, pdAddr, dataDir string
 		MemTableSize:                config.DefaultEngineMemCacheSize,
 		LocalWriterMemCacheSize:     int64(config.DefaultLocalWriterMemCacheSize),
 		ShouldCheckTiKV:             true,
-		DupeDetectEnabled:           false,
-		DuplicateDetectOpt:          common.DupDetectOpt{ReportErrOnDup: false},
+		DupeDetectEnabled:           e.Plan.OnDupKey == OnDupKeyModeReplace,
+		DuplicateDetectOpt:          common.DupDetectOpt{ReportErrOnDup: e.Plan.OnDupKey == OnDupKeyModeReplace},
 		TiKVWorkerURL:               tidb.GetGlobalConfig().TiKVWorkerURL,
 		StoreWriteBWLimit:           int(e.MaxWriteSpeed),
 		MaxOpenFiles:                int(tidbutil.GenRLimit("table_import")),

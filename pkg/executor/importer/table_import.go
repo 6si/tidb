@@ -589,7 +589,12 @@ func (ti *TableImporter) ImportAndCleanup(ctx context.Context, closedEngine *bac
 	importErr := closedEngine.Import(ctx, ti.regionSplitSize, ti.regionSplitKeys)
 	failpoint.InjectCall("mockDataEngineImportErr", &importErr)
 	if common.ErrFoundDuplicateKeys.Equal(importErr) {
-		importErr = ingestctrl.ConvertToErrFoundConflictRecords(importErr, ti.encTable)
+		if ti.Plan.OnDupKey == OnDupKeyModeReplace {
+			ti.logger.Info("duplicate keys found during import, resolved via replace mode")
+			importErr = nil
+		} else {
+			importErr = ingestctrl.ConvertToErrFoundConflictRecords(importErr, ti.encTable)
+		}
 	}
 	if closedEngine.GetID() != common.IndexEngineID {
 		// todo: change to a finer-grain progress later.

@@ -112,6 +112,8 @@ go_test(
         "job_test.go",
         "kv_encode_test.go",
         "main_test.go",
+        "on_duplicate_replace_precheck_test.go",
+        "on_duplicate_replace_test.go",
         "precheck_test.go",
         "sampler_test.go",
         "table_import_test.go",

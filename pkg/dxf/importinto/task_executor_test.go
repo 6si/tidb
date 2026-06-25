@@ -155,6 +155,17 @@ func TestGetOnDupForKVGroup(t *testing.T) {
 		require.Error(t, err)
 		require.Equal(t, engineapi.OnDuplicateKeyIgnore, onDup)
 	})
+
+	t.Run("data-kv-group-replace", func(t *testing.T) {
+		onDup, err := getOnDupForKVGroup(nil, globalsort.DataKVGroup, importer.OnDupKeyModeReplace)
+		require.NoError(t, err)
+		require.Equal(t, engineapi.OnDuplicateKeyRecord, onDup)
+	})
+	t.Run("unique-index-replace", func(t *testing.T) {
+		onDup, err := getOnDupForKVGroup(indicesGenKV, globalsort.IndexID2KVGroup(1), importer.OnDupKeyModeReplace)
+		require.NoError(t, err)
+		require.Equal(t, engineapi.OnDuplicateKeyRecord, onDup)
+	})
 }
 
 func TestNormalizeSubtaskErr(t *testing.T) {
