@@ -122,6 +122,14 @@ func (p *postProcessStepExecutor) postProcess(ctx context.Context, subtaskMeta *
 		return err
 	}
 
+	// Repair orphaned secondary index entries left by replace-mode import.
+	// Must run before checksum verification since it modifies index data.
+	if removed, repairErr := repairTableIndexes(ctx, p.store, plan, logger); repairErr != nil {
+		return repairErr
+	} else if removed > 0 {
+		callLog.Info("index repair removed orphaned entries", zap.Int64("count", removed))
+	}
+
 	localChecksum := verify.NewKVGroupChecksumForAdd()
 	for id, cksum := range subtaskMeta.Checksum {
 		callLog.Info(
