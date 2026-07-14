@@ -39,6 +39,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/session"
 	"github.com/pingcap/tidb/pkg/testkit"
+	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/promutil"
 	"github.com/pingcap/tidb/pkg/util/syncutil"
 	"github.com/prometheus/client_golang/prometheus"
@@ -53,6 +54,57 @@ func getCSVParser(ctx context.Context, t *testing.T, fileName string) mydump.Par
 		file, importer.LoadDataReadBlockSize, nil, false, nil)
 	require.NoError(t, err)
 	return csvParser
+}
+
+func TestTableKVEncoderAllowedPartitions(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec(`CREATE TABLE test.p (
+			id BIGINT NOT NULL,
+			company_id BIGINT NOT NULL,
+			PRIMARY KEY (id, company_id)
+		) SHARD BY (company_id) SHARDS 4
+		PARTITION BY RANGE (id) (
+			PARTITION p0 VALUES LESS THAN (10),
+			PARTITION p1 VALUES LESS THAN (MAXVALUE)
+		)`)
+	do, err := session.GetDomain(store)
+	require.NoError(t, err)
+	tbl, err := do.InfoSchema().TableByName(context.Background(), model.NewCIStr("test"), model.NewCIStr("p"))
+	require.NoError(t, err)
+
+	fieldMappings := []*importer.FieldMapping{
+		{Column: tbl.VisibleCols()[0]},
+		{Column: tbl.VisibleCols()[1]},
+	}
+	mode, err := mysql.GetSQLMode(mysql.DefaultSQLMode)
+	require.NoError(t, err)
+	encoder, err := importer.NewTableKVEncoder(
+		&encode.EncodingConfig{
+			SessionOptions: encode.SessionOptions{SQLMode: mode},
+			Table:          tbl,
+			Logger:         log.L(),
+		},
+		&importer.TableImporter{
+			LoadDataController: &importer.LoadDataController{
+				ASTArgs:       &importer.ASTArgs{},
+				InsertColumns: tbl.VisibleCols(),
+				FieldMappings: fieldMappings,
+			},
+		},
+	)
+	require.NoError(t, err)
+	allowed := make(map[int64]struct{})
+	for _, id := range tbl.Meta().Partition.Definitions[1].ShardIDs {
+		allowed[id] = struct{}{}
+	}
+	require.Len(t, allowed, 4)
+	require.NoError(t, encoder.SetAllowedPartitions(allowed))
+
+	_, err = encoder.Encode([]types.Datum{types.NewIntDatum(5), types.NewIntDatum(100)}, 1)
+	require.ErrorContains(t, err, "outside the IMPORT INTO PARTITION target set")
+	_, err = encoder.Encode([]types.Datum{types.NewIntDatum(15), types.NewIntDatum(100)}, 2)
+	require.NoError(t, err)
 }
 
 func TestFileChunkProcess(t *testing.T) {

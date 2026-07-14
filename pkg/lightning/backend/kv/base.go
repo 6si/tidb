@@ -224,6 +224,11 @@ func (e *BaseKVEncoder) TableMeta() *model.TableInfo {
 	return e.table.Meta()
 }
 
+// GetTable returns the table encoded by this encoder.
+func (e *BaseKVEncoder) GetTable() table.Table {
+	return e.table
+}
+
 // ProcessColDatum processes the datum of a column.
 func (e *BaseKVEncoder) ProcessColDatum(col *table.Column, rowID int64, inputDatum *types.Datum) (types.Datum, error) {
 	value, err := e.getActualDatum(col, rowID, inputDatum)

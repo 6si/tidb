@@ -66,6 +66,87 @@ func createMockETCD(t *testing.T) (string, *embed.Etcd) {
 	return clientAddr, embedEtcd
 }
 
+func TestCheckPartitionsEmpty(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	ctx := util.WithInternalSourceType(context.Background(), kv.InternalImportInto)
+	conn := tk.Session().GetSQLExecutor()
+
+	controller := func(tableName string, targets ...string) *importer.LoadDataController {
+		is := tk.Session().GetDomainInfoSchema().(infoschema.InfoSchema)
+		tableObj, err := is.TableByName(ctx, model.NewCIStr("test"), model.NewCIStr(tableName))
+		require.NoError(t, err)
+		names := make([]model.CIStr, 0, len(targets))
+		for _, target := range targets {
+			names = append(names, model.NewCIStr(target))
+		}
+		return &importer.LoadDataController{
+			Plan: &importer.Plan{
+				DBName:           "test",
+				DataSourceType:   importer.DataSourceTypeQuery,
+				TableInfo:        tableObj.Meta(),
+				TargetPartitions: names,
+				DisablePrecheck:  true,
+			},
+			Table: tableObj,
+		}
+	}
+
+	tk.MustExec(`CREATE TABLE pt (
+		id BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		ts DATE NOT NULL,
+		PRIMARY KEY (id, company_id, ts)
+	) SHARD BY (company_id) SHARDS 4
+	PARTITION BY RANGE COLUMNS (ts) (
+		PARTITION p0 VALUES LESS THAN ('2025-01-01'),
+		PARTITION p1 VALUES LESS THAN ('2026-01-01')
+	)`)
+	tk.MustExec("INSERT INTO pt VALUES (1, 10, '2024-01-01')")
+
+	is := tk.Session().GetDomainInfoSchema().(infoschema.InfoSchema)
+	pt, err := is.TableByName(ctx, model.NewCIStr("test"), model.NewCIStr("pt"))
+	require.NoError(t, err)
+	require.Len(t, pt.Meta().Partition.Definitions[0].ShardIDs, 4)
+	require.Len(t, pt.Meta().Partition.Definitions[1].ShardIDs, 4)
+
+	require.NoError(t, controller("pt", "p1").CheckRequirements(ctx, tk.Session(), conn))
+	err = controller("pt", "p0").CheckRequirements(ctx, tk.Session(), conn)
+	require.ErrorContains(t, err, "target partition(s)/shard(s) are not empty")
+	err = controller("pt", "missing").CheckRequirements(ctx, tk.Session(), conn)
+	require.ErrorContains(t, err, "unknown partition")
+
+	tk.MustExec(`CREATE TABLE shard_only (
+		id BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		PRIMARY KEY (id, company_id)
+	) SHARD BY (company_id) SHARDS 4`)
+	is = tk.Session().GetDomainInfoSchema().(infoschema.InfoSchema)
+	shardOnly, err := is.TableByName(ctx, model.NewCIStr("test"), model.NewCIStr("shard_only"))
+	require.NoError(t, err)
+	require.Len(t, shardOnly.Meta().ShardKeyInfo.ShardIDs, 4)
+	require.NoError(t, controller("shard_only", "shard_0").CheckRequirements(ctx, tk.Session(), conn))
+
+	tk.MustExec("CREATE TABLE plain (id BIGINT PRIMARY KEY)")
+	err = controller("plain", "p0").CheckRequirements(ctx, tk.Session(), conn)
+	require.ErrorContains(t, err, "requires a partitioned or SHARD BY table")
+
+	tk.MustExec(`CREATE TABLE unique_idx (
+		id BIGINT NOT NULL,
+		company_id BIGINT NOT NULL,
+		ts DATE NOT NULL,
+		PRIMARY KEY (id, company_id, ts),
+		UNIQUE KEY uk_company_ts (company_id, ts)
+	) SHARD BY (company_id) SHARDS 4
+	PARTITION BY RANGE COLUMNS (ts) (
+		PARTITION p0 VALUES LESS THAN ('2025-01-01'),
+		PARTITION p1 VALUES LESS THAN ('2026-01-01')
+	)`)
+	err = controller("unique_idx", "p1").CheckRequirements(ctx, tk.Session(), conn)
+	require.ErrorContains(t, err, "does not support unique secondary index")
+}
+
 func TestCheckRequirements(t *testing.T) {
 	store := testkit.CreateMockStore(t)
 	tk := testkit.NewTestKit(t, store)
@@ -93,21 +174,21 @@ func TestCheckRequirements(t *testing.T) {
 	// there is active job on the target table already
 	jobID, err := importer.CreateJob(ctx, conn, "test", "t", tableObj.Meta().ID, "root", &importer.ImportParameters{}, 0)
 	require.NoError(t, err)
-	err = c.CheckRequirements(ctx, conn)
+	err = c.CheckRequirements(ctx, tk.Session(), conn)
 	require.ErrorIs(t, err, exeerrors.ErrLoadDataPreCheckFailed)
 	require.ErrorContains(t, err, "there is active job on the target table already")
 	// cancel the job
 	require.NoError(t, importer.CancelJob(ctx, conn, jobID))
 
 	// source data file size = 0
-	require.ErrorIs(t, c.CheckRequirements(ctx, conn), exeerrors.ErrLoadDataPreCheckFailed)
+	require.ErrorIs(t, c.CheckRequirements(ctx, tk.Session(), conn), exeerrors.ErrLoadDataPreCheckFailed)
 
 	// make checkTotalFileSize pass
 	c.TotalFileSize = 1
 	// global sort with thread count < 8
 	c.ThreadCnt = 7
 	c.CloudStorageURI = "s3://test"
-	err = c.CheckRequirements(ctx, conn)
+	err = c.CheckRequirements(ctx, tk.Session(), conn)
 	require.ErrorIs(t, err, exeerrors.ErrLoadDataPreCheckFailed)
 	require.ErrorContains(t, err, "global sort requires at least 8 threads")
 
@@ -117,11 +198,11 @@ func TestCheckRequirements(t *testing.T) {
 	// non-empty table
 	_, err = conn.Execute(ctx, "insert into test.t values(1)")
 	require.NoError(t, err)
-	require.ErrorIs(t, c.CheckRequirements(ctx, conn), exeerrors.ErrLoadDataPreCheckFailed)
+	require.ErrorIs(t, c.CheckRequirements(ctx, tk.Session(), conn), exeerrors.ErrLoadDataPreCheckFailed)
 	// table not exists
 	_, err = conn.Execute(ctx, "drop table if exists test.t")
 	require.NoError(t, err)
-	require.ErrorContains(t, c.CheckRequirements(ctx, conn), "doesn't exist")
+	require.ErrorContains(t, c.CheckRequirements(ctx, tk.Session(), conn), "doesn't exist")
 
 	// create table again, now checkTableEmpty pass
 	_, err = conn.Execute(ctx, "create table test.t(id int primary key)")
@@ -154,12 +235,12 @@ func TestCheckRequirements(t *testing.T) {
 	pitrKey := streamhelper.PrefixOfTask() + "test"
 	_, err = etcdCli.Put(ctx, pitrKey, "")
 	require.NoError(t, err)
-	err = c.CheckRequirements(ctx, conn)
+	err = c.CheckRequirements(ctx, tk.Session(), conn)
 	require.ErrorIs(t, err, exeerrors.ErrLoadDataPreCheckFailed)
 	require.ErrorContains(t, err, "found PiTR log streaming")
 	// disable precheck, should pass
 	c.DisablePrecheck = true
-	require.NoError(t, c.CheckRequirements(ctx, conn))
+	require.NoError(t, c.CheckRequirements(ctx, tk.Session(), conn))
 	c.DisablePrecheck = false // revert back
 
 	// remove PiTR task, and mock a CDC task
@@ -169,23 +250,23 @@ func TestCheckRequirements(t *testing.T) {
 	cdcKey := cdcutil.CDCPrefix + "testcluster/test_ns/changefeed/info/test_cf"
 	_, err = etcdCli.Put(ctx, cdcKey, `{"state":"normal"}`)
 	require.NoError(t, err)
-	err = c.CheckRequirements(ctx, conn)
+	err = c.CheckRequirements(ctx, tk.Session(), conn)
 	require.ErrorIs(t, err, exeerrors.ErrLoadDataPreCheckFailed)
 	require.ErrorContains(t, err, "found CDC changefeed")
 
 	// remove CDC task, pass
 	_, err = etcdCli.Delete(ctx, cdcKey)
 	require.NoError(t, err)
-	require.NoError(t, c.CheckRequirements(ctx, conn))
+	require.NoError(t, c.CheckRequirements(ctx, tk.Session(), conn))
 
 	// with global sort
 	c.Plan.ThreadCnt = 8
 	c.Plan.CloudStorageURI = ":"
-	require.ErrorIs(t, c.CheckRequirements(ctx, conn), exeerrors.ErrLoadDataInvalidURI)
+	require.ErrorIs(t, c.CheckRequirements(ctx, tk.Session(), conn), exeerrors.ErrLoadDataInvalidURI)
 	c.Plan.CloudStorageURI = "sdsdsdsd://sdsdsdsd"
-	require.ErrorIs(t, c.CheckRequirements(ctx, conn), exeerrors.ErrLoadDataInvalidURI)
+	require.ErrorIs(t, c.CheckRequirements(ctx, tk.Session(), conn), exeerrors.ErrLoadDataInvalidURI)
 	c.Plan.CloudStorageURI = "local:///tmp"
-	require.ErrorContains(t, c.CheckRequirements(ctx, conn), "unsupported cloud storage uri scheme: local")
+	require.ErrorContains(t, c.CheckRequirements(ctx, tk.Session(), conn), "unsupported cloud storage uri scheme: local")
 	// this mock cannot mock credential check, so we just skip it.
 	backend := s3mem.New()
 	faker := gofakes3.New(backend)
@@ -193,5 +274,5 @@ func TestCheckRequirements(t *testing.T) {
 	defer ts.Close()
 	require.NoError(t, backend.CreateBucket("test-bucket"))
 	c.Plan.CloudStorageURI = fmt.Sprintf("s3://test-bucket/path?region=us-east-1&endpoint=%s&access-key=xxxxxx&secret-access-key=xxxxxx", ts.URL)
-	require.NoError(t, c.CheckRequirements(ctx, conn))
+	require.NoError(t, c.CheckRequirements(ctx, tk.Session(), conn))
 }

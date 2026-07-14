@@ -34,9 +34,41 @@ import (
 type TableKVEncoder struct {
 	*kv.BaseKVEncoder
 	// see import.go
-	columnAssignments []expression.Expression
-	fieldMappings     []*FieldMapping
-	insertColumns     []*table.Column
+	columnAssignments  []expression.Expression
+	fieldMappings      []*FieldMapping
+	insertColumns      []*table.Column
+	allowedPhysicalIDs map[int64]struct{}
+	partitionedTable   table.PartitionedTable
+}
+
+// SetAllowedPartitions restricts encoded rows to the physical targets that
+// passed the empty-partition precheck.
+func (en *TableKVEncoder) SetAllowedPartitions(ids map[int64]struct{}) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	pt, ok := en.GetTable().(table.PartitionedTable)
+	if !ok {
+		return errors.New("IMPORT INTO PARTITION requires a partitioned or SHARD BY table")
+	}
+	en.allowedPhysicalIDs = ids
+	en.partitionedTable = pt
+	return nil
+}
+
+func (en *TableKVEncoder) checkRowPartition(record []types.Datum) error {
+	if en.allowedPhysicalIDs == nil {
+		return nil
+	}
+	evalCtx := en.SessionCtx.GetExprCtx().GetEvalCtx()
+	phys, err := en.partitionedTable.GetPartitionByRow(evalCtx, record)
+	if err != nil {
+		return err
+	}
+	if _, ok := en.allowedPhysicalIDs[phys.GetPhysicalID()]; !ok {
+		return errors.New("a row was routed outside the IMPORT INTO PARTITION target set")
+	}
+	return nil
 }
 
 // NewTableKVEncoder creates a new TableKVEncoder.
@@ -89,6 +121,9 @@ func (en *TableKVEncoder) Encode(row []types.Datum, rowID int64) (*kv.Pairs, err
 	defer en.TruncateWarns()
 	record, err := en.parserData2TableData(row, rowID)
 	if err != nil {
+		return nil, err
+	}
+	if err := en.checkRowPartition(record); err != nil {
 		return nil, err
 	}
 

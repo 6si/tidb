@@ -6903,6 +6903,8 @@ UnReservedKeyword:
 |	"RULE"
 |	"SESSION"
 |	"SIGNED"
+|	"SHARD"
+|	"SHARDS"
 |	"SHARD_ROW_ID_BITS"
 |	"SHUTDOWN"
 |	"SNAPSHOT"
@@ -15132,25 +15134,29 @@ LoadDataOption:
 	}
 
 ImportIntoStmt:
-	"IMPORT" "INTO" TableName ColumnNameOrUserVarListOptWithBrackets LoadDataSetSpecOpt "FROM" stringLit FormatOpt LoadDataOptionListOpt
+	"IMPORT" "INTO" TableName PartitionNameListOpt ColumnNameOrUserVarListOptWithBrackets LoadDataSetSpecOpt "FROM" stringLit FormatOpt LoadDataOptionListOpt
 	{
+		tn := $3.(*ast.TableName)
+		tn.PartitionNames = $4.([]model.CIStr)
 		$$ = &ast.ImportIntoStmt{
-			Table:              $3.(*ast.TableName),
-			ColumnsAndUserVars: $4.([]*ast.ColumnNameOrUserVar),
-			ColumnAssignments:  $5.([]*ast.Assignment),
-			Path:               $7,
-			Format:             $8.(*string),
-			Options:            $9.([]*ast.LoadDataOpt),
+			Table:              tn,
+			ColumnsAndUserVars: $5.([]*ast.ColumnNameOrUserVar),
+			ColumnAssignments:  $6.([]*ast.Assignment),
+			Path:               $8,
+			Format:             $9.(*string),
+			Options:            $10.([]*ast.LoadDataOpt),
 		}
 	}
-|	"IMPORT" "INTO" TableName ColumnNameOrUserVarListOptWithBrackets LoadDataSetSpecOpt "FROM" ImportFromSelectStmt LoadDataOptionListOpt
+|	"IMPORT" "INTO" TableName PartitionNameListOpt ColumnNameOrUserVarListOptWithBrackets LoadDataSetSpecOpt "FROM" ImportFromSelectStmt LoadDataOptionListOpt
 	/* LoadDataSetSpecOpt is used to avoid shift/reduce conflict, we don't support it actually */
 	{
+		tn := $3.(*ast.TableName)
+		tn.PartitionNames = $4.([]model.CIStr)
 		st := &ast.ImportIntoStmt{
-			Table:              $3.(*ast.TableName),
-			ColumnsAndUserVars: $4.([]*ast.ColumnNameOrUserVar),
-			Select:             $7.(ast.ResultSetNode),
-			Options:            $8.([]*ast.LoadDataOpt),
+			Table:              tn,
+			ColumnsAndUserVars: $5.([]*ast.ColumnNameOrUserVar),
+			Select:             $8.(ast.ResultSetNode),
+			Options:            $9.([]*ast.LoadDataOpt),
 		}
 		for _, cu := range st.ColumnsAndUserVars {
 			if cu.ColumnName == nil {
@@ -15158,7 +15164,7 @@ ImportIntoStmt:
 				return 1
 			}
 		}
-		if $5.([]*ast.Assignment) != nil {
+		if $6.([]*ast.Assignment) != nil {
 			yylex.AppendError(yylex.Errorf("Cannot use SET clause in IMPORT INTO FROM SELECT statement."))
 			return 1
 		}

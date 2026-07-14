@@ -786,6 +786,10 @@ func TestDMLStmt(t *testing.T) {
 		{"import into t from '/file.csv' with detached", true, "IMPORT INTO `t` FROM '/file.csv' WITH detached"},
 		{"import into `t` from '/file.csv' with thread=1", true, "IMPORT INTO `t` FROM '/file.csv' WITH thread=1"},
 		{"import into `t` from '/file.csv' with detached, thread=1", true, "IMPORT INTO `t` FROM '/file.csv' WITH detached, thread=1"},
+		{"import into `t` partition(`p1`) from '/file.csv'", true, "IMPORT INTO `t` PARTITION(`p1`) FROM '/file.csv'"},
+		{"import into `t` partition(`p1`, `p2`) from '/file.csv'", true, "IMPORT INTO `t` PARTITION(`p1`, `p2`) FROM '/file.csv'"},
+		{"import into `t` partition(`shard_0`, `shard_1`) from '/file.csv'", true, "IMPORT INTO `t` PARTITION(`shard_0`, `shard_1`) FROM '/file.csv'"},
+		{"import into `t` partition(`p1`) (`a`,`b`) from '/file.csv'", true, "IMPORT INTO `t` PARTITION(`p1`) (`a`,`b`) FROM '/file.csv'"},
 
 		// select for update/share
 		{"select * from t for update", true, "SELECT * FROM `t` FOR UPDATE"},

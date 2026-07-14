@@ -16,6 +16,7 @@ package importer
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -47,7 +48,9 @@ import (
 	"github.com/pingcap/tidb/pkg/lightning/mydump"
 	verify "github.com/pingcap/tidb/pkg/lightning/verification"
 	"github.com/pingcap/tidb/pkg/meta/autoid"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	tidbmetrics "github.com/pingcap/tidb/pkg/metrics"
+	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/sessiontxn"
@@ -319,7 +322,51 @@ func (ti *TableImporter) GetKVEncoder(chunk *checkpoints.ChunkCheckpoint) (*Tabl
 		Table:  ti.encTable,
 		Logger: log.Logger{Logger: ti.logger.With(zap.String("path", chunk.FileMeta.Path))},
 	}
-	return NewTableKVEncoder(cfg, ti)
+	encoder, err := NewTableKVEncoder(cfg, ti)
+	if err != nil {
+		return nil, err
+	}
+	if len(ti.TargetPartitions) > 0 {
+		ids, err := resolveTargetPhysicalIDs(ti.encTable.Meta(), ti.TargetPartitions)
+		if err != nil {
+			return nil, err
+		}
+		if err := encoder.SetAllowedPartitions(ids); err != nil {
+			return nil, err
+		}
+	}
+	return encoder, nil
+}
+
+func resolveTargetPhysicalIDs(tblInfo *model.TableInfo, names []pmodel.CIStr) (map[int64]struct{}, error) {
+	byName := make(map[string][]int64)
+	if pi := tblInfo.GetPartitionInfo(); pi != nil {
+		for _, def := range pi.Definitions {
+			if len(def.ShardIDs) > 0 {
+				byName[def.Name.L] = append([]int64(nil), def.ShardIDs...)
+			} else {
+				byName[def.Name.L] = []int64{def.ID}
+			}
+		}
+	} else if ski := tblInfo.ShardKeyInfo; ski != nil && len(ski.ShardIDs) > 0 {
+		for i, physID := range ski.ShardIDs {
+			byName[fmt.Sprintf("shard_%d", i)] = []int64{physID}
+		}
+	} else {
+		return nil, errors.Errorf("table %q is not partitioned or sharded", tblInfo.Name.O)
+	}
+
+	ids := make(map[int64]struct{})
+	for _, name := range names {
+		physicalIDs, ok := byName[name.L]
+		if !ok {
+			return nil, errors.Errorf("unknown partition %q in table %q", name.O, tblInfo.Name.O)
+		}
+		for _, id := range physicalIDs {
+			ids[id] = struct{}{}
+		}
+	}
+	return ids, nil
 }
 
 // GetKVEncoderForDupResolve get the KV encoder.
