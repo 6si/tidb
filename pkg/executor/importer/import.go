@@ -47,6 +47,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	pformat "github.com/pingcap/tidb/pkg/parser/format"
+	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/parser/terror"
 	plannercore "github.com/pingcap/tidb/pkg/planner/core"
@@ -274,6 +275,9 @@ type Plan struct {
 	TotalFileSize int64
 	// used in tests to force enable merge-step when using global sort.
 	ForceMergeStep bool
+	// TargetPartitions contains the partition or shard names from
+	// IMPORT INTO ... PARTITION(...).
+	TargetPartitions []pmodel.CIStr `json:",omitempty"`
 }
 
 // ASTArgs is the arguments for ast.LoadDataStmt.
@@ -445,6 +449,7 @@ func NewImportPlan(ctx context.Context, userSctx sessionctx.Context, plan *plann
 		InImportInto:           true,
 		DataSourceType:         getDataSourceType(plan),
 		User:                   userSctx.GetSessionVars().User.String(),
+		TargetPartitions:       plan.Table.PartitionNames,
 	}
 	if err := p.initOptions(ctx, userSctx, plan.Options); err != nil {
 		return nil, err
@@ -566,6 +571,9 @@ func (p *Plan) initDefaultOptions(targetNodeCPUCnt int) {
 	}
 
 	p.Checksum = config.OpLevelRequired
+	if len(p.TargetPartitions) > 0 {
+		p.Checksum = config.OpLevelOff
+	}
 	p.ThreadCnt = threadCnt
 	p.MaxWriteSpeed = unlimitedWriteSpeed
 	p.SplitFile = false

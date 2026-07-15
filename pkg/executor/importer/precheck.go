@@ -23,8 +23,12 @@ import (
 	"github.com/pingcap/tidb/br/pkg/storage"
 	"github.com/pingcap/tidb/br/pkg/streamhelper"
 	tidb "github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/lightning/common"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/terror"
+	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/tablecodec"
 	"github.com/pingcap/tidb/pkg/util"
 	"github.com/pingcap/tidb/pkg/util/cdcutil"
 	"github.com/pingcap/tidb/pkg/util/dbterror/exeerrors"
@@ -51,7 +55,11 @@ var GetEtcdClient = getEtcdClient
 //   - no CDC or PiTR tasks running
 //
 // we check them one by one, and return the first error we meet.
-func (e *LoadDataController) CheckRequirements(ctx context.Context, conn sqlexec.SQLExecutor) error {
+func (e *LoadDataController) CheckRequirements(
+	ctx context.Context,
+	se sessionctx.Context,
+	conn sqlexec.SQLExecutor,
+) error {
 	if e.DataSourceType == DataSourceTypeFile {
 		cnt, err := GetActiveJobCnt(ctx, conn, e.Plan.DBName, e.Plan.TableInfo.Name.L)
 		if err != nil {
@@ -69,7 +77,7 @@ func (e *LoadDataController) CheckRequirements(ctx context.Context, conn sqlexec
 			return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs("global sort requires at least 8 threads")
 		}
 	}
-	if err := e.checkTableEmpty(ctx, conn); err != nil {
+	if err := e.checkTableEmpty(ctx, se, conn); err != nil {
 		return err
 	}
 	if !e.DisablePrecheck {
@@ -93,7 +101,14 @@ func (e *LoadDataController) checkTotalFileSize() error {
 	return nil
 }
 
-func (e *LoadDataController) checkTableEmpty(ctx context.Context, conn sqlexec.SQLExecutor) error {
+func (e *LoadDataController) checkTableEmpty(
+	ctx context.Context,
+	se sessionctx.Context,
+	conn sqlexec.SQLExecutor,
+) error {
+	if len(e.TargetPartitions) > 0 {
+		return e.checkPartitionsEmpty(se)
+	}
 	sql := common.SprintfWithIdentifiers("SELECT 1 FROM %s.%s USE INDEX() LIMIT 1", e.DBName, e.Table.Meta().Name.L)
 	rs, err := conn.ExecuteInternal(ctx, sql)
 	if err != nil {
@@ -106,6 +121,54 @@ func (e *LoadDataController) checkTableEmpty(ctx context.Context, conn sqlexec.S
 	}
 	if len(rows) > 0 {
 		return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs("target table is not empty")
+	}
+	return nil
+}
+
+func (e *LoadDataController) checkPartitionsEmpty(se sessionctx.Context) error {
+	tblInfo := e.Table.Meta()
+	if tblInfo.GetPartitionInfo() == nil && tblInfo.ShardKeyInfo == nil {
+		return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs(
+			"PARTITION clause requires a partitioned or SHARD BY table")
+	}
+	if err := e.rejectExtraUniqueIndexes(tblInfo); err != nil {
+		return err
+	}
+	ids, err := resolveTargetPhysicalIDs(tblInfo, e.TargetPartitions)
+	if err != nil {
+		return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs(err.Error())
+	}
+	snapshot := se.GetStore().GetSnapshot(kv.MaxVersion)
+	for physID := range ids {
+		empty, err := physicalTableEmpty(snapshot, physID)
+		if err != nil {
+			return errors.Annotatef(err, "checking target partition/shard %d", physID)
+		}
+		if !empty {
+			return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs(
+				"target partition(s)/shard(s) are not empty")
+		}
+	}
+	return nil
+}
+
+func physicalTableEmpty(snapshot kv.Snapshot, physID int64) (bool, error) {
+	start := tablecodec.GenTablePrefix(physID)
+	iter, err := snapshot.Iter(start, start.PrefixNext())
+	if err != nil {
+		return false, err
+	}
+	defer iter.Close()
+	return !iter.Valid(), nil
+}
+
+func (*LoadDataController) rejectExtraUniqueIndexes(tblInfo *model.TableInfo) error {
+	for _, idx := range tblInfo.Indices {
+		if idx.State != model.StatePublic || idx.Primary || !idx.Unique {
+			continue
+		}
+		return exeerrors.ErrLoadDataPreCheckFailed.FastGenByArgs(
+			fmt.Sprintf("partition-scoped IMPORT INTO does not support unique secondary index %q", idx.Name.O))
 	}
 	return nil
 }

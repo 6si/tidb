@@ -1980,7 +1980,7 @@ func TestTiKVCoprocessorJoins(t *testing.T) {
 
 // explainToStr joins all rows of an EXPLAIN output into a single string
 // for substring matching.
-func explainToStr(rows [][]interface{}) string {
+func explainToStr(rows [][]any) string {
 	var b strings.Builder
 	for _, row := range rows {
 		for _, col := range row {

@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	clusterDSN     = "root@tcp(k8s-tidbshar-tidbshar-527997beb2-b7b40e83bd4bc403.elb.us-east-1.amazonaws.com:4000)/"
-	dialTimeout    = 5 * time.Second
-	clusterTestDB  = "shardkey_cluster_test"
+	clusterDSN    = "root@tcp(k8s-tidbshar-tidbshar-527997beb2-b7b40e83bd4bc403.elb.us-east-1.amazonaws.com:4000)/"
+	dialTimeout   = 5 * time.Second
+	clusterTestDB = "shardkey_cluster_test"
 )
 
 // clusterDB opens a connection to the live TiDB cluster and creates a fresh
@@ -180,7 +180,7 @@ func TestCluster_ShardRouting(t *testing.T) {
 	defer explainRows.Close()
 	cols, _ := explainRows.Columns()
 	vals := make([]sql.NullString, len(cols))
-	ptrs := make([]interface{}, len(cols))
+	ptrs := make([]any, len(cols))
 	for i := range vals {
 		ptrs[i] = &vals[i]
 	}
@@ -303,7 +303,7 @@ func explainPlan(t *testing.T, db *sql.DB, query string) string {
 	var plan strings.Builder
 	cols, _ := rows.Columns()
 	vals := make([]sql.NullString, len(cols))
-	ptrs := make([]interface{}, len(cols))
+	ptrs := make([]any, len(cols))
 	for i := range vals {
 		ptrs[i] = &vals[i]
 	}

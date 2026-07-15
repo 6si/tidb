@@ -38,6 +38,7 @@ go_test(
     timeout = "short",
     srcs = [
         "bytesize_test.go",
+        "config_6sense_test.go",
         "config_test.go",
         "configlist_test.go",
     ],

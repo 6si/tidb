@@ -893,20 +893,21 @@ func BuildTableInfoWithStmt(ctx *metabuild.Context, s *ast.CreateTableStmt, dbCh
 			}
 			cols = append(cols, colName)
 		}
-		// Shard key columns must be part of the primary key so that PointGet
-		// can always determine the correct shard from the PK predicate.
+		// If the table has an explicit primary key, it must include the shard
+		// key so PointGet can determine the physical shard from the PK predicate.
+		// Tables without an explicit primary key use TiDB's hidden row ID and
+		// are scanned across the candidate physical shards when necessary.
 		pkColSet := make(map[string]struct{})
 		for _, col := range tbInfo.Columns {
 			if mysql.HasPriKeyFlag(col.GetFlag()) {
 				pkColSet[col.Name.L] = struct{}{}
 			}
 		}
-		if len(pkColSet) == 0 {
-			return nil, dbterror.ErrShardKeyNotInPrimaryKey.FastGenByArgs(cols[0])
-		}
-		for _, skCol := range cols {
-			if _, ok := pkColSet[skCol]; !ok {
-				return nil, dbterror.ErrShardKeyNotInPrimaryKey.FastGenByArgs(skCol)
+		if len(pkColSet) > 0 {
+			for _, skCol := range cols {
+				if _, ok := pkColSet[skCol]; !ok {
+					return nil, dbterror.ErrShardKeyNotInPrimaryKey.FastGenByArgs(skCol)
+				}
 			}
 		}
 		if len(cols) > 0 {
