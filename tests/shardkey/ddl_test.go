@@ -927,11 +927,67 @@ func TestDDL_ERR_MultiColumnShardKeyPartialPK(t *testing.T) {
 	)
 }
 
-func TestDDL_ERR_NoPKWithShardKey(t *testing.T) {
-	// No explicit PK (implicit rowid) + SHARD BY → rejected.
-	tk, _ := setup(t)
-	tk.MustGetDBError(
-		`CREATE TABLE t (id BIGINT NOT NULL, company_id BIGINT NOT NULL) SHARD BY (company_id) SHARDS 4`,
-		dbterror.ErrShardKeyNotInPrimaryKey,
+func TestDDL_OK_NoPKWithShardKey(t *testing.T) {
+	tk, dom := setup(t)
+	tk.MustExec(`CREATE TABLE t (
+		record_id VARCHAR(64) NOT NULL,
+		company_id BIGINT NOT NULL,
+		KEY idx_record (record_id)
+	) SHARD BY (company_id) SHARDS 4`)
+
+	mi := tableInfo(t, dom, "t")
+	require.False(t, mi.PKIsHandle)
+	require.False(t, mi.IsCommonHandle)
+	require.NotNil(t, mi.ShardKeyInfo)
+	require.Equal(t, []string{"company_id"}, mi.ShardKeyInfo.Columns)
+
+	tk.MustExec(`INSERT INTO t VALUES
+		('r1', 10),
+		('r2', 20),
+		('r3', 30)`)
+	tk.MustQuery("SELECT record_id, company_id FROM t ORDER BY record_id").Check(
+		testkit.Rows("r1 10", "r2 20", "r3 30"),
 	)
+	tk.MustQuery("SELECT COUNT(DISTINCT _tidb_rowid), COUNT(*) FROM t").Check(
+		testkit.Rows("3 3"),
+	)
+	tk.MustQuery("SELECT COUNT(*) FROM t USE INDEX(idx_record)").Check(
+		testkit.Rows("3"),
+	)
+	tk.MustExec("ADMIN CHECK TABLE t")
+	tk.MustExec("ADMIN CHECK INDEX t idx_record")
+}
+
+func TestDDL_OK_NoPKPartitionedWithShardKey(t *testing.T) {
+	tk, dom := setup(t)
+	tk.MustExec(`CREATE TABLE t (
+		record_id VARCHAR(64) NOT NULL,
+		shard_id VARCHAR(64) NOT NULL,
+		org_name VARCHAR(64) NOT NULL,
+		etl_ts DATETIME NOT NULL,
+		KEY idx_record (record_id)
+	) SHARD BY (shard_id) SHARDS 4
+	PARTITION BY LIST COLUMNS (org_name, etl_ts) (
+		PARTITION p01 VALUES IN (('org_0000', '2026-01-02 00:00:00')),
+		PARTITION p02 VALUES IN (('org_0001', '2026-01-02 00:00:00'))
+	)`)
+
+	mi := tableInfo(t, dom, "t")
+	require.False(t, mi.PKIsHandle)
+	require.False(t, mi.IsCommonHandle)
+	require.Len(t, mi.Partition.Definitions, 2)
+	for _, def := range mi.Partition.Definitions {
+		require.Len(t, def.ShardIDs, 4)
+	}
+
+	tk.MustExec(`INSERT INTO t VALUES
+		('r1', 's1', 'org_0000', '2026-01-02 00:00:00'),
+		('r2', 's2', 'org_0001', '2026-01-02 00:00:00')`)
+	tk.MustQuery("SELECT COUNT(*) FROM t PARTITION (p01)").Check(testkit.Rows("1"))
+	tk.MustQuery("SELECT COUNT(*) FROM t PARTITION (p02)").Check(testkit.Rows("1"))
+	tk.MustQuery("SELECT COUNT(DISTINCT _tidb_rowid), COUNT(*) FROM t").Check(
+		testkit.Rows("2 2"),
+	)
+	tk.MustExec("ADMIN CHECK TABLE t")
+	tk.MustExec("ADMIN CHECK INDEX t idx_record")
 }

@@ -97,7 +97,7 @@ func TestCheckPartitionsEmpty(t *testing.T) {
 		id BIGINT NOT NULL,
 		company_id BIGINT NOT NULL,
 		ts DATE NOT NULL,
-		PRIMARY KEY (id, company_id, ts)
+		KEY idx_id (id)
 	) SHARD BY (company_id) SHARDS 4
 	PARTITION BY RANGE COLUMNS (ts) (
 		PARTITION p0 VALUES LESS THAN ('2025-01-01'),

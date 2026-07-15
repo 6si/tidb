@@ -62,7 +62,7 @@ func TestTableKVEncoderAllowedPartitions(t *testing.T) {
 	tk.MustExec(`CREATE TABLE test.p (
 			id BIGINT NOT NULL,
 			company_id BIGINT NOT NULL,
-			PRIMARY KEY (id, company_id)
+			KEY idx_id (id)
 		) SHARD BY (company_id) SHARDS 4
 		PARTITION BY RANGE (id) (
 			PARTITION p0 VALUES LESS THAN (10),

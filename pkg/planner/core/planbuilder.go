@@ -1927,7 +1927,13 @@ func (b *PlanBuilder) buildPhysicalIndexLookUpReaders(ctx context.Context, dbNam
 		}
 		indexInfos = append(indexInfos, idxInfo)
 		// For partition tables except global index.
-		if pi := tbl.Meta().GetPartitionInfo(); pi != nil && !idxInfo.Global {
+		pi := tbl.Meta().GetPartitionInfo()
+		if spt, ok := tbl.(table.ShardedPartitionedTable); ok {
+			if flatPI := spt.FlatPartitionInfo(); flatPI != nil {
+				pi = flatPI
+			}
+		}
+		if pi != nil && !idxInfo.Global {
 			for _, def := range pi.Definitions {
 				t := tbl.(table.PartitionedTable).GetPartition(def.ID)
 				reader, err := b.buildPhysicalIndexLookUpReader(ctx, dbName, t, idxInfo)
